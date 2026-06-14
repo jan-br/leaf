@@ -5,3 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+indexmap.workspace = true
+smallvec.workspace = true
+once_cell.workspace = true
+futures.workspace = true
+linkme.workspace = true
+pin-project-lite.workspace = true

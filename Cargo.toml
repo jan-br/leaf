@@ -33,3 +33,11 @@ leaf-redis = { path = "crates/leaf-redis", version = "0.1.0" }
 leaf-starter-redis = { path = "crates/leaf-starter-redis", version = "0.1.0" }
 leaf-starter-web = { path = "crates/leaf-starter-web", version = "0.1.0" }
 leaf = { path = "crates/leaf", version = "0.1.0" }
+
+# External deps (pinned centrally — the internal BOM also covers third-party versions)
+indexmap = "2"
+smallvec = "1"
+once_cell = "1"
+futures = "0.3"
+linkme = "0.3"
+pin-project-lite = "0.2"
