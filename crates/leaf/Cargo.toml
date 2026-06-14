@@ -1,0 +1,13 @@
+[package]
+name = "leaf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+leaf-core.workspace = true
+leaf-macros.workspace = true
+leaf-boot.workspace = true
+leaf-tokio.workspace = true
+leaf-starter-redis.workspace = true
+leaf-starter-web.workspace = true

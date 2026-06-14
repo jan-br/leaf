@@ -1,0 +1,52 @@
+[
+ {
+  "file": "docs/design/phase4/SEAMS.md",
+  "locator": "## RoleTier plus order table \u2014 Decision/Affects/Rationale/Ripples were the literal stub ('Define RoleTier and a cmp_chain' / 'a, b' / 'x; y' / 'm; n')",
+  "correctedText": "APPLIED. Rewrote the C6 seam to the full content: (A) RoleTier enum {Infrastructure=0,Support=1,Application=2} with const fn RoleTier::of(Role) total map (ASC=outermost-first); (B) ChainKey{tier,order,id} + cmp_chain composite = tier.cmp().then(cmp_order).then(ContractId), cmp_order kept PURE, AdvisorRef::chain_key(); (C) fixed order:i32 table VALIDATE=100/RETRY=200/ASYNC=300/CACHE=400/TX=500/CONCURRENCY=550/TRANSLATE=600 (CACHE<TX) + ASYNC_DISPATCH=100/ERROR_ISOLATION=200/CONTEXT_PROP=300/METRICS=400, with the leaf-core property test asserting CACHE_ORDER<TX_ORDER etc.; (D) advice Interceptor vs events DispatchInterceptor are STRUCTURALLY DISTINCT, share ONLY cmp_chain+RoleTier grade; (E) cmp_chain at ProxyPlan::freeze/multicaster/R2-R3-R6, plain cmp_order at PriorityRank/collection/Lookup/integer-Phase. Full Affects/Rationale/Ripples authored."
+ },
+ {
+  "file": "docs/design/phase3/08-proxy-interception.md",
+  "locator": "shared-machinery item 2 (line 9): 'Proxy installation IS the origin-agnostic after_init instance-decoration hook ... inside Engine::create's publish pipeline'",
+  "correctedText": "APPLIED. Rewrote item 2 to the C3 TWO-SITE rule: (i) after_init proxies ONLY Multiplicity::Once singletons + advised-prototype Published::Owned (chain fires once); (ii) PerContextKey scoped-AND-advised beans proxied at the INJECTION/resolver seam over a ScopeTarget (memoized per holder), InstanceStore holds the BARE ErasedBean, after_init SKIPPED \u2014 so no double-proxy/raw-handoff. ProxyPlan is a declared App<Wired>::validate() input (consumed at after_init R4 AND the injection/validate seam); concrete-self_type injection of an advised bean is ResolveError::AdvisedConcreteInjection (not ScopeMismatch)."
+ },
+ {
+  "file": "docs/design/phase3/08-proxy-interception.md",
+  "locator": "shared-machinery item 5 (line 9): 'ONE comparator ... The advice chain sorts by (RoleTier, OrderKey) ... then cmp_order ... No second comparator.'",
+  "correctedText": "APPLIED. Item 5 now sorts by cmp_chain(&ChainKey,&ChainKey) at CORRECTNESS grade \u2014 RoleTier first (Infrastructure outermost), then the unchanged pure cmp_order(OrderKey), then ContractId tiebreak. cmp_chain (the ONE composite over ChainKey{tier,order,id}, SEAMS C6) is what ProxyPlan::freeze's documented (RoleTier, cmp_order, ContractId) sort resolves to; AdvisorRef::chain_key() builds it from {id,order,role}. Plain cmp_order stays the non-tiered-sites comparator."
+ },
+ {
+  "file": "docs/design/phase3/09-declarative-advice.md",
+  "locator": "line 154 canonical chain '... \u2192 TX (demarcate) \u2192 CACHE (a hit avoids opening a tx) \u2192 TRANSLATE ...' (CACHE placed INSIDE TX, contradicting line-31 cache-outside-tx invariant); + line 5 'validation \u2192 retry \u2192 tx \u2192 cache \u2192 translation innermost'; + line 3 'ordered by cmp_order'",
+  "correctedText": "APPLIED. Corrected the canonical chain to VALIDATE\u2192RETRY\u2192@ASYNC\u2192CACHE\u2192TX\u2192TRANSLATE (CACHE OUTSIDE/before TX) on lines 3/5/154, pinned to the C6 consts CACHE_ORDER=400 < TX_ORDER=500, TRANSLATE_ORDER=600 innermost, sorted by cmp_chain, with a note that a leaf-core property test asserts CACHE_ORDER<TX_ORDER. Resolves the latent self-contradiction with the line-31 'cache outside tx so a hit avoids opening a tx' invariant."
+ },
+ {
+  "file": "docs/design/phase3/09-declarative-advice.md",
+  "locator": "line 15 'The chain sorts by (RoleTier, OrderKey, ContractId) ... the canonical leaf_core::order::cmp_order, no second comparator'; line 150 'sorted by the one cmp_order at correctness grade'; line 152 'ordering uses the SAME cmp_order'",
+  "correctedText": "APPLIED. Lines 15/150/152 now name cmp_chain (the RoleTier-first composite over the unchanged pure cmp_order; SEAMS C6) as the correctness-grade comparator; line 152 additionally narrows the events claim to the C5 sibling DispatchInterceptor sharing ONLY cmp_chain+RoleTier grade (not the one-Call Interceptor type)."
+ },
+ {
+  "file": "docs/design/phase3/09-declarative-advice.md",
+  "locator": "line 19 item 5 'genuinely-async finalization (tx commit/rollback ...) is an awaited TeardownLedger entry or explicit .await in the interceptor body'; line 26 tx interceptor body + 'order = TX_ORDER between retry and cache'",
+  "correctedText": "APPLIED. Pinned C7's per-request tx finalization: a TxFinalizeEntry rides the PER-REQUEST InstanceStore ledger (RequestScopeGuard::ledger(), reached via InstanceStore::ledger()) \u2014 NOT the container TeardownLedger \u2014 drained by 13-container-lifecycle teardown step-2's in-flight drain under BootstrapSettings.shutdown.finalize_grace; finalize-once via OnceCell so the shutdown drain never double-finalizes. Corrected the tx descriptor order to TX_ORDER=500 INSIDE cache (CACHE_ORDER=400 < TX_ORDER)."
+ },
+ {
+  "file": "docs/design/phase3/12-events.md",
+  "locator": "lines 5/15/45/61/124-126/159/166: 'REUSES the proxy-substrate Interceptor chain verbatim' / 'no new comparator/around-advice trait' / chain: Box<[Arc<dyn leaf_core::aop::Interceptor>]> / dispatch concerns 'ordered by cmp_order'",
+  "correctedText": "APPLIED. Rewrote the multicaster to the C5 design: a NEW sibling trait DispatchInterceptor { intercept(ev, seq, next: ListenerNext) -> BoxFuture<DispatchOutcome> } that fans OUT over N listeners (structurally distinct from aop's one-Call Interceptor \u2014 NOT verbatim reuse), sharing with AOP ONLY cmp_chain + the RoleTier grade. PipelineMulticaster.chain is Box<[Arc<dyn DispatchInterceptor>]>; the four dispatch concerns are DispatchInterceptor rows sorted by cmp_chain over the pinned ASYNC_DISPATCH/ERROR_ISOLATION/CONTEXT_PROP/METRICS consts (SEAMS C6); per-listener ListenerSeq ordering stays on the pure cmp_order (listeners are not RoleTier-graded). Updated lines 5/15/45/61/124-126/159/166 + added the trait/ListenerNext to the API sketch."
+ },
+ {
+  "file": "docs/design/phase3/14-bootstrap-diagnostics.md",
+  "locator": "Public API sketch (line ~182): 'pub shutdown: ShutdownSettings' field referenced but the ShutdownSettings struct was NEVER defined (dangling type); field comment said '(+ shutdown.finalize_grace once C7 two-budget lands)'",
+  "correctedText": "APPLIED. Added the missing leaf-core ABI definitions next to StartupValidation: 'pub struct ShutdownSettings { pub grace: Deadline, pub finalize_grace: Deadline }' (grace = in-flight body drain; finalize_grace = per-request TxFinalizeEntry budget) and updated the field comment to reflect both budgets now land. NOTE: the BootstrapSettings 8th field startup_validation: StartupValidation, the StartupValidation enum, App::set_startup_validation, and the strictness-lever prose were ALREADY on disk from the round-2 C2 application \u2014 only the ShutdownSettings struct body was the unbacked gap."
+ },
+ {
+  "file": "docs/design/phase3/13-container-lifecycle.md",
+  "locator": "teardown step (2): 'bounded await on outstanding\u21920 under grace Deadline, then cooperative-cancel survivors + DRAIN each per-request InstanceStore ledger' (single-budget)",
+  "correctedText": "APPLIED. Made the in-flight drain TWO-budget (C7) to match the now-defined ShutdownSettings: bounded body drain under `grace`, then cooperative-cancel + per-request-ledger drain under the separate `finalize_grace`, running each open tx's awaited TxFinalizeEntry within its own per-request finalize budget \u2014 closing the doc-drift where 14/09 referenced finalize_grace/TxFinalizeEntry but 13 still drained under a single grace."
+ },
+ {
+  "file": "docs/design/phase3/03-injection-resolution.md",
+  "locator": "proxy-substrate interaction (line 153): 'Shares the ONE cmp_order (advisor chain at correctness-grade, RoleTier-first)'",
+  "correctedText": "APPLIED. Clarified that the advisor chain sorts by cmp_chain (the RoleTier-first composite over THIS module's UNCHANGED pure cmp_order; SEAMS C6) \u2014 cmp_order stays pure here and at PriorityRank/collection ordering \u2014 and named the concrete ResolveError::AdvisedConcreteInjection for the rejected concrete-type injection of an advised bean."
+ }
+]

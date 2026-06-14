@@ -1,0 +1,9 @@
+[package]
+name = "leaf-starter-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+leaf-redis.workspace = true
+leaf-tokio.workspace = true

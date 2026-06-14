@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+# leaf — a Spring-Boot-4-class dependency-injection framework in idiomatic Rust.
+# Design corpus: docs/ (research, charter, phase1..4). Build kernel-first: leaf-core.
+
+# Internal BOM (TOPOLOGY.md): pins ONE version of every leaf-* crate, so there is
+# exactly one copy of leaf-core (the single-AUTO_CONFIGS/COMPONENTS-slice invariant).
+[workspace.dependencies]
+leaf-core = { path = "crates/leaf-core", version = "0.1.0" }
+leaf-macros = { path = "crates/leaf-macros", version = "0.1.0" }
+leaf-codegen = { path = "crates/leaf-codegen", version = "0.1.0" }
+leaf-config = { path = "crates/leaf-config", version = "0.1.0" }
+leaf-conditions = { path = "crates/leaf-conditions", version = "0.1.0" }
+leaf-aop-expr = { path = "crates/leaf-aop-expr", version = "0.1.0" }
+leaf-boot = { path = "crates/leaf-boot", version = "0.1.0" }
+leaf-tokio = { path = "crates/leaf-tokio", version = "0.1.0" }
+leaf-smol = { path = "crates/leaf-smol", version = "0.1.0" }
+leaf-cron = { path = "crates/leaf-cron", version = "0.1.0" }
+leaf-tx = { path = "crates/leaf-tx", version = "0.1.0" }
+leaf-cache = { path = "crates/leaf-cache", version = "0.1.0" }
+leaf-validation = { path = "crates/leaf-validation", version = "0.1.0" }
+leaf-resilience = { path = "crates/leaf-resilience", version = "0.1.0" }
+leaf-i18n = { path = "crates/leaf-i18n", version = "0.1.0" }
+leaf-serde = { path = "crates/leaf-serde", version = "0.1.0" }
+leaf-figlet = { path = "crates/leaf-figlet", version = "0.1.0" }
+leaf-redis = { path = "crates/leaf-redis", version = "0.1.0" }
+leaf-starter-redis = { path = "crates/leaf-starter-redis", version = "0.1.0" }
+leaf-starter-web = { path = "crates/leaf-starter-web", version = "0.1.0" }
+leaf = { path = "crates/leaf", version = "0.1.0" }
