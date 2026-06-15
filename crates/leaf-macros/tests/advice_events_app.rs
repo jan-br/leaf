@@ -23,7 +23,7 @@ use leaf_core::{
     ADVISORS, CATALOGS, COMPONENTS, EVENT_LISTENERS, FAILURE_ANALYZERS, RESOURCES, SCHEDULED,
 };
 use leaf_macros::{
-    advisable, aspect, catalog, event_listener, failure_analyzer, runner, scheduled,
+    advisable, aspect, catalog, component, event_listener, failure_analyzer, runner, scheduled,
     transactional_event_listener,
 };
 
@@ -256,6 +256,73 @@ fn runner_reaches_components_and_declares_the_runner_upcast_view() {
         desc.provides.iter().any(|row| row.view == runner_view),
         "#[runner] must declare the dyn Runner upcast view"
     );
+}
+
+#[test]
+fn runner_emits_the_upcast_thunk_that_rewraps_the_erased_bean() {
+    // The headline: #[runner] emits the per-runner upcast thunk the run pipeline pairs
+    // by ContractId — `ErasedBean -> Option<Arc<dyn Runner>>` (the RunnerPairing the
+    // auto-wire test previously hand-wrote). It downcasts the concrete runner + upcasts.
+    let bean: leaf_core::ErasedBean = std::sync::Arc::new(MigrateRunner);
+    let upcast: Option<std::sync::Arc<dyn leaf_core::Runner>> =
+        __leaf_runner_upcast_MigrateRunner(bean);
+    assert!(upcast.is_some(), "the upcast thunk re-wraps the concrete runner as Arc<dyn Runner>");
+    // A non-runner erased bean yields None (the thunk is type-checked, never a guess).
+    let other: leaf_core::ErasedBean = std::sync::Arc::new(42_u32);
+    assert!(__leaf_runner_upcast_MigrateRunner(other).is_none());
+}
+
+// ─────────────────────── #[advisable] impl (method-aware) ───────────────────
+
+/// The METHOD-AWARE `#[advisable]` form — `#[component]` on the struct (the
+/// Descriptor) + `#[advisable]` on the impl, whose `&self` methods are advised join
+/// points + transparently-invocable `MethodEntry`s (no duplicate join-points const).
+#[component]
+struct PricingService;
+
+#[advisable]
+impl PricingService {
+    fn new() -> Self {
+        PricingService
+    }
+
+    fn quote(&self, base: i64) -> i64 {
+        base * 2
+    }
+}
+
+#[test]
+fn advisable_impl_emits_a_method_table_with_a_working_downcast_thunk() {
+    // The impl form emits the per-bean method table (`__leaf_methods_PricingService`)
+    // — one downcast-thunk MethodEntry per `&self` method — the const the auto-wire
+    // test previously hand-wrote. The thunk downcasts, unpacks the positional arg
+    // tuple, calls the real method, and packs the ErasedRet.
+    let table: &::leaf_core::MethodTable = __leaf_methods_PricingService;
+    let entry = table
+        .lookup(::leaf_core::MethodKey::of("PricingService::quote"))
+        .expect("the advised method is in the macro-emitted table");
+
+    let bean: ::leaf_core::ErasedBean = std::sync::Arc::new(PricingService);
+    let cx = ::leaf_core::ResolveCtx::root();
+    let ret = futures::executor::block_on((entry.invoke)(
+        &bean,
+        ::leaf_core::ErasedArgs::pack((21_i64,)),
+        &cx,
+    ))
+    .expect("the downcast thunk drives the real method");
+    assert_eq!(ret.unpack::<i64>().unwrap(), 42, "21 * 2 — the real method ran via the thunk");
+}
+
+#[test]
+fn advisable_impl_emits_per_method_join_points() {
+    // The impl form ALSO enumerates each `&self` method as a join point (the empty
+    // struct-form spec is replaced by the method-aware one for the SAME bean type).
+    let spec = __leaf_joinpoints_PricingService;
+    assert_eq!(spec.bean_type, std::any::TypeId::of::<PricingService>());
+    assert_eq!(spec.methods.len(), 1, "one advised `&self` method (the `new` assoc fn is skipped)");
+    assert_eq!(spec.methods[0].method, ::leaf_core::MethodKey::of("PricingService::quote"));
+    assert_eq!(spec.methods[0].arg_types, &[std::any::TypeId::of::<i64>()]);
+    assert_eq!(spec.methods[0].ret_type, std::any::TypeId::of::<i64>());
 }
 
 // ───────────────────────────── #[failure_analyzer] ──────────────────────────

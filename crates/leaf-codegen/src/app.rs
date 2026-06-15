@@ -183,12 +183,45 @@ pub fn runner_input(item: &syn::ItemStruct) -> Result<crate::descriptor::BeanInp
 }
 
 /// Emit the const `#[runner]` artifact — a `COMPONENTS` `Descriptor` row that
-/// declares the `dyn ::leaf_core::Runner` upcast view.
+/// declares the `dyn ::leaf_core::Runner` upcast view PLUS the per-runner UPCAST THUNK
+/// (`__leaf_runner_upcast_<Ident>`) the run pipeline JOINs as a `RunnerPairing`.
 ///
 /// # Errors
 /// [`EmitError`] per [`runner_input`].
 pub fn emit_runner(item: &syn::ItemStruct) -> Result<TokenStream, EmitError> {
-    crate::descriptor::emit(&runner_input(item)?)
+    let rows = crate::descriptor::emit(&runner_input(item)?)?;
+    let upcast = emit_runner_upcast(&item.ident.to_string());
+    Ok(quote! { #rows #upcast })
+}
+
+/// Emit the per-runner UPCAST THUNK for a `#[runner]` bean `ident`: a PUBLIC
+/// `fn(::leaf_core::ErasedBean) -> Option<Arc<dyn ::leaf_core::Runner>>` named
+/// `__leaf_runner_upcast_<Ident>` that downcasts the erased bean to the concrete
+/// runner type and re-wraps it as `Arc<dyn Runner>` (trait upcasting, stable 1.86).
+///
+/// This is the runner analogue of the `__leaf_methods_<Ident>` method-table thunk:
+/// `#[leaf::main]` pairs it with the runner's `ContractId` as a
+/// `::leaf_boot::RunnerPairing`, and the run pipeline AUTO-COLLECTS the runner from
+/// the live Context by applying this thunk to the resolved erased bean — so a
+/// `#[runner]` bean auto-runs with NO hand-written `RunnerUpcast` in user code (the
+/// same `TypeId`-keyed view-upcast idea as `TypeRow`).
+#[must_use]
+pub fn emit_runner_upcast(ident: &str) -> TokenStream {
+    let mangled = mangle(ident);
+    let upcast_ident = format_ident!("__leaf_runner_upcast_{}", mangled);
+    let ty: syn::Ident = syn::Ident::new(ident, proc_macro2::Span::call_site());
+    quote! {
+        // The PUBLIC per-runner upcast thunk: downcast the erased bean to the concrete
+        // runner, re-wrap as Arc<dyn Runner>. `#[leaf::main]` pairs it with the runner's
+        // ContractId as a ::leaf_boot::RunnerPairing; the run pipeline applies it to the
+        // resolved erased bean to auto-collect the runner from the live Context.
+        #[allow(non_upper_case_globals, non_snake_case)]
+        pub fn #upcast_ident(
+            __bean: ::leaf_core::ErasedBean,
+        ) -> ::core::option::Option<::std::sync::Arc<dyn ::leaf_core::Runner>> {
+            __bean.downcast::<#ty>().ok().map(|__a| __a as ::std::sync::Arc<dyn ::leaf_core::Runner>)
+        }
+    }
 }
 
 // ─────────────────────────── #[failure_analyzer] ────────────────────────────
@@ -351,6 +384,36 @@ mod tests {
         let err = emit_runner(&item("struct R<T> { inner: T }"))
             .expect_err("a generic runner hard-errors");
         assert!(err.message.contains("register_component!") || err.message.contains("generic"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn runner_emits_the_per_runner_upcast_thunk() {
+        // A #[runner] ALSO emits the per-runner upcast thunk the run pipeline pairs
+        // by ContractId (the RunnerPairing the auto-wire test previously hand-wrote).
+        let ts = emit_runner(&item("struct MigrateRunner;")).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains(
+                "pubfn__leaf_runner_upcast_MigrateRunner(__bean:::leaf_core::ErasedBean,)->::core::option::Option<::std::sync::Arc<dyn::leaf_core::Runner>>"
+            ),
+            "got: {s}"
+        );
+        // It downcasts to the concrete runner and re-wraps as Arc<dyn Runner>.
+        assert!(s.contains("__bean.downcast::<MigrateRunner>().ok()"), "got: {s}");
+        assert!(
+            s.contains("__aas::std::sync::Arc<dyn::leaf_core::Runner>"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn runner_upcast_thunk_is_emittable_standalone() {
+        // The thunk emitter is the thin macro's delegate (no logic in the macro).
+        let ts = emit_runner_upcast("MigrateRunner");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(s.contains("__leaf_runner_upcast_MigrateRunner"), "got: {s}");
     }
 
     // ── #[failure_analyzer] ──────────────────────────────────────────────────

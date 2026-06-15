@@ -136,6 +136,94 @@ pub fn emit_aspect_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
     Ok(rows)
 }
 
+/// Emit the full `#[advisable] impl Svc { fn place(&self, a: A) -> R { .. } }`
+/// artifact: the per-bean PROXY METADATA the auto-proxy pipeline JOINs — the
+/// `__leaf_joinpoints_<Ident>` join-point spec (the `ProxyPlan` pointcut input) PLUS
+/// the `__leaf_methods_<Ident>` method table (the transparent downcast-thunk index),
+/// each carrying ONE row per advisable method (proxy-interception phase3/08).
+///
+/// This is the METHOD-AWARE form of `#[advisable]` (the struct form sees no impl, so
+/// it emits an EMPTY method spec): an impl-position macro CAN iterate the impl's
+/// methods, so it enumerates each `&self` method as an advised join point + a
+/// transparently-invocable `MethodEntry`. The impl block itself is kept verbatim by
+/// the thin macro; this only appends the const pairing artifacts.
+///
+/// Advisable methods are the `&self`/`&mut self` inherent methods (a method threading
+/// the bean instance — an associated fn with no receiver is not an advisable call
+/// seam); each lowers to a `MethodKey` of `Bean::method`, its NON-receiver arg types,
+/// and its return type. `async fn` is detected so the thunk `.await`s the call.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when the impl is generic (a generic bean has no
+/// single concrete `TypeId` — `register_proxy!(Concrete)` is the escape) or is a trait
+/// impl (`#[advisable]` applies to the inherent impl, the call-seam carrier).
+pub fn emit_advisable_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
+    let self_ty = self_ty_of(item)?;
+    let bean_ident = type_ident(&self_ty);
+    if !item.generics.params.is_empty() {
+        return Err(EmitError {
+            message: format!(
+                "`{bean_ident}` is a generic `#[advisable]` impl: a generic bean has no \
+                 single concrete type to mint a proxy `MethodTable`/join-point spec. \
+                 Register a concrete instantiation with `register_proxy!({bean_ident}<Concrete>)`."
+            ),
+        });
+    }
+
+    let methods = advisable_methods(item, &bean_ident);
+    let join_points = advisor::emit_join_points(&bean_ident, &self_ty, &methods);
+    let method_table = advisor::emit_method_table(&bean_ident, &self_ty, &methods);
+    Ok(quote::quote! { #join_points #method_table })
+}
+
+/// The advisable (`&self`/`&mut self`) inherent methods of an impl block, lowered to
+/// [`advisor::MethodSpec`]s — one advised join point + method-table thunk each. An
+/// associated fn with no receiver is skipped (it is not a per-instance call seam).
+fn advisable_methods(item: &ItemImpl, bean_ident: &str) -> Vec<advisor::MethodSpec> {
+    let mut specs = Vec::new();
+    for inner in &item.items {
+        let ImplItem::Fn(func) = inner else { continue };
+        if !has_self_receiver(func) {
+            continue;
+        }
+        let method_ident = func.sig.ident.to_string();
+        let arg_types = non_receiver_arg_types(func);
+        let ret_type = match &func.sig.output {
+            ReturnType::Type(_, ty) => (**ty).clone(),
+            // A `-> ()` method's return type is unit (the carrier round-trips `()`).
+            ReturnType::Default => syn::parse_str("()").expect("unit type parses"),
+        };
+        specs.push(advisor::MethodSpec {
+            method_path: format!("{bean_ident}::{method_ident}"),
+            method_ident: Some(method_ident),
+            is_async: func.sig.asyncness.is_some(),
+            arg_types,
+            ret_type,
+        });
+    }
+    specs
+}
+
+/// `true` iff the method takes a `self`/`&self`/`&mut self` receiver.
+fn has_self_receiver(func: &ImplItemFn) -> bool {
+    func.sig.inputs.iter().any(|a| matches!(a, FnArg::Receiver(_)))
+}
+
+/// The NON-receiver argument types of a method, in order (the positional tuple the
+/// `ErasedArgs` carrier packs). The receiver is skipped; each typed param contributes
+/// its declared type VERBATIM (no `Ref<…>` stripping — these are real call args, not
+/// injection points).
+fn non_receiver_arg_types(func: &ImplItemFn) -> Vec<Type> {
+    func.sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            FnArg::Typed(pat_ty) => Some((*pat_ty.ty).clone()),
+            FnArg::Receiver(_) => None,
+        })
+        .collect()
+}
+
 /// The concrete `Self` type of an impl block (`impl AppConfig { .. }` → `AppConfig`).
 ///
 /// # Errors
@@ -607,5 +695,94 @@ mod tests {
         let item = impl_item("impl<T> AppConfig<T> { #[bean] fn pool(&self) -> Pool { todo!() } }");
         let err = emit_configuration_impl(&item).expect_err("a generic config hard-errors");
         assert!(err.message.contains("generic"), "got: {}", err.message);
+    }
+
+    // ── #[advisable] impl (the method-aware proxy-metadata form) ─────────────────
+
+    #[test]
+    fn an_advisable_impl_emits_join_points_and_a_method_table_for_each_self_method() {
+        // The headline: `#[advisable] impl OrderService { fn place_order(&self, amount:
+        // i64) -> i64 {..} }` emits BOTH the per-bean join-point spec (the ProxyPlan
+        // pointcut input) AND the per-bean method table (the transparent downcast
+        // thunks) — the two consts the auto-wire test previously hand-wrote.
+        let item = impl_item(
+            "impl OrderService {
+                fn new(repo: Ref<Repository>) -> Self { todo!() }
+                fn place_order(&self, amount: i64) -> i64 { todo!() }
+             }",
+        );
+        let ts = emit_advisable_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The join-point spec pairing const (the ProxyPlan input).
+        assert!(
+            s.contains("pubconst__leaf_joinpoints_OrderService:::leaf_core::BeanJoinPointsSpec"),
+            "got: {s}"
+        );
+        // The method table pairing static (the transparent downcast thunks).
+        assert!(
+            s.contains("pubstatic__leaf_methods_OrderService:&::leaf_core::MethodTable"),
+            "got: {s}"
+        );
+        // The advised method's MethodKey + downcast thunk (the `&self` method only —
+        // the associated `new` fn has no receiver, so it is NOT an advised call seam).
+        assert!(
+            s.contains(r#"::leaf_core::MethodKey::of("OrderService::place_order")"#),
+            "got: {s}"
+        );
+        assert!(s.contains("__target.place_order(__a0)"), "got: {s}");
+        assert!(!s.contains("OrderService::new"), "associated fn is not an advised seam: {s}");
+    }
+
+    #[test]
+    fn an_advisable_impl_threads_arg_and_ret_types_into_both_consts() {
+        let item = impl_item(
+            "impl OrderService {
+                fn place_order(&self, amount: i64) -> i64 { todo!() }
+             }",
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        // The join-point spec carries the method's arg/ret TypeIds.
+        assert!(s.contains("ret_type:const{::core::any::TypeId::of::<i64>()}"), "got: {s}");
+        assert!(s.contains("arg_types:&[const{::core::any::TypeId::of::<i64>()}]"), "got: {s}");
+        // The thunk unpacks the positional tuple of the same arg type.
+        assert!(s.contains("__args.unpack::<(i64,)>()"), "got: {s}");
+    }
+
+    #[test]
+    fn an_advisable_impl_detects_an_async_method() {
+        let item = impl_item(
+            "impl Svc {
+                async fn fetch(&self, id: u64) -> String { todo!() }
+             }",
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        assert!(s.contains("__target.fetch(__a0).await"), "got: {s}");
+    }
+
+    #[test]
+    fn an_advisable_impl_with_no_self_methods_emits_empty_consts() {
+        // Only associated fns => empty (no advisable call seam), but the consts still
+        // emit (so the JOIN by ContractId always finds a row).
+        let item = impl_item("impl Svc { fn make() -> Self { todo!() } }");
+        let ts = emit_advisable_impl(&item).expect("emits");
+        let s = flat(&ts);
+        assert!(s.contains("methods:&[]"), "got: {s}");
+        assert!(s.contains("::leaf_core::MethodTable(&[])"), "got: {s}");
+    }
+
+    #[test]
+    fn a_generic_advisable_impl_is_a_hard_error_with_register_proxy_hint() {
+        let item = impl_item("impl<T> Svc<T> { fn run(&self) {} }");
+        let err = emit_advisable_impl(&item).expect_err("a generic advisable impl hard-errors");
+        assert!(err.message.contains("generic"), "got: {}", err.message);
+        assert!(err.message.contains("register_proxy!"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn an_advisable_trait_impl_is_rejected() {
+        let item = impl_item("impl SomeTrait for Svc { fn f(&self) {} }");
+        let err = emit_advisable_impl(&item).expect_err("a trait impl is rejected");
+        assert!(err.message.contains("inherent"), "got: {}", err.message);
     }
 }

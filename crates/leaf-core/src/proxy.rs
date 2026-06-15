@@ -52,12 +52,18 @@ use crate::registry::Registry;
 
 /// The erased argument pack handed to an [`Interceptor`] / [`MethodEntry`].
 ///
-/// On the COMMON path the generated newtype keeps the typed tuple boxed exactly
-/// once as a `Box<dyn Any + Send + Sync>` (a MOVE of the whole tuple, not a
-/// per-arg box); typed around-advice reaches concrete args by downcasting back to
-/// the per-method tuple. The exact pack/unpack ABI is a Phase-4 measure; this is
-/// the stable kernel shape both the generated glue and the `ErasedProxy` fallback
-/// use.
+/// ## The settled pack/unpack ABI (proxy-interception §R2 — the Phase-4 measure)
+///
+/// The representation is a SINGLE owned `Box<dyn Any + Send + Sync>` carrying the
+/// method's POSITIONAL ARGUMENT TUPLE `(A0, A1, …)` — `()` for a no-arg method,
+/// `(A0,)` for one arg. On the COMMON path the generated newtype keeps that typed
+/// tuple boxed exactly ONCE (a MOVE of the whole tuple, NOT a per-arg box); typed
+/// around-advice + the auto-installed transparent proxy's [`MethodEntry`] thunk
+/// reach the concrete args by downcasting back to the SAME per-method tuple via
+/// [`ErasedArgs::unpack`]. This is the one stable kernel shape both the
+/// macro-emitted glue (the `__leaf_methods_<Ident>` downcast thunks `leaf-codegen`
+/// emits) and the dynamic [`ErasedProxy`] fallback use; the design's deferred
+/// Phase-4 ABI question is settled here as this minimal sound owned carrier.
 ///
 /// The `+ Sync` bound is load-bearing: the [`Call`] is shared by reference
 /// (`&Call`) across the REPLAYABLE [`Next::proceed`] boxed `Send` futures, so the
@@ -68,12 +74,17 @@ pub struct ErasedArgs(pub Box<dyn Any + Send + Sync>);
 
 impl ErasedArgs {
     /// Pack a typed argument tuple (the generated per-method glue calls this).
+    ///
+    /// The caller packs the method's POSITIONAL ARGUMENT TUPLE `(A0, A1, …)` — a
+    /// no-arg method packs `()` (or uses [`ErasedArgs::none`]), a one-arg method
+    /// packs `(a0,)` — and the matching [`MethodEntry`] thunk recovers it with
+    /// `unpack::<(A0, …)>()`. This is the settled positional-tuple ABI.
     #[must_use]
     pub fn pack<T: Any + Send + Sync>(args: T) -> Self {
         ErasedArgs(Box::new(args))
     }
 
-    /// An empty (unit) argument pack.
+    /// An empty (unit `()`) argument pack — the carrier for a no-arg advised method.
     #[must_use]
     pub fn none() -> Self {
         ErasedArgs(Box::new(()))

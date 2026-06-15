@@ -410,14 +410,50 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 // ═══════════════════ the declarative-advice / AOP surface ════════════════════
 
-/// `#[advisable]` — mark a `#[component]` struct as a PROXY TARGET (the transparent-
-/// newtype seam the proxy substrate wraps). Structurally a `#[component]`: it emits
-/// the same const `::leaf_core::Descriptor` row so the bean is registered and is
-/// resolvable; the proxy plan is built at refresh from the matching `ADVISORS`. A
-/// generic target hard-errors with the `register_proxy!(Concrete)` hint.
+/// `#[advisable]` — mark a bean as a PROXY TARGET (the transparent-newtype seam the
+/// proxy substrate wraps). TWO forms:
+///
+/// - on a STRUCT: structurally a `#[component]` — it emits the same const
+///   `::leaf_core::Descriptor` row so the bean is registered + resolvable, PLUS the
+///   per-bean join-point spec pairing const (`__leaf_joinpoints_<Ident>`) the
+///   `ProxyPlan` matches pointcuts over. A bare struct attr cannot enumerate the
+///   bean's methods, so its methods spec (and method table) is EMPTY — the impl-aware
+///   form supplies the per-method join points + downcast thunks.
+/// - on an inherent IMPL BLOCK (`#[advisable] impl Svc { fn place(&self, a: A) -> R
+///   {..} }`): the METHOD-AWARE form (proxy-interception phase3/08). The macro reads
+///   each `&self` method and emits the per-bean join-point spec
+///   (`__leaf_joinpoints_<Ident>`) + the per-bean method table
+///   (`__leaf_methods_<Ident>` — one downcast-thunk `::leaf_core::MethodEntry` per
+///   advised method) — the two consts the auto-proxy pipeline JOINs by `ContractId` so
+///   the transparent proxy auto-installs with NO hand-written `MethodTable` in user
+///   code. The impl block is kept verbatim.
+///
+/// A generic target hard-errors with the `register_proxy!(Concrete)` hint.
 #[proc_macro_attribute]
 pub fn advisable(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed = parse_macro_input!(item as ItemStruct);
+    let parsed_item = parse_macro_input!(item as Item);
+    // The METHOD-AWARE impl form: emit the join-point spec + the method table (the
+    // downcast thunks) for the impl's `&self` methods. The struct form (the
+    // Descriptor row) is the STRUCT attr's concern.
+    if let Item::Impl(item_impl) = parsed_item {
+        return match config_impl::emit_advisable_impl(&item_impl) {
+            Ok(rows) => quote! { #item_impl #rows }.into(),
+            Err(err) => {
+                let error = compile_error(&err);
+                quote! { #item_impl #error }.into()
+            }
+        };
+    }
+    let Item::Struct(parsed) = parsed_item else {
+        return quote! {
+            #parsed_item
+            ::core::compile_error!(
+                "#[advisable] applies to a `struct` (the proxy-target bean) or an \
+                 inherent `impl` block (its advisable `&self` methods)"
+            );
+        }
+        .into();
+    };
     match stereotype::emit_struct(&parsed, Stereotype::Component, attr.into()) {
         Ok(rows) => {
             // ALSO emit the per-bean join-point spec pairing const (bean_type +

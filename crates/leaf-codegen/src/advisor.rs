@@ -257,10 +257,30 @@ pub fn emit_advisor(
 pub struct MethodSpec {
     /// The canonical `Bean::method` path minting the method's stable `MethodKey`.
     pub method_path: String,
+    /// The method's callable ident on the concrete bean (e.g. `place_order`) — what
+    /// the [`emit_method_table`] downcast thunk invokes on the downcast target. The
+    /// join-point form ([`emit_join_points`]) does not read it; defaults to the last
+    /// `::`-segment of `method_path` via [`MethodSpec::call_ident`] when unset.
+    pub method_ident: Option<String>,
+    /// `true` iff the method is `async fn` — the thunk `.await`s the call before
+    /// packing the [`ErasedRet`] (a sync method is awaited via an immediate value).
+    pub is_async: bool,
     /// The method's argument types (lowered through the const `TypeId`-of seam).
     pub arg_types: Vec<syn::Type>,
     /// The method's return type (lowered through the const `TypeId`-of seam).
     pub ret_type: syn::Type,
+}
+
+impl MethodSpec {
+    /// The callable method ident — the explicit [`MethodSpec::method_ident`], else the
+    /// last `::`-segment of [`MethodSpec::method_path`] (`"Svc::place"` → `"place"`).
+    #[must_use]
+    pub fn call_ident(&self) -> &str {
+        match &self.method_ident {
+            Some(id) => id.as_str(),
+            None => self.method_path.rsplit("::").next().unwrap_or(&self.method_path),
+        }
+    }
 }
 
 /// Emit the PUBLIC per-bean join-point spec pairing const for an advisable bean: a
@@ -308,6 +328,114 @@ pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]
             markers: &#meta_ident,
             methods: &[ #(#method_rows),* ],
         };
+    }
+}
+
+/// Emit the PUBLIC per-bean METHOD TABLE pairing const for an advisable bean: a
+/// `&'static ::leaf_core::MethodTable` named `__leaf_methods_<Ident>` carrying one
+/// `::leaf_core::MethodEntry` per advised method, each with a generated DOWNCAST
+/// THUNK that drives the REAL method over the resolved [`leaf_core::ErasedBean`].
+///
+/// This is the proxy analogue of `__leaf_joinpoints_<Ident>` (the join-point spec the
+/// `ProxyPlan` matches pointcuts over): leaf-boot's `InstalledProxies::install_with_tables`
+/// JOINs it to the bean's frozen `BeanId` by `ContractId`, and
+/// `InstalledProxies::invoke` terminates the auto-installed `AdviceChain` in the
+/// matching `MethodEntry.invoke` thunk — so a `#[advisable]`/`#[aspect]` bean is advised
+/// with NO hand-written `MethodTable`/`MethodEntry` in user code.
+///
+/// ## The thunk shape (the settled erased dispatch ABI)
+///
+/// Each thunk realizes the leaf-core `ErasedArgs`/`ErasedRet` ABI (proxy-interception
+/// §R2 erased fallback, the design's Phase-4 measure now settled): the per-bean glue
+/// keeps the COMMON typed path a single owned `Box<dyn Any+Send+Sync>` move (never a
+/// per-arg box). The carrier is the method's POSITIONAL ARGUMENT TUPLE
+/// `(A0, A1, …)` — `()` for a no-arg method, `(A0,)` for one arg — so a thunk:
+///
+/// 1. `::std::sync::Arc::clone(bean).downcast::<#self_ty>()` → the concrete target
+///    (a `DowncastMismatch` if the published bean is not the expected type);
+/// 2. `args.unpack::<(A0, …)>()` → the typed tuple (a `DowncastMismatch` on a
+///    carrier-type mismatch), destructured into the positional params;
+/// 3. calls (`.await`s, if `is_async`) the real method on the downcast target;
+/// 4. `::leaf_core::ErasedRet::pack(ret)` → the erased return the chain unwinds.
+///
+/// A bare struct form supplies no methods (an empty table); the method-aware
+/// impl-block form / the binary supplies the per-method specs.
+#[must_use]
+pub fn emit_method_table(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]) -> TokenStream {
+    let mangled = mangle(ident);
+    let table_ident = format_ident!("__leaf_methods_{}", mangled);
+
+    // One generated downcast-thunk fn per advised method + the MethodEntry row that
+    // points at it. The thunk fn is named off the bean + method so two methods on one
+    // bean (and two beans in one module) never collide.
+    let mut thunk_fns = TokenStream::new();
+    let mut entries = TokenStream::new();
+    for method in methods {
+        let path = &method.method_path;
+        let call_ident = format_ident!("{}", method.call_ident());
+        let thunk_ident = format_ident!("__leaf_invoke_{}_{}", mangled, mangle(method.call_ident()));
+
+        // The positional arg binding idents + the tuple type the carrier unpacks to.
+        let arg_idents: Vec<syn::Ident> =
+            (0..method.arg_types.len()).map(|i| format_ident!("__a{}", i)).collect();
+        let arg_tys = &method.arg_types;
+        let tuple_ty = quote! { ( #( #arg_tys, )* ) };
+        let unpack_pat = quote! { ( #( #arg_idents, )* ) };
+
+        // The real-method call on the downcast target; `.await` iff the method is async.
+        let call = quote! { __target.#call_ident( #( #arg_idents ),* ) };
+        let invoke_call = if method.is_async {
+            quote! { #call.await }
+        } else {
+            quote! { #call }
+        };
+
+        thunk_fns.extend(quote! {
+            // The macro-emitted downcast thunk: unpack the ErasedArgs tuple, downcast
+            // the target to the concrete bean, call (await) the real method, pack the
+            // ErasedRet. The single owned-tuple move IS the typed common path (no
+            // per-arg box); a carrier/target mismatch is a loud DowncastMismatch.
+            #[allow(non_snake_case)]
+            fn #thunk_ident(
+                __bean: &::leaf_core::ErasedBean,
+                __args: ::leaf_core::ErasedArgs,
+                __cx: &::leaf_core::ResolveCtx<'_>,
+            ) -> ::leaf_core::BoxFuture<'static, ::core::result::Result<::leaf_core::ErasedRet, ::leaf_core::AdviceError>> {
+                let __ = __cx;
+                let __downcast = ::std::sync::Arc::clone(__bean).downcast::<#self_ty>();
+                ::std::boxed::Box::pin(async move {
+                    let __target = __downcast.map_err(|_| {
+                        ::leaf_core::AdviceError::DowncastMismatch {
+                            method: ::leaf_core::MethodKey::of(#path),
+                        }
+                    })?;
+                    let #unpack_pat = __args.unpack::<#tuple_ty>().map_err(|_| {
+                        ::leaf_core::AdviceError::DowncastMismatch {
+                            method: ::leaf_core::MethodKey::of(#path),
+                        }
+                    })?;
+                    ::core::result::Result::Ok(::leaf_core::ErasedRet::pack(#invoke_call))
+                })
+            }
+        });
+
+        entries.extend(quote! {
+            ::leaf_core::MethodEntry {
+                key: ::leaf_core::MethodKey::of(#path),
+                invoke: #thunk_ident,
+            },
+        });
+    }
+
+    quote! {
+        #thunk_fns
+        // The PUBLIC per-bean method table pairing const (the downcast-thunk index):
+        // leaf-boot's InstalledProxies::install_with_tables JOINs it by ContractId, and
+        // InstalledProxies::invoke routes a call by MethodKey through the auto-installed
+        // chain, terminating in the matching MethodEntry.invoke thunk.
+        #[allow(non_upper_case_globals)]
+        pub static #table_ident: &::leaf_core::MethodTable =
+            &::leaf_core::MethodTable(&[ #entries ]);
     }
 }
 
@@ -527,6 +655,8 @@ mod tests {
         // MethodJoinPointSpec per advisable method: its MethodKey + const arg/ret types.
         let methods = vec![MethodSpec {
             method_path: "OrderService::place_order".into(),
+            method_ident: Some("place_order".into()),
+            is_async: false,
             arg_types: vec![ty("i64")],
             ret_type: ty("i64"),
         }];
@@ -538,5 +668,148 @@ mod tests {
         );
         assert!(s.contains("ret_type:const{::core::any::TypeId::of::<i64>()}"), "got: {s}");
         assert!(s.contains("arg_types:&[const{::core::any::TypeId::of::<i64>()}]"), "got: {s}");
+    }
+
+    // ── per-bean method table (the transparent-proxy downcast thunks) ─────────────
+
+    #[test]
+    fn method_spec_call_ident_falls_back_to_the_last_path_segment() {
+        let m = MethodSpec {
+            method_path: "OrderService::place_order".into(),
+            method_ident: None,
+            is_async: false,
+            arg_types: vec![],
+            ret_type: ty("()"),
+        };
+        assert_eq!(m.call_ident(), "place_order");
+        let m2 = MethodSpec { method_ident: Some("renamed".into()), ..m };
+        assert_eq!(m2.call_ident(), "renamed");
+    }
+
+    #[test]
+    fn emits_a_public_method_table_pairing_static() {
+        // The headline: an advisable bean emits a PUBLIC `__leaf_methods_<Ident>` of
+        // the runtime `&'static ::leaf_core::MethodTable` type (one downcast-thunk
+        // MethodEntry per advised method), so leaf-boot's InstalledProxies JOINs it by
+        // ContractId — the proxy analogue of `__leaf_methods_<Ident>` the auto-wire
+        // test previously hand-wrote.
+        let methods = vec![MethodSpec {
+            method_path: "OrderService::place_order".into(),
+            method_ident: Some("place_order".into()),
+            is_async: false,
+            arg_types: vec![ty("i64")],
+            ret_type: ty("i64"),
+        }];
+        let ts = emit_method_table("OrderService", &ty("OrderService"), &methods);
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        assert!(
+            s.contains(
+                "pubstatic__leaf_methods_OrderService:&::leaf_core::MethodTable=&::leaf_core::MethodTable(&["
+            ),
+            "got: {s}"
+        );
+        // One MethodEntry keyed by the method's stable MethodKey, pointing at the thunk.
+        assert!(s.contains("::leaf_core::MethodEntry{"), "got: {s}");
+        assert!(
+            s.contains(r#"key:::leaf_core::MethodKey::of("OrderService::place_order")"#),
+            "got: {s}"
+        );
+        assert!(s.contains("invoke:__leaf_invoke_OrderService_place_order"), "got: {s}");
+    }
+
+    #[test]
+    fn method_table_thunk_downcasts_unpacks_calls_and_packs() {
+        // The thunk realizes the ErasedArgs/ErasedRet ABI: downcast the ErasedBean to
+        // the concrete bean, unpack the positional arg tuple, call the real method,
+        // pack the ErasedRet — the exact shape the auto-wire test hand-wrote.
+        let methods = vec![MethodSpec {
+            method_path: "OrderService::place_order".into(),
+            method_ident: Some("place_order".into()),
+            is_async: false,
+            arg_types: vec![ty("i64")],
+            ret_type: ty("i64"),
+        }];
+        let s = flat(&emit_method_table("OrderService", &ty("OrderService"), &methods));
+        // The thunk fn has the MethodEntry.invoke fn-pointer signature.
+        assert!(
+            s.contains(
+                "fn__leaf_invoke_OrderService_place_order(__bean:&::leaf_core::ErasedBean,__args:::leaf_core::ErasedArgs,__cx:&::leaf_core::ResolveCtx<'_>,)"
+            ),
+            "got: {s}"
+        );
+        // (1) downcast the erased bean to the concrete bean type.
+        assert!(
+            s.contains("::std::sync::Arc::clone(__bean).downcast::<OrderService>()"),
+            "got: {s}"
+        );
+        // (2) unpack the POSITIONAL ARG TUPLE (one arg => a 1-tuple).
+        assert!(s.contains("__args.unpack::<(i64,)>()"), "got: {s}");
+        // (3) call the real method on the downcast target with the unpacked args.
+        assert!(s.contains("__target.place_order(__a0)"), "got: {s}");
+        // (4) pack the typed return into the ErasedRet.
+        assert!(s.contains("::leaf_core::ErasedRet::pack(__target.place_order(__a0))"), "got: {s}");
+        // A mismatch on either downcast is a loud DowncastMismatch (never silent).
+        assert!(s.contains("::leaf_core::AdviceError::DowncastMismatch"), "got: {s}");
+    }
+
+    #[test]
+    fn method_table_thunk_awaits_an_async_method() {
+        // An async method is `.await`ed before the ErasedRet is packed.
+        let methods = vec![MethodSpec {
+            method_path: "OrderService::place_order".into(),
+            method_ident: Some("place_order".into()),
+            is_async: true,
+            arg_types: vec![ty("i64")],
+            ret_type: ty("i64"),
+        }];
+        let s = flat(&emit_method_table("OrderService", &ty("OrderService"), &methods));
+        assert!(
+            s.contains("::leaf_core::ErasedRet::pack(__target.place_order(__a0).await)"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn method_table_thunk_handles_a_no_arg_method() {
+        // A no-arg method unpacks the unit tuple `()` and calls with no args.
+        let methods = vec![MethodSpec {
+            method_path: "Svc::ping".into(),
+            method_ident: Some("ping".into()),
+            is_async: false,
+            arg_types: vec![],
+            ret_type: ty("u8"),
+        }];
+        let s = flat(&emit_method_table("Svc", &ty("Svc"), &methods));
+        assert!(s.contains("__args.unpack::<()>()"), "got: {s}");
+        assert!(s.contains("::leaf_core::ErasedRet::pack(__target.ping())"), "got: {s}");
+    }
+
+    #[test]
+    fn method_table_thunk_handles_multiple_args() {
+        // Two args => a 2-tuple carrier destructured into both positional params.
+        let methods = vec![MethodSpec {
+            method_path: "Svc::add".into(),
+            method_ident: Some("add".into()),
+            is_async: false,
+            arg_types: vec![ty("i64"), ty("u32")],
+            ret_type: ty("i64"),
+        }];
+        let s = flat(&emit_method_table("Svc", &ty("Svc"), &methods));
+        assert!(s.contains("__args.unpack::<(i64,u32,)>()"), "got: {s}");
+        assert!(s.contains("__target.add(__a0,__a1)"), "got: {s}");
+    }
+
+    #[test]
+    fn an_empty_method_table_is_a_valid_empty_const() {
+        // A bare struct form has no enumerable methods — an honest empty table (the
+        // bean is registered + matchable but has no transparently-invocable methods).
+        let ts = emit_method_table("Bare", &ty("Bare"), &[]);
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("pubstatic__leaf_methods_Bare:&::leaf_core::MethodTable=&::leaf_core::MethodTable(&[])"),
+            "got: {s}"
+        );
     }
 }
