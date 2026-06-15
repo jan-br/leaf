@@ -41,6 +41,7 @@ once_cell = "1"
 futures = "0.3"
 linkme = "0.3"
 pin-project-lite = "0.2"
+tokio = { version = "1", default-features = false }
 
 # Codegen deps (leaf-codegen is a normal lib using proc-macro2/syn/quote so it is
 # unit-testable without a compiler; leaf-macros is the thin proc-macro that calls it).
@@ -50,3 +51,4 @@ syn = { version = "2", features = ["full", "extra-traits", "visit"] }
 serde_json = "1"
 toml = "0.8"
 trybuild = "1"
+yaml-rust2 = "0.11"

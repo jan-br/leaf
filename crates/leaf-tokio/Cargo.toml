@@ -6,3 +6,12 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+futures.workspace = true
+once_cell.workspace = true
+
+[dependencies.tokio]
+workspace = true
+features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "io-util"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "io-util", "test-util"] }

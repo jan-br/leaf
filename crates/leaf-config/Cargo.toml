@@ -6,3 +6,10 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+serde_json.workspace = true
+yaml-rust2.workspace = true
+
+[dev-dependencies]
+# Only to drive the async `ConfigDataLoader::load` BoxFuture path in tests
+# (the production driver is leaf-boot's bootstrap ExecutionFacility).
+futures.workspace = true
