@@ -1,0 +1,7 @@
+error: `#[inject]` marks the constructor of an `#[advisable] impl Bean { .. }` block: the impl-block macro reads the marked constructor and lowers its parameters to the bean's injection plan + provider (a method-position attribute alone cannot emit the sibling `SEED_PAIRINGS`/`INJECTION_PLAN_PAIRINGS` rows). Put the `#[advisable]` attribute on the enclosing impl block.
+  --> tests/ui/inject_outside_advisable_is_a_hard_error.rs:12:1
+   |
+12 | #[inject]
+   | ^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `inject` (in Nightly builds, run with -Z macro-backtrace for more info)

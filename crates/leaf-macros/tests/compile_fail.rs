@@ -41,4 +41,9 @@ fn ui() {
     // method-position attr alone cannot emit the sibling ADVISOR_PAIRINGS row). The
     // WORKING impl-block form is exercised by the concern crates' auto_advise tests.
     t.compile_fail("tests/ui/concern_outside_advisable_is_a_hard_error.rs");
+    // `#[inject]` applied STANDALONE (not on the constructor of an `#[advisable] impl`)
+    // is a loud error: a method-position attr alone cannot emit the sibling
+    // SEED_PAIRINGS/INJECTION_PLAN_PAIRINGS constructor rows. It steers to the
+    // impl-block form (`#[inject]` marks the constructor of an `#[advisable]` impl).
+    t.compile_fail("tests/ui/inject_outside_advisable_is_a_hard_error.rs");
 }
