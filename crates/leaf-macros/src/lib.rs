@@ -36,6 +36,7 @@ use leaf_codegen::descriptor::EmitError;
 use leaf_codegen::listener;
 use leaf_codegen::scheduling;
 use leaf_codegen::stereotype::{self, Stereotype};
+use leaf_codegen::validate;
 
 /// Turn an [`EmitError`] into a `compile_error!` token stream (the one
 /// error→diagnostic lowering the thin macros share).
@@ -240,6 +241,26 @@ fn expand_stereotype(attr: TokenStream, item: TokenStream, stereotype: Stereotyp
 pub fn derive_bind_target(item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     match config::emit_bind_target(&input) {
+        Ok(ts) => ts.into(),
+        Err(err) => compile_error(&err).into(),
+    }
+}
+
+/// `#[derive(Validate)]` — derive the cascade-aware
+/// `::leaf_validation::ValidateInto` impl for a named-field struct from its
+/// `#[validate(..)]` field attributes (one constraint check per attr, in declaration
+/// order). The emitted body drives `::leaf_validation::constraints::*` checkers (and
+/// the `@Valid`-nested `Cascade::enter` cascade for a `#[validate(nested)]` field)
+/// through the one `Cascade` — the SAME engine a hand `impl ValidateInto` writes.
+///
+/// All emitted paths are absolute `::leaf_validation::` (leaf-codegen depends only on
+/// leaf-core; the user crate supplies leaf-validation). A generic or non-struct
+/// target is a Tier-0 `compile_error!`. The `#[validate(..)]` field attribute is
+/// declared as an inert helper via `attributes(validate)`.
+#[proc_macro_derive(Validate, attributes(validate))]
+pub fn derive_validate(item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    match validate::emit_validate(&input) {
         Ok(ts) => ts.into(),
         Err(err) => compile_error(&err).into(),
     }

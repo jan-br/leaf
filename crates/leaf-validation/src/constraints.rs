@@ -3,10 +3,10 @@
 //! Each constraint is a plain `fn(&T, &Params) -> Option<Violation>` over an
 //! already-converted value — the "compiled-in, path-referenced checker" model the
 //! design pins (R1): a constraint is NAMED at the derive/check site, never
-//! runtime-discovered, and is generics-friendly (monomorphized per use). A
-//! `#[derive(Validate)]` (deferred — a NOTE in the crate docs) would emit calls to
-//! exactly these fns; until it lands a hand-written `impl Validate` calls them via
-//! the [`ValidationContext`] helpers in [`crate::cascade`].
+//! runtime-discovered, and is generics-friendly (monomorphized per use). The
+//! `#[derive(Validate)]` derive emits calls to exactly these fns (a hand-written
+//! `impl ValidateInto` calls the same fns directly via the [`Cascade`](crate::Cascade)
+//! helpers in [`crate::cascade`]).
 //!
 //! A constraint returns `Some(Violation)` on FAILURE (collect-all: the caller pushes
 //! it into the [`ValidationContext`] and keeps going — never fail-first) and `None`

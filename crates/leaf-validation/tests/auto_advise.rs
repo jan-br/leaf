@@ -10,11 +10,13 @@
 //! hand-written `ADVISOR_PAIRINGS` row):
 //! - a `#[component]` + `#[advisable]` `SignupService` whose `create(req: CreateUser)`
 //!   method carries `#[validated]` and takes a `@Valid` argument — the ADVISED bean;
-//! - a `CreateUser` arg type with a hand-written `impl ValidateInto` (the
-//!   `#[derive(Validate)]` constraint-derive is its own deferred macro; the
-//!   `#[validated]` ADVISOR macro is what this test exercises);
-//! - a `#[config_properties]`-shaped `PoolProps` bean whose `max-connections` field
-//!   carries a `range(min=1)` constraint — proving FACE 3 (config-binding validation).
+//! - a `CreateUser` arg type whose constraints come from `#[derive(Validate)]` (the
+//!   constraint-derive); the `#[validated]` ADVISOR macro is what the run test
+//!   exercises, and the derive supplies the `ValidateInto` it runs;
+//! - a `#[config_properties(prefix = "app", validate)]` + `#[derive(Validate)]`
+//!   `PoolProps` bean whose `max-connections` field carries a `min(1)` constraint —
+//!   proving FACE 3 (config-binding validation) end-to-end through the REAL
+//!   macro-emitted C2 bind thunk (the `validate` flag's bind→validate gate).
 //!
 //! The `#[validated]` annotation on the `#[advisable]`-impl `create` method is what the
 //! impl-block macro lowers to the const `ADVISOR_PAIRINGS` row (the validation advisor
@@ -40,25 +42,22 @@ use leaf_core::{ContractId, ErasedArgs, ErrorKind, LeafError, MethodKey};
 // `#[validated]` is NOT imported: it is a per-method MARKER the `#[advisable]` impl
 // macro STRIPS + lowers (the impl-block macro owns the row), so — exactly like
 // `#[bean]` inside `#[configuration] impl` — it needs no import.
-use leaf_macros::{advisable, register_component};
-use leaf_validation::{validate_config, Cascade, ValidateInto};
+use leaf_macros::{advisable, config_properties, register_component, Validate};
 
 // ─────────────────────────── the @Valid argument type ───────────────────────
 
-/// The `@Valid` argument: a signup request. Constraints travel WITH the type (a hand
-/// `impl ValidateInto` — the `#[derive(Validate)]` macro is deferred). `name` must be
-/// non-empty; `age` must be in `[0, 150]`.
-#[derive(Debug, Clone)]
+/// The `@Valid` argument: a signup request. Constraints travel WITH the type — now
+/// via `#[derive(Validate)]` (the constraint-derive, which emits the SAME
+/// `not_empty`/`range` cascade the prior hand `impl ValidateInto` wrote: this test's
+/// unchanged short-circuit + aggregated-violation assertions prove the derive
+/// reproduces the hand behaviour byte-for-byte). `name` must be non-empty; `age` must
+/// be in `[0, 150]`.
+#[derive(Debug, Clone, Validate)]
 struct CreateUser {
+    #[validate(not_empty)]
     name: String,
+    #[validate(range(min = 0, max = 150))]
     age: i64,
-}
-
-impl ValidateInto for CreateUser {
-    fn validate_into(&self, c: &mut Cascade<'_>) {
-        c.check("name", leaf_validation::constraints::not_empty(&self.name));
-        c.check("age", leaf_validation::constraints::range(self.age, 0, 150));
-    }
 }
 
 // ───────────────────────── the advised service bean ─────────────────────────
@@ -98,17 +97,26 @@ impl SignupService {
 
 // ───────────────── FACE 3: a @ConfigurationProperties with range(min=1) ──────
 
-/// A `@ConfigurationProperties` bean whose `max-connections` carries `range(min=1)`
-/// (FACE 3 — the config-binding JSR validation half). The hand `impl ValidateInto`
-/// stands in for the deferred derive.
-#[derive(Debug, Default)]
+/// A `@ConfigurationProperties` bean whose `max-connections` carries `min(1)`
+/// (FACE 3 — the config-binding JSR validation half). It is BOTH
+/// `#[config_properties(prefix = "app", validate)]` (so the macro-emitted C2 bind
+/// thunk runs JSR validation over the bound value) AND `#[derive(Validate)]` (the
+/// constraint-derive supplying the `ValidateInto` the thunk calls). Its `Default`
+/// yields a VALID `max_connections` (1) so the empty-env C2 validate during the
+/// `Application::run` test above binds the default-filled bean clean — the failing
+/// case is driven explicitly through the thunk with a bad env value below.
+#[config_properties(prefix = "app", validate)]
+#[derive(Debug, Validate)]
 struct PoolProps {
+    #[validate(min = 1)]
     max_connections: i64,
 }
 
-impl ValidateInto for PoolProps {
-    fn validate_into(&self, c: &mut Cascade<'_>) {
-        c.check("max-connections", leaf_validation::constraints::min(self.max_connections, 1));
+impl Default for PoolProps {
+    fn default() -> Self {
+        // A valid default (>= 1): the empty-env C2 validate (the sibling run test)
+        // binds + validates this default-filled bean WITHOUT a fault.
+        PoolProps { max_connections: 1 }
     }
 }
 
@@ -203,21 +211,57 @@ async fn a_validated_bean_auto_advises_through_run_and_a_bad_arg_short_circuits(
     assert_eq!(report.run_state, leaf_core::RunState::Closed, "the context closed");
 }
 
+/// Find the macro-emitted `__leaf_config_bind_<Ident>` thunk for a config bean on the
+/// `CONFIG_BIND_PAIRINGS` slice by its module-qualified contract id (the auto-collect
+/// substrate the leaf-boot C2 validate sub-pass JOINs over).
+fn config_bind_thunk(ident: &str) -> leaf_core::ConfigBindThunk {
+    let module = module_path!();
+    let contract = ContractId::of(&format!("{module}::{ident}"));
+    leaf_core::collect_slice(&leaf_core::CONFIG_BIND_PAIRINGS)
+        .iter()
+        .find(|r| r.contract == contract)
+        .expect("the #[config_properties] bind thunk auto-collected into CONFIG_BIND_PAIRINGS")
+        .thunk
+}
+
+/// Build a sealed `Env` from raw canonical pairs (the binder reads `app.max-connections`).
+fn env_from(pairs: &[(&str, &str)]) -> leaf_core::Env {
+    let mut b = leaf_core::EnvBuilder::new();
+    b.add_last(Arc::new(leaf_core::MapPropertySource::from_pairs(
+        "test",
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+    )));
+    b.seal_env()
+}
+
 #[test]
-fn a_config_properties_with_range_min_1_fails_at_validate_via_the_bind_handler() {
-    // FACE 3: the binder-side adapter runs the SAME engine after a bind. A bound
-    // PoolProps with max-connections = 0 violates range(min=1) and fails at VALIDATE
-    // with the canonical property KEY (`app.max-connections`) — the leaf-config/
-    // leaf-boot C2 path's missing validation half.
+fn a_config_properties_validate_flag_fails_through_the_real_bind_thunk() {
+    // FACE 3 END-TO-END: the `#[config_properties(prefix = "app", validate)]`
+    // macro-emitted C2 bind thunk (NOT a direct `validate_config` call) binds
+    // PoolProps from the env AND runs JSR validation over the bound value. A bad env
+    // value (`app.max-connections = 0`, violating `min(1)`) drives the thunk to the
+    // aggregated `ValidationError` keyed `app.max-connections`. This proves the
+    // codegen `validate` flag wires the bind→validate gate the thunk previously
+    // SKIPPED (the `validate_config` adapter was tested but never called by the thunk).
+    let thunk = config_bind_thunk("PoolProps");
 
-    // A clean value (>= 1) binds without fault.
-    let ok = PoolProps { max_connections: 8 };
-    assert!(validate_config("app", &ok).is_none(), "max-connections=8 satisfies range(min=1)");
+    // A clean env value (>= 1) binds + validates WITHOUT a fault → Ok(Published).
+    thunk(&env_from(&[("app.max-connections", "8")]), leaf_core::StartupValidation::Strict)
+        .expect("max-connections=8 satisfies min(1): the bind+validate succeeds");
 
-    // max-connections = 0 fails at validate.
-    let bad = PoolProps { max_connections: 0 };
-    let err = validate_config("app", &bad).expect("range(min=1) fails at validate via the bind handler");
-    assert_eq!(err.kind, ErrorKind::ValidationError);
+    // The UNBOUND/default arm also validates: an empty env binds the (valid) default.
+    thunk(&env_from(&[]), leaf_core::StartupValidation::Strict)
+        .expect("the default (max_connections=1) is valid: the default arm binds clean");
+
+    // max-connections = 0 fails JSR validation INSIDE the thunk → Err(vec![verr]).
+    let faults = thunk(
+        &env_from(&[("app.max-connections", "0")]),
+        leaf_core::StartupValidation::Strict,
+    )
+    .expect_err("max-connections=0 violates min(1): the thunk SHORT-CIRCUITS with the fault");
+    assert_eq!(faults.len(), 1, "one aggregated ValidationError from the thunk");
+    let err: &LeafError = &faults[0];
+    assert_eq!(err.kind, ErrorKind::ValidationError, "the validate flag surfaces a ValidationError");
     assert_eq!(err.chain.len(), 1, "one violation");
     let detail = err.chain[0].detail.to_string();
     assert!(

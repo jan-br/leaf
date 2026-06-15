@@ -128,21 +128,19 @@ fn aggregate_config(prefix: &str, violations: &[Violation]) -> Option<LeafError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cascade::{AsValidate, Cascade};
-    use crate::constraints;
+    use crate::cascade::AsValidate;
+    use leaf_macros::Validate;
 
-    // A @ConfigurationProperties bean: app.* with a range(min=1) field.
-    #[derive(Debug, Default)]
+    // A @ConfigurationProperties bean: app.* with a range(min=1) field. The hand
+    // `impl ValidateInto` is now DERIVED — the `max-connections` canonical segment
+    // (from the `max_connections` field) + the `host` not_empty check reproduce the
+    // prior hand impl, so the unchanged canonical-KEY assertions below still hold.
+    #[derive(Debug, Default, Validate)]
     struct PoolProps {
+        #[validate(min = 1)]
         max_connections: i64,
+        #[validate(not_empty)]
         host: String,
-    }
-    impl ValidateInto for PoolProps {
-        fn validate_into(&self, c: &mut Cascade<'_>) {
-            // range(min=1): max_connections must be >= 1.
-            c.check("max-connections", constraints::min(self.max_connections, 1));
-            c.check("host", constraints::not_empty(&self.host));
-        }
     }
 
     #[test]

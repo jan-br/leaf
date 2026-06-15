@@ -269,6 +269,12 @@ fn vec_elem(ty: &Type) -> Type {
 pub struct ConfigPropertiesArgs {
     /// The canonical config-key prefix this bean binds under (required).
     pub prefix: String,
+    /// Whether the bean opts into post-bind JSR validation: a bare `validate` flag
+    /// makes the C2 bind thunk run `::leaf_validation::validate_config` over the bound
+    /// value (the bean must `#[derive(Validate)]` / `impl ValidateInto`) and surface
+    /// the aggregated `ValidationError` as a bind fault. Off by default — an existing
+    /// non-`Validate` config bean is unaffected.
+    pub validate: bool,
 }
 
 /// Parse the `#[config_properties(prefix = "app")]` attribute body.
@@ -282,22 +288,46 @@ pub fn parse_config_args(attr: TokenStream) -> Result<ConfigPropertiesArgs, Emit
         message: format!("malformed #[config_properties] arguments: {e}"),
     })?;
     let mut prefix = None;
+    let mut validate = false;
     for meta in metas {
-        let syn::Meta::NameValue(nv) = meta else {
-            return Err(EmitError {
-                message: "#[config_properties] arguments must be `key = \"value\"` pairs".into(),
-            });
-        };
-        let key = nv.path.get_ident().map(ToString::to_string).unwrap_or_default();
-        match key.as_str() {
-            "prefix" => {
-                prefix = Some(str_value(&nv.value).ok_or_else(|| EmitError {
-                    message: "`prefix` must be a string literal".into(),
-                })?);
+        match meta {
+            // The `prefix = "..."` key-value pair (required).
+            syn::Meta::NameValue(nv) => {
+                let key = nv.path.get_ident().map(ToString::to_string).unwrap_or_default();
+                match key.as_str() {
+                    "prefix" => {
+                        prefix = Some(str_value(&nv.value).ok_or_else(|| EmitError {
+                            message: "`prefix` must be a string literal".into(),
+                        })?);
+                    }
+                    other => {
+                        return Err(EmitError {
+                            message: format!(
+                                "unknown #[config_properties] argument `{other}` (expected `prefix` / `validate`)"
+                            ),
+                        });
+                    }
+                }
             }
-            other => {
+            // The bare-path `validate` opt-in flag.
+            syn::Meta::Path(path) => {
+                let key = path.get_ident().map(ToString::to_string).unwrap_or_default();
+                match key.as_str() {
+                    "validate" => validate = true,
+                    other => {
+                        return Err(EmitError {
+                            message: format!(
+                                "unknown #[config_properties] argument `{other}` (expected `prefix` / `validate`)"
+                            ),
+                        });
+                    }
+                }
+            }
+            syn::Meta::List(_) => {
                 return Err(EmitError {
-                    message: format!("unknown #[config_properties] argument `{other}` (expected `prefix`)"),
+                    message: "#[config_properties] arguments are `prefix = \"...\"` and the bare \
+                              `validate` flag"
+                        .into(),
                 });
             }
         }
@@ -305,7 +335,7 @@ pub fn parse_config_args(attr: TokenStream) -> Result<ConfigPropertiesArgs, Emit
     let prefix = prefix.ok_or_else(|| EmitError {
         message: "#[config_properties] requires a `prefix = \"...\"` argument".into(),
     })?;
-    Ok(ConfigPropertiesArgs { prefix })
+    Ok(ConfigPropertiesArgs { prefix, validate })
 }
 
 /// Emit the full `#[config_properties(prefix = "app")]` artifact: the
@@ -341,7 +371,7 @@ pub fn emit_config_properties(
 
     let prefix = &args.prefix;
     let ident_str = ident.to_string();
-    let bind_thunk = emit_config_bind_thunk(ident, prefix, &bind_thunk_ident);
+    let bind_thunk = emit_config_bind_thunk(ident, prefix, &bind_thunk_ident, args.validate);
 
     // The config bean's AUTO_CONFIGS registration (the Descriptor + seed + the
     // SEED_PAIRINGS row), so the bean auto-registers from the slices alone — no
@@ -538,13 +568,36 @@ fn emit_config_bean_registration(
 ///
 /// The JSR `ValidationBindHandler` lives in leaf-validation (out of this codegen
 /// unit's leaf-core-only dependency surface); the thunk runs the stock
-/// `NoopBindHandler`, so bind/convert faults surface here and JSR validation is the
-/// leaf-validation force-link's concern (the bind itself is the structural C2 gate).
+/// `NoopBindHandler`, so bind/convert faults surface here. When `validate` is set the
+/// thunk ALSO runs `::leaf_validation::validate_config(prefix, &__bound)` over the
+/// bound value (the bean must `#[derive(Validate)]`) before wrapping in `Published`,
+/// short-circuiting with the aggregated `ValidationError` as a bind fault — Spring
+/// validates the bound bean INCLUDING defaults, so BOTH the Bound and the
+/// Unbound/default arm validate. When `validate` is NOT set the thunk is exactly the
+/// prior NoopBindHandler bind (existing non-`Validate` config beans are unaffected).
 fn emit_config_bind_thunk(
     ident: &syn::Ident,
     prefix: &str,
     thunk_ident: &syn::Ident,
+    validate: bool,
 ) -> TokenStream {
+    // The shared per-arm tail: validate the bound value (opt-in) then publish it. The
+    // bound value lives in `__bound` in BOTH arms so one tail serves the Bound arm and
+    // the Unbound/default arm — Spring validates the bound bean including defaults.
+    let publish = if validate {
+        quote! {
+            if let ::core::option::Option::Some(__verr) =
+                ::leaf_validation::validate_config(#prefix, &__bound)
+            {
+                return ::core::result::Result::Err(::std::vec![__verr]);
+            }
+            ::core::result::Result::Ok(::leaf_core::Published::shared_value(__bound))
+        }
+    } else {
+        quote! {
+            ::core::result::Result::Ok(::leaf_core::Published::shared_value(__bound))
+        }
+    };
     quote! {
         // The bean is engine-resolvable so the bound value is a Published::shared_value
         // (the same Bean opt-in a #[component] emits — a #[config_properties] type is
@@ -576,13 +629,13 @@ fn emit_config_bind_thunk(
             };
             match __binder.bind::<#ident>(&__prefix) {
                 ::leaf_core::BindResult::Bound(__bound) => {
-                    ::core::result::Result::Ok(::leaf_core::Published::shared_value(__bound))
+                    #publish
                 }
-                // Absent config is NOT an error — bind the JavaBean default-filled value.
+                // Absent config is NOT an error — bind the JavaBean default-filled value
+                // (validated too when opted in: Spring validates defaults as well).
                 ::leaf_core::BindResult::Unbound => {
-                    ::core::result::Result::Ok(::leaf_core::Published::shared_value(
-                        <#ident as ::core::default::Default>::default()
-                    ))
+                    let __bound = <#ident as ::core::default::Default>::default();
+                    #publish
                 }
                 ::leaf_core::BindResult::Failed(__e) => {
                     ::core::result::Result::Err(::std::vec![__e])
@@ -761,10 +814,72 @@ mod tests {
     }
 
     #[test]
+    fn config_properties_validate_flag_defaults_off() {
+        let attr: TokenStream = syn::parse_str(r#"prefix = "app""#).expect("tokens");
+        let args = parse_config_args(attr).expect("parses");
+        assert!(!args.validate, "an unflagged config bean does not validate");
+    }
+
+    #[test]
+    fn config_properties_parses_the_bare_validate_flag() {
+        let attr: TokenStream = syn::parse_str(r#"prefix = "app", validate"#).expect("tokens");
+        let args = parse_config_args(attr).expect("parses");
+        assert_eq!(args.prefix, "app");
+        assert!(args.validate, "the bare `validate` flag opts in");
+    }
+
+    #[test]
+    fn config_properties_rejects_unknown_bare_flag() {
+        let attr: TokenStream = syn::parse_str(r#"prefix = "app", bogus"#).expect("tokens");
+        let err = parse_config_args(attr).expect_err("an unknown bare flag errors");
+        assert!(err.message.contains("bogus"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn config_properties_unflagged_thunk_has_no_validation() {
+        // Gate: an UNFLAGGED config bean's bind thunk wraps the bound value in
+        // Published with NO `validate_config` call (existing beans unaffected).
+        let args = ConfigPropertiesArgs { prefix: "app".into(), validate: false };
+        let s = flat(
+            &emit_config_properties(&derive("struct AppProps { name: String }"), &args)
+                .expect("emits"),
+        );
+        assert!(!s.contains("validate_config"), "no validation is wired when unflagged: {s}");
+    }
+
+    #[test]
+    fn config_properties_validate_flag_wires_validate_config_in_both_arms() {
+        // The opt-in: a `validate`-flagged bean's bind thunk runs
+        // `::leaf_validation::validate_config(prefix, &bound)` BEFORE wrapping in
+        // Published, in BOTH the Bound and the Unbound/default arm (Spring validates
+        // the bound bean INCLUDING defaults), surfacing the fault as Err(vec![__verr]).
+        let args = ConfigPropertiesArgs { prefix: "app".into(), validate: true };
+        let ts = emit_config_properties(&derive("struct AppProps { name: String }"), &args)
+            .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The validate call is emitted with the absolute leaf_validation path + prefix.
+        assert!(
+            s.contains(r#"::leaf_validation::validate_config("app",&__bound)"#),
+            "got: {s}"
+        );
+        // It short-circuits with the aggregated fault as a single-element Err vec.
+        assert!(s.contains("return::core::result::Result::Err(::std::vec![__verr]);"), "got: {s}");
+        // BOTH arms validate: the Bound arm names `__bound`, the Unbound/default arm
+        // binds the default into `__bound` first, so `validate_config(.., &__bound)`
+        // appears TWICE (once per arm).
+        assert_eq!(
+            s.matches(r#"::leaf_validation::validate_config("app",&__bound)"#).count(),
+            2,
+            "the bound arm AND the default arm both validate: {s}"
+        );
+    }
+
+    #[test]
     fn config_properties_emits_a_config_metadata_row() {
         // The headline: a #[config_properties] type emits a CONFIG_METADATA row
         // carrying the prefix + the module-qualified contract id.
-        let args = ConfigPropertiesArgs { prefix: "app".into() };
+        let args = ConfigPropertiesArgs { prefix: "app".into(), validate: false };
         let ts = emit_config_properties(&derive("struct AppProps { name: String }"), &args)
             .expect("emits");
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
@@ -788,7 +903,7 @@ mod tests {
         // AUTO_CONFIGS Descriptor (at CandidateRole::FALLBACK) + a default-returning
         // ProviderSeed + the SEED_PAIRINGS row — so the bean registers + binds purely
         // from the slices, with no hand-written AutoConfigCandidate/descriptor/seed.
-        let args = ConfigPropertiesArgs { prefix: "app".into() };
+        let args = ConfigPropertiesArgs { prefix: "app".into(), validate: false };
         let ts = emit_config_properties(&derive("struct AppProps { name: String }"), &args)
             .expect("emits");
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
@@ -815,7 +930,7 @@ mod tests {
 
     #[test]
     fn config_properties_also_emits_the_bind_target_and_a_config_group() {
-        let args = ConfigPropertiesArgs { prefix: "app".into() };
+        let args = ConfigPropertiesArgs { prefix: "app".into(), validate: false };
         let s = flat(
             &emit_config_properties(&derive("struct AppProps { name: String, port: u16 }"), &args)
                 .expect("emits"),
@@ -838,7 +953,7 @@ mod tests {
         // `::leaf_core::ConfigBindThunk` type, so leaf-boot's App<Wired>::validate can
         // JOIN it by ContractId and thread the REAL macro-emitted thunk (the same
         // pairing-const pattern as the __leaf_seed_<Ident> ProviderSeed).
-        let args = ConfigPropertiesArgs { prefix: "app".into() };
+        let args = ConfigPropertiesArgs { prefix: "app".into(), validate: false };
         let ts = emit_config_properties(&derive("struct AppProps { title: String, workers: u16 }"), &args)
             .expect("emits");
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");

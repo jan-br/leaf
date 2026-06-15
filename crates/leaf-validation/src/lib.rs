@@ -32,24 +32,33 @@
 //! time against messages-i18n + the ambient locale; the sync validate path never
 //! touches a bean).
 //!
+//! ## The constraint derive + the config-bind validation hook (WIRED)
+//!
+//! - The `#[derive(Validate)]` derive (leaf-macros / `leaf_codegen::validate`) emits
+//!   the per-field constraint calls into a `ValidateInto` impl — the SAME cascade a
+//!   hand `impl ValidateInto` writes (a type now `#[derive(Validate)]`s its
+//!   `#[validate(not_empty)]` / `#[validate(min = N)]` / … fields rather than hand-
+//!   writing the [`Cascade`] calls). The derive's emitted code names this crate via
+//!   ABSOLUTE `::leaf_validation::` paths (leaf-codegen depends only on leaf-core).
+//! - The `#[config_properties(prefix = .., validate)]` C2 bind thunk now CALLS
+//!   [`validate_config`] over the bound value (opt-in via the bare `validate` flag):
+//!   on a JSR violation it short-circuits with the aggregated `ValidationError` as a
+//!   bind fault, validating BOTH the bound value and the JavaBean default arm. An
+//!   unflagged config bean is unaffected (the stock
+//!   [`NoopBindHandler`](leaf_core::NoopBindHandler) bind, no validation). The kernel
+//!   binder hands a [`BindHandler`](leaf_core::BindHandler) the bound NAME but NOT the
+//!   typed value, so the typed validation runs on the bound value via
+//!   [`validate_config`], not through the observer alone.
+//!
 //! ## Deferred (honest NOTEs)
 //!
-//! - The `#[derive(Validate)]` derive + the `#[validated]` STRUCT/METHOD attribute
-//!   macro (which would emit the per-field constraint calls, the per-method
-//!   [`ArgValidator`](interceptor::ArgValidator) over the `@Valid` args, and the
-//!   VALIDATE marker the pointcut keys on) are NOT in leaf-macros/leaf-codegen yet.
-//!   Until they land: a type writes a hand `impl ValidateInto` calling the
-//!   [`constraints`] fns through [`Cascade`], and a binding site supplies the
-//!   per-method validator via [`single_arg_make_interceptor`] / a const
-//!   [`AdvisorPairingRow`](leaf_core::AdvisorPairingRow) row (the established leaf-tx
-//!   `#[transactional]` precedent — see the integration test).
-//! - The `#[config_properties]` C2 bind thunk (leaf-codegen) currently runs the stock
-//!   [`NoopBindHandler`](leaf_core::NoopBindHandler); the JSR validation is THIS
-//!   force-link's concern (per the leaf-codegen NOTE). [`validate_config`] is the
-//!   adapter a thunk (or the integration test) calls on the bound value — the
-//!   kernel binder hands a [`BindHandler`](leaf_core::BindHandler) the bound NAME but
-//!   NOT the typed value, so the typed validation runs on the bound value, not
-//!   through the observer alone.
+//! - The `#[validated]` METHOD attribute (the per-method validation ADVISOR) is wired
+//!   separately by the `#[advisable]` impl-block macro (it lowers `#[validated]` to a
+//!   const [`AdvisorPairingRow`](leaf_core::AdvisorPairingRow) binding the
+//!   per-method [`ArgValidator`](interceptor::ArgValidator) over the `@Valid` arg via
+//!   [`single_arg_make_interceptor`] — see the integration test). The
+//!   `#[derive(Validate)]` constraint-derive (above) supplies the `ValidateInto` that
+//!   validator runs.
 //! - Multi-`@Valid`-argument method validation: [`single_arg_make_interceptor`]
 //!   covers the one-`@Valid`-arg method; a multi-arg method writes a hand-written
 //!   [`ArgValidator`](interceptor::ArgValidator) over its concrete arg tuple. Groups
@@ -57,6 +66,13 @@
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+
+// A self-alias so the `#[derive(Validate)]` macro's ABSOLUTE `::leaf_validation::`
+// emitted paths (the thin-macro path rule — leaf-codegen depends only on leaf-core,
+// never on this crate, so the derive cannot name `crate`) resolve INSIDE this crate's
+// own `#[cfg(test)]` modules too. Without it `::leaf_validation::ValidateInto` would
+// fail to resolve when the derive is used in `src/cascade.rs` unit tests.
+extern crate self as leaf_validation;
 
 pub mod advisor;
 pub mod bind_handler;

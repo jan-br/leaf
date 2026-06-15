@@ -12,10 +12,10 @@
 //!   object's heap identity (`*const () as usize`) so a self-referential object
 //!   graph (`a.next = a`) terminates instead of recursing forever.
 //!
-//! A hand-written `impl Validate` (the `#[derive(Validate)]` macro is deferred — a
-//! NOTE in the crate docs) drives a per-field constraint check directly into the
-//! [`ValidationContext`] via [`Cascade`], and a nested-object field calls
-//! [`Cascade::enter`] to cascade with the path + guard threaded.
+//! The `#[derive(Validate)]` macro emits the per-field constraint check into a
+//! [`ValidateInto`] impl driving the [`Cascade`] (a nested `#[validate(nested)]`
+//! field lowers to [`Cascade::enter`] with the path + guard threaded); a hand-written
+//! `impl ValidateInto` writes the same `Cascade` calls directly.
 
 use std::collections::HashSet;
 
@@ -108,10 +108,10 @@ impl<'c> Cascade<'c> {
     }
 }
 
-/// The cascade-aware validation face: a `#[derive(Validate)]` impl (deferred — a
-/// NOTE in the crate docs) or a hand-written one drives per-field constraint checks
-/// and nested `@Valid` cascades through a [`Cascade`] (the path + cycle guard
-/// threaded). This is the trait a leaf-validation USER writes; the orphan rule
+/// The cascade-aware validation face: a `#[derive(Validate)]` impl (or a hand-written
+/// one) drives per-field constraint checks and nested `@Valid` cascades through a
+/// [`Cascade`] (the path + cycle guard threaded). This is the trait a leaf-validation
+/// USER derives or writes; the orphan rule
 /// forbids a blanket `impl Validate` over it, so the bridge to the kernel
 /// object-safe [`Validate`] is the explicit [`AsValidate`] adapter (used by the
 /// config-bind face) — and the method-validation path dispatches `validate_into`
@@ -193,18 +193,18 @@ fn join_path(prefix: &str, segment: &str) -> String {
 mod tests {
     use super::*;
     use crate::constraints;
+    use leaf_macros::Validate;
 
-    // A flat bean with two constrained fields.
+    // A flat bean with two constrained fields — the hand `impl ValidateInto` is now
+    // DERIVED (the `#[derive(Validate)]` proves byte-for-byte parity with the prior
+    // hand impl: the SAME `not_empty`/`range` checks under the SAME segments, so the
+    // unchanged assertions below pin the derive reproduces the hand behaviour).
+    #[derive(Validate)]
     struct User {
+        #[validate(not_empty)]
         name: String,
+        #[validate(range(min = 0, max = 150))]
         age: i64,
-    }
-
-    impl ValidateInto for User {
-        fn validate_into(&self, c: &mut Cascade<'_>) {
-            c.check("name", constraints::not_empty(&self.name));
-            c.check("age", constraints::range(self.age, 0, 150));
-        }
     }
 
     #[test]
@@ -222,25 +222,19 @@ mod tests {
         assert!(paths.contains(&"age"), "age violation reported at `age`");
     }
 
-    // A nested bean cascade (@Valid) — Order has Items.
+    // A nested bean cascade (@Valid) — Order has Items. Both are now DERIVED: the
+    // `#[validate(min = 1)]` leaf + the `#[validate(nested)]` Vec<Item> indexed
+    // cascade reproduce the prior hand impls (the unchanged assertions pin the path).
+    #[derive(Validate)]
     struct Item {
+        #[validate(min = 1)]
         qty: i64,
     }
-    impl ValidateInto for Item {
-        fn validate_into(&self, c: &mut Cascade<'_>) {
-            c.check("qty", constraints::min(self.qty, 1));
-        }
-    }
 
+    #[derive(Validate)]
     struct Order {
+        #[validate(nested)]
         items: Vec<Item>,
-    }
-    impl ValidateInto for Order {
-        fn validate_into(&self, c: &mut Cascade<'_>) {
-            for (i, item) in self.items.iter().enumerate() {
-                c.enter(&format!("items[{i}]"), addr_of(item), item);
-            }
-        }
     }
 
     #[test]
