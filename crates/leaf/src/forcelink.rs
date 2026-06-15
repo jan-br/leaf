@@ -29,23 +29,22 @@
 //! set the cold assembly pass joins against the link-collected
 //! [`leaf_core::SOURCES`] slice: a crate EXPECTED to contribute rows but absent from
 //! `SOURCES` is the LOUD [`AntiDceError::SourceVanished`](leaf_boot::AntiDceError)
-//! naming the crate — never a confusing silent empty registry later. The binary
-//! crate adds its OWN package name to the manifest it feeds the run pipeline (it
-//! contributes its own rows); this seam supplies the ENABLED-INTEGRATION rows.
+//! naming the crate — never a confusing silent empty registry later. This seam
+//! supplies the ENABLED-INTEGRATION rows; the binary crate's own rows are NOT
+//! checked (the binary IS the final link unit, so its rows cannot vanish
+//! independently — only a participating rlib reached transitively can be DCE-dropped).
 //!
-//! NOTE (honest deferral — the self-check's found side): the expected-vs-found
-//! check is only as strong as the `SOURCES` rows the integration crates contribute.
-//! Today `leaf-tokio`/`leaf-redis` register their beans into `COMPONENTS`/
-//! `AUTO_CONFIGS` but do NOT yet submit a per-crate [`SourceTag`](leaf_core::SourceTag)
-//! into `SOURCES` (that per-crate anchor is the integration crates' codegen seam,
-//! not the umbrella's). So feeding this manifest to
-//! [`leaf_boot::self_check`] would currently flag those crates as vanished even when
-//! present. The umbrella therefore EXPOSES the manifest (the seam + the capability
-//! vocabulary are complete here) and force-links the crates (the load-bearing
-//! Layer-0 defense), but [`bootstrap`](crate::bootstrap) runs the self-check over
-//! the EMPTY manifest until the integration crates emit their `SOURCES` anchors —
-//! the same posture `leaf_boot::Application::run` ships with. [`expected_manifest`]
-//! is ready to wire through the moment those anchors land.
+//! The found side is LIVE: every participating crate (`leaf-tokio`/`leaf-redis` + the
+//! `web`-bundle concern crates) calls [`leaf_core::declare_source!`] in its crate root
+//! to submit exactly one per-crate [`SourceTag`] into `SOURCES`,
+//! and [`bootstrap`](crate::bootstrap()) feeds this [`expected_manifest`] to
+//! [`Application::with_expected_sources`](leaf_boot::Application::with_expected_sources)
+//! so [`Application::run`](leaf_boot::Application::run) runs the self-check over the
+//! REAL participating set at the `Define→Resolve` edge — a force-linked-but-zero-
+//! contributing crate (a real DCE drop, or a misconfigured toolchain) is a loud
+//! `SourceVanished`, while a healthy app passes. (A capability crate's `declare_source!`
+//! anchor rides the SAME `#[distributed_slice]` mechanism its `COMPONENTS`/`AUTO_CONFIGS`
+//! rows do, so if `--gc-sections` drops that crate's section the tag goes with it.)
 
 use leaf_core::SourceTag;
 
@@ -103,10 +102,13 @@ pub fn participating_crates() -> Vec<&'static str> {
 /// participating set, the expected-vs-found anti-DCE self-check anchor the cold
 /// assembly pass joins against [`leaf_core::SOURCES`].
 ///
-/// This is the umbrella-owned half of the binary crate's `ExpectedManifest`. The
-/// binary adds its OWN [`SourceTag`] (it contributes its own rows); this supplies
-/// the rows the enabled capability features pull in. See the module NOTE for why
-/// [`bootstrap`](crate::bootstrap) does not yet feed this to the live self-check.
+/// This supplies the rows the enabled capability features pull in (the binary crate
+/// is NOT added — it is the final link unit, so its own rows cannot vanish
+/// independently). [`bootstrap`](crate::bootstrap()) feeds this to the LIVE
+/// self-check via
+/// [`Application::with_expected_sources`](leaf_boot::Application::with_expected_sources),
+/// so a force-linked-but-zero-contributing capability crate is a loud
+/// `SourceVanished` at the `Define→Resolve` edge.
 #[must_use]
 pub fn expected_manifest() -> Vec<SourceTag> {
     participating_crates().into_iter().map(SourceTag).collect()

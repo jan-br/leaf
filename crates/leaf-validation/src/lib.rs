@@ -65,6 +65,13 @@ pub mod constraints;
 pub mod interceptor;
 pub mod violations;
 
+// The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in
+// the link-collected `SOURCES` slice so a binary that lists leaf-validation in its
+// ExpectedManifest (the `web` capability bundle) can tell "linked-but-zero-rows"
+// from "never-linked" — a loud `SourceVanished` rather than a silent missing
+// concern. The package name (dashes) is the string the ExpectedManifest joins on.
+leaf_core::declare_source!("leaf-validation");
+
 pub use advisor::{
     enable_validation, single_arg_make_interceptor, validation_advisor_contract,
     validation_advisor_pairing, validation_marker, validation_order_key, ValidationPointcut,

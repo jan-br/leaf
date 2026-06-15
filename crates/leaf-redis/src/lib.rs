@@ -60,6 +60,14 @@ pub mod live;
 pub mod manager;
 pub mod properties;
 
+// The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in
+// the link-collected `SOURCES` slice so the binary's expected-vs-found self-check
+// can tell "linked-but-zero-rows" from "never-linked". A force-linked-but-zero-
+// contributing leaf-redis (its AUTO_CONFIGS row GC'd) becomes a loud `SourceVanished`
+// naming it rather than a silent missing auto-config. The package name (dashes) is
+// the author-stable string the umbrella's ExpectedManifest joins on.
+leaf_core::declare_source!("leaf-redis");
+
 // ── the flat integration surface ──
 
 pub use autoconfig::{

@@ -40,6 +40,13 @@ use leaf_tokio::{TokioExecutionFacility, TokioSchedulerCore};
 /// returned application needs no `.with_*` tables; it is ready to `.run(inputs,
 /// overlay)`. The `name` is the banner / diagnostics application name.
 ///
+/// The returned application carries the LIVE anti-DCE [`ExpectedManifest`](crate::forcelink::expected_manifest):
+/// the force-linked participating set the enabled capability features know, fed to
+/// the expected-vs-found self-check `Application::run` runs at the `Define→Resolve`
+/// edge. A force-linked-but-zero-contributing crate is a loud
+/// [`AntiDceError::SourceVanished`](leaf_boot::AntiDceError) naming it; a healthy app
+/// (every participating crate `declare_source!`s its tag) passes.
+///
 /// The caller drives the returned future on its own executor (the tokio runtime the
 /// binary owns via `#[leaf::main]` / `#[tokio::main]`).
 #[must_use]
@@ -57,6 +64,16 @@ pub fn bootstrap(name: &'static str) -> Application {
         .with_name(name)
         .with_spawner(spawner)
         .with_scheduler(scheduler)
+        // Feed the LIVE anti-DCE self-check the force-linked participating set the
+        // enabled capability features know (`leaf::expected_manifest()`): each
+        // capability crate `declare_source!`s its SourceTag, so a force-linked-but-
+        // zero-contributing crate (a real DCE drop / a misconfigured toolchain) is a
+        // loud `SourceVanished` naming it at the Define→Resolve edge, never a
+        // confusing silent empty registry later. The binary crate is NOT added — it
+        // IS the link unit, so its own rows cannot vanish independently (see
+        // `crate::forcelink::expected_manifest`). An app with no capability feature
+        // gets an empty (trivially-green) manifest.
+        .with_expected_sources(crate::forcelink::expected_manifest())
 }
 
 /// A thin, ergonomic builder for the [`SealInputs`] the run pipeline's environment

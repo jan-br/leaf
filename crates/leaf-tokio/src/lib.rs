@@ -53,6 +53,14 @@ pub mod resource;
 pub mod scheduler;
 pub mod shutdown;
 
+// The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in
+// the link-collected `SOURCES` slice so the binary's expected-vs-found self-check
+// can tell "linked-but-zero-rows" from "never-linked". A force-linked-but-zero-
+// contributing leaf-tokio (a real DCE drop) becomes a loud `SourceVanished` naming
+// it rather than a silent missing ExecutionFacility. The package name (dashes) is
+// the author-stable string the ExpectedManifest joins on.
+leaf_core::declare_source!("leaf-tokio");
+
 // ── curated re-exports: the flat runtime surface leaf-boot wires ──
 
 pub use ambient::TokioAmbient;

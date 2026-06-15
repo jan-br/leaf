@@ -32,7 +32,7 @@ use leaf_core::{
     analyze_first, cmp_order, AnalysisCtx, ApplicationArguments, BannerMode, BeanKey, CandidateRole,
     CreatorPolicy, Diagnostic, Env, EarlyListener, ErasedBean, FailureAnalyzer, FailureAnalysis,
     InjectionPlan, LeafError, LifecyclePlan, OrderKey, RenderStyle, Runner, RunMilestone,
-    SchedulerCore, Spawner,
+    SchedulerCore, SourceTag, Spawner,
 };
 
 use crate::app::App;
@@ -281,6 +281,7 @@ pub struct Application {
     banner_mode_override: Option<BannerMode>,
     app_name: &'static str,
     inventory: Vec<(std::any::TypeId, CandidateRole)>,
+    expected_sources: Vec<SourceTag>,
 }
 
 impl Application {
@@ -315,6 +316,7 @@ impl Application {
             banner_mode_override: None,
             app_name: "application",
             inventory: Vec::new(),
+            expected_sources: Vec::new(),
         }
     }
 
@@ -524,6 +526,28 @@ impl Application {
         self
     }
 
+    /// The binary's `ExpectedManifest` — the [`SourceTag`] set the run pipeline's
+    /// anti-DCE self-check joins against the link-collected
+    /// [`SOURCES`](leaf_core::SOURCES) slice at the `Define→Resolve` edge (ADR-09
+    /// Defense MANIFEST, bootstrap-diagnostics phase3/14).
+    ///
+    /// Each expected source that contributed ZERO rows to `SOURCES` (a real DCE drop,
+    /// or a misconfigured toolchain that never force-linked the crate) becomes a LOUD
+    /// [`AntiDceError::SourceVanished`](crate::AntiDceError) naming the crate, instead
+    /// of a confusing silent empty registry later. An empty manifest (the default)
+    /// always passes — there is nothing to compare against.
+    ///
+    /// The umbrella feeds this from `leaf::expected_manifest()` (the force-linked
+    /// participating set its enabled capability features know); each PARTICIPATING
+    /// crate contributes its tag via [`leaf_core::declare_source!`]. The binary crate
+    /// is NOT included — it IS the final link unit, so its own rows cannot vanish
+    /// independently of the whole binary.
+    #[must_use]
+    pub fn with_expected_sources(mut self, sources: Vec<SourceTag>) -> Self {
+        self.expected_sources = sources;
+        self
+    }
+
     /// AUTO-COLLECT every per-bean wiring pairing from its `linkme` distributed slice
     /// and FOLD it into the run tables (discovery-codegen phase3/02): the macro emits
     /// one pairing row per bean beside its `Descriptor`, `linkme` auto-collects them at
@@ -676,8 +700,13 @@ impl Application {
 
         // (6) seal_environment IS EnvironmentPrepared (the 5f async fence).
         let app = App::<Define>::from_slices(&self.seeds)?;
-        // self_check at the Define→Resolve edge (anti-DCE expected-vs-found).
-        App::<Define>::self_check(&[]).map_err(LeafError::from)?;
+        // self_check at the Define→Resolve edge (anti-DCE expected-vs-found): every
+        // SourceTag the binary's ExpectedManifest names must appear in the
+        // link-collected SOURCES, or it is a LOUD SourceVanished naming the crate. The
+        // manifest is the force-linked participating set (umbrella capability features
+        // + binary crate); a healthy app's force-linked crates each `declare_source!`,
+        // so the JOIN finds them. An empty manifest (the bare app) trivially passes.
+        App::<Define>::self_check(&self.expected_sources).map_err(LeafError::from)?;
 
         let mut app = app.seal_environment(args, self.inventory.clone()).await?;
         *phase = RunMilestone::EnvironmentPrepared;

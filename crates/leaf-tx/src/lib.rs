@@ -58,6 +58,13 @@ pub mod manager;
 pub mod propagation;
 pub mod rollback;
 
+// The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in
+// the link-collected `SOURCES` slice so a binary that lists leaf-tx in its
+// ExpectedManifest can tell "linked-but-zero-rows" from "never-linked" — a loud
+// `SourceVanished` rather than a silent missing concern. The package name (dashes)
+// is the author-stable string the ExpectedManifest joins on.
+leaf_core::declare_source!("leaf-tx");
+
 use leaf_core::{Cx, LeafError, TxPhase, TxResourceKey, TxState};
 
 pub use advisor::{

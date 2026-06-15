@@ -91,10 +91,13 @@ pub fn parse_main_args(attr: TokenStream) -> Result<MainArgs, EmitError> {
     Ok(args)
 }
 
-/// Emit the `#[leaf::main]` artifact: the anti-DCE force-link shim + the const
-/// `ExpectedManifest` (over the participating set) PLUS a real `fn main()` that
-/// drives the run engine over the user's `async fn` body — the umbrella-only
-/// maximal-magic entry (bootstrap-diagnostics phase3/14).
+/// Emit the `#[leaf::main]` artifact: the anti-DCE force-link seam (the `scan(...)`
+/// shim + the umbrella's feature-gated `::leaf::force_link!()` invoked from the
+/// binary crate) + the const `ExpectedManifest` (over the participating set) PLUS a
+/// real `fn main()` that drives the run engine over the user's `async fn` body — the
+/// umbrella-only maximal-magic entry (bootstrap-diagnostics phase3/14). The user
+/// writes ONLY `#[leaf::main]`: the force-link anchor is fully encapsulated here, so
+/// the binary `main` module carries no hand-written `leaf::force_link!();`.
 ///
 /// `binary_crate` is the binary's own Cargo package name (always force-linked); the
 /// `args.scan` list adds further participating crates. The emitted `fn main()`
@@ -126,7 +129,16 @@ pub fn emit_main(binary_crate: &str, args: &MainArgs, user_fn: &syn::ItemFn) -> 
     manifest_set.add(binary_crate);
     let force_link = crate::forcelink::emit_force_link(&scan_set);
     let manifest = crate::forcelink::emit_expected_manifest(&manifest_set);
-    let anti_dce = quote! { #force_link #manifest };
+    // The umbrella's feature-gated force-link, invoked FROM the binary crate so the
+    // capability rlibs the umbrella pulls (its `#[cfg(feature = …)]` set) are pinned
+    // onto the link graph from the final link unit — the strongest anti-`--gc-sections`
+    // anchor. ENCAPSULATING this here is the DX payoff: the user writes ONLY
+    // `#[leaf::main]`, never `leaf::force_link!();`. The macro expands at the call site,
+    // so its `#[cfg(feature = …)]` gates resolve in the BINARY crate's feature namespace
+    // (the binary mirrors the umbrella's capability features). The `scan(...)` shim above
+    // covers the author-explicit list; this covers the umbrella's enabled capabilities.
+    let umbrella_force_link = quote! { ::leaf::force_link!(); };
+    let anti_dce = quote! { #force_link #umbrella_force_link #manifest };
 
     // The user body, renamed so the generated `fn main` owns the entrypoint symbol.
     let mut inner = user_fn.clone();
@@ -350,6 +362,9 @@ mod tests {
         // The anti-DCE seam (from forcelink::emit).
         assert!(s.contains("mod__leaf_force_link"), "got: {s}");
         assert!(s.contains("__LEAF_EXPECTED_MANIFEST"), "got: {s}");
+        // The umbrella's feature-gated force-link, invoked from the binary crate so the
+        // USER never hand-writes `leaf::force_link!();` (the encapsulated anti-DCE anchor).
+        assert!(s.contains("::leaf::force_link!()"), "got: {s}");
         // The binary crate itself is always force-linked.
         assert!(s.contains(r#"::leaf_core::SourceTag("my-app")"#), "got: {s}");
         // A real synchronous `fn main` returning the umbrella-rooted LeafError is emitted.
@@ -364,6 +379,24 @@ mod tests {
             s.contains("|_app:&::leaf::boot::RunningApp|::std::boxed::Box::pin(__leaf_async_main())"),
             "got: {s}"
         );
+    }
+
+    #[test]
+    fn main_invokes_the_umbrella_feature_gated_force_link() {
+        // The DX headline: #[leaf::main] itself invokes the umbrella's feature-gated
+        // `::leaf::force_link!()` (the binary-originated anti-DCE anchor over the ENABLED
+        // CAPABILITY features), so the user never hand-writes `leaf::force_link!();` in
+        // their `main` module. This is distinct from the `scan(...)` shim (the
+        // author-explicit list): the macro-invoked force_link! pins the rlibs the umbrella
+        // pulls via its capability features, gated in the BINARY crate's feature namespace.
+        let ts = emit_main(
+            "my-app",
+            &MainArgs::default(),
+            &func("async fn main() -> Result<(), ::leaf::LeafError> { Ok(()) }"),
+        );
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(s.contains("::leaf::force_link!()"), "got: {s}");
     }
 
     #[test]

@@ -54,6 +54,13 @@ pub mod interceptor;
 pub mod manager;
 pub mod value;
 
+// The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in
+// the link-collected `SOURCES` slice so a binary that lists leaf-cache in its
+// ExpectedManifest (the `web` capability bundle) can tell "linked-but-zero-rows"
+// from "never-linked" — a loud `SourceVanished` rather than a silent missing
+// concern. The package name (dashes) is the string the ExpectedManifest joins on.
+leaf_core::declare_source!("leaf-cache");
+
 pub use advisor::{
     build_cache_interceptor, cache_advisor_contract, cache_advisor_pairing, cache_marker,
     cache_order_key, enable_caching, resolve_manager, CachePointcut, CACHE_MARKER_POINTCUT,

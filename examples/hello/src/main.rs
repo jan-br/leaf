@@ -219,12 +219,12 @@ impl Runner for StartupRunner {
 
 // ──────────────────────────────── the entry ──────────────────────────────────
 
-// The Layer-0 anti-DCE force-link shim from the BINARY crate (belt-and-suspenders:
-// the umbrella's `redis` feature already force-links leaf-redis, but invoking this in
-// `main`'s module makes the binary itself the originating link unit). With the `redis`
-// feature on it path-references the Redis integration crate so its `AUTO_CONFIGS`
-// rows survive link-time DCE.
-leaf::force_link!();
+// NOTE: no hand-written `leaf::force_link!();` here — `#[leaf::main]` ITSELF emits the
+// Layer-0 anti-DCE force-link anchor from the BINARY crate (the umbrella's feature-gated
+// `::leaf::force_link!()`, gated in this crate's mirrored capability features). So with
+// the `redis` feature on, the binary path-references the Redis integration crate and its
+// `AUTO_CONFIGS` rows survive link-time DCE — with NOTHING in the entry but the
+// annotation. The user writes only `use leaf::prelude::*;`, the beans, and `#[leaf::main]`.
 
 /// `#[leaf::main]` — the umbrella-only entry. It builds the tokio runtime the umbrella
 /// owns, bootstraps + runs the application to Ready (the graph wires, `AppProps`
@@ -362,5 +362,43 @@ mod tests {
             manifest.iter().any(|t| t.0 == "leaf-redis"),
             "the ExpectedManifest names leaf-redis: {manifest:?}"
         );
+    }
+
+    /// THE LIVE SELF-CHECK PROOF (umbrella-only-app level): the healthy hello app's
+    /// `ExpectedManifest` is NON-EMPTY (redis on → leaf-redis + leaf-tokio), and every
+    /// crate it names actually CONTRIBUTED a `SourceTag` into the link-collected
+    /// `SOURCES` slice (each `declare_source!`s it), so the LIVE self-check
+    /// `leaf::bootstrap(...).run()` runs over the real participating set passes — it is
+    /// NOT the empty manifest. The healthy full-run is proven by
+    /// `the_umbrella_only_app_wires_advises_runs_and_shuts_down` (which drives the same
+    /// `leaf::bootstrap("hello").run()` now carrying this live manifest); the
+    /// SourceVanished negative control is proven end-to-end in the leaf-boot
+    /// `tests/live_self_check.rs` integration test (a vanished expected crate faults the
+    /// SAME run pipeline). Here we assert the FOUND side is genuinely populated, so the
+    /// passing self-check is meaningful, not a vacuous empty-manifest pass.
+    #[test]
+    fn the_live_anti_dce_self_check_runs_over_a_non_empty_contributing_manifest() {
+        let manifest = leaf::forcelink::expected_manifest();
+        assert!(
+            !manifest.is_empty(),
+            "the redis app has a NON-EMPTY (live) manifest — not the empty self-check"
+        );
+
+        // Every expected crate actually contributed its SourceTag into the
+        // link-collected SOURCES (the FOUND side), so the self-check JOIN is real.
+        let found = leaf::core::collect_slice(&leaf::core::SOURCES);
+        for tag in &manifest {
+            assert!(
+                found.contains(tag),
+                "expected crate `{}` must have contributed a SourceTag into SOURCES \
+                 (declare_source!); found {found:?}",
+                tag.0
+            );
+        }
+
+        // The self-check is exactly what bootstrap feeds the run pipeline; running it
+        // here proves the healthy participating manifest passes the LIVE check.
+        leaf::boot::self_check(&manifest)
+            .expect("the healthy participating manifest passes the LIVE self-check");
     }
 }

@@ -112,6 +112,46 @@ pub use linkme;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SourceTag(pub &'static str);
 
+/// `leaf_core::declare_source!("leaf-redis")` — submit exactly ONE per-crate
+/// [`SourceTag`] into the link-collected [`SOURCES`] slice, so the binary's
+/// expected-vs-found anti-DCE self-check ([`anti_dce::self_check`](crate)) can tell
+/// "linked-but-zero-rows" from "never-linked" (ADR-09 Defense MANIFEST,
+/// bootstrap-diagnostics phase3/14).
+///
+/// Every PARTICIPATING crate (each runtime integration / concern crate that
+/// contributes `COMPONENTS`/`AUTO_CONFIGS` rows but is only reachable via a binary
+/// force-link) calls this ONCE in its crate root with its author-stable Cargo
+/// PACKAGE name (the same string a [`SourceTag`] / the binary's `ExpectedManifest`
+/// carries — dashes, NOT the underscore crate ident):
+///
+/// ```ignore
+/// // in leaf-redis/src/lib.rs
+/// leaf_core::declare_source!("leaf-redis");
+/// ```
+///
+/// The submission rides the SAME `#[distributed_slice]` mechanism every per-bean row
+/// uses, so it survives — or vanishes WITH — that crate's rows: if `--gc-sections`
+/// drops the crate's section the tag goes with it, and the self-check reports the
+/// crate as [`SourceVanished`](crate). The emitted static is named `__LEAF_SOURCE`,
+/// so a SECOND `declare_source!` in the same crate root is a duplicate-definition
+/// COMPILE error — the once-per-crate contract is structural, not a convention.
+///
+/// The `$crate::linkme` path + `#[linkme(crate = $crate::linkme)]` override route
+/// through the leaf-core re-export, so a participating crate names only `leaf_core`
+/// (or the umbrella facade alias), never a bare `linkme` dependency.
+#[macro_export]
+macro_rules! declare_source {
+    ($name:expr) => {
+        // One per-crate anti-DCE anchor in SOURCES, keyed by the package name. The
+        // fixed static ident makes a second invocation in the same crate a loud
+        // duplicate-definition error (the once-per-crate contract, enforced).
+        #[allow(non_upper_case_globals)]
+        #[$crate::linkme::distributed_slice($crate::SOURCES)]
+        #[linkme(crate = $crate::linkme)]
+        static __LEAF_SOURCE: $crate::SourceTag = $crate::SourceTag($name);
+    };
+}
+
 // ─────────────────────── programmatic registration ──────────────────────────
 
 /// The minimal forward-compatible context handed to a [`Registrar`].
@@ -454,8 +494,8 @@ pub static AUTO_CONFIGS: [Descriptor] = [..];
 pub static CONDITIONS: [ConditionRow] = [..];
 
 /// The anti-DCE source-anchor channel: one [`SourceTag`] per crate that called
-/// `provides_descriptors!()`, so the self-check can tell "linked-but-zero-rows"
-/// from "never-linked" (ADR-09 Defense MANIFEST).
+/// [`declare_source!`](crate::declare_source), so the self-check can tell
+/// "linked-but-zero-rows" from "never-linked" (ADR-09 Defense MANIFEST).
 #[linkme::distributed_slice]
 pub static SOURCES: [SourceTag] = [..];
 
@@ -603,6 +643,27 @@ mod tests {
         assert!(
             found.contains(&TEST_SOURCE),
             "submitted SourceTag must roundtrip through the linkme slice; found {found:?}",
+        );
+    }
+
+    // The `declare_source!` per-crate anchor: the once-per-crate SourceTag every
+    // PARTICIPATING crate calls in its root so the binary's expected-vs-found
+    // self-check can tell linked-but-zero-rows from never-linked. The static the
+    // macro emits is scoped to this nested module so its fixed `__LEAF_SOURCE` ident
+    // does not collide with the roundtrip submission above (and so a real crate's
+    // single root-level call is the only `__LEAF_SOURCE` per crate).
+    mod declared {
+        crate::declare_source!("leaf-core::discovery::declared");
+    }
+
+    #[test]
+    fn declare_source_submits_one_per_crate_tag_into_sources() {
+        // The macro-submitted anchor is link-collected into SOURCES under the exact
+        // package-name string handed to it (so the manifest JOIN finds it).
+        let found: Vec<SourceTag> = collect_slice(&SOURCES);
+        assert!(
+            found.contains(&SourceTag("leaf-core::discovery::declared")),
+            "declare_source! must submit its SourceTag into SOURCES; found {found:?}",
         );
     }
 
