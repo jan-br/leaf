@@ -349,8 +349,12 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         impl ::leaf_core::Bean for #self_ty {}
 
         // ── the generated Provider + the PUBLIC const ProviderSeed that BUILDS it ──
+        // `#[doc(hidden)]`: the `__leaf_seed_<Ident>` const is framework-internal wiring
+        // (the assembly pass's pairing key), not public API — so a contributing crate
+        // under `#![warn(missing_docs)]` needs no doc on this generated const.
         #provider_impl
         #[allow(non_upper_case_globals)]
+        #[doc(hidden)]
         pub const #seed_ident: ::leaf_core::ProviderSeed =
             || ::std::sync::Arc::new(#provider_ident);
 

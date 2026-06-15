@@ -269,9 +269,12 @@ fn parse_property_leaf(name: &str, call: &syn::ExprCall) -> Result<CondExpr, Emi
     let mut saw_key = false;
     for (i, arg) in call.args.iter().enumerate() {
         match arg {
-            // The first positional string literal is the property key.
+            // The first positional string literal is the property name. The runtime
+            // `OnProperty`/`OnMissingProperty` reads it from the `"name"` attr (the
+            // multi-name form ANDs them), so the macro emits it under `"name"` — NOT
+            // `"key"`, which the runtime ignores (a vacuously-true guard that never gates).
             syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) if i == 0 => {
-                attrs.push(CondAttr::Str("key".into(), s.value()));
+                attrs.push(CondAttr::Str("name".into(), s.value()));
                 saw_key = true;
             }
             // `having_value = "..."` / `prefix = "..."` etc.
@@ -713,7 +716,11 @@ pub fn emit_guard(ident: &str, expr: &CondExpr) -> TokenStream {
     }
 
     quote! {
+        // `#[doc(hidden)]`: the `__leaf_guard_<Ident>` const is framework-internal
+        // wiring (the assembly pass's guard-pairing key), not public API — so a
+        // contributing crate under `#![warn(missing_docs)]` needs no doc on it.
         #[allow(non_upper_case_globals)]
+        #[doc(hidden)]
         pub const #guard_ident: ::leaf_core::CondExpr = #tree;
         // Submit the guard into GUARD_PAIRINGS (the auto-collect substrate) keyed by
         // the gated element's ContractId — so leaf-boot's condition routing finds it
@@ -894,8 +901,9 @@ mod tests {
             s.contains(r#"::leaf_core::ConditionId(::leaf_core::contract_hash("leaf::condition::OnProperty")asu32)"#),
             "got: {s}"
         );
-        // The property key and having_value lower to const ::leaf_core::Attr rows.
-        assert!(s.contains(r#"::leaf_core::Attr::Str("key","app.enabled")"#), "got: {s}");
+        // The property name (under the `"name"` key the runtime OnProperty reads) and
+        // having_value lower to const ::leaf_core::Attr rows.
+        assert!(s.contains(r#"::leaf_core::Attr::Str("name","app.enabled")"#), "got: {s}");
         assert!(s.contains(r#"::leaf_core::Attr::Str("having_value","true")"#), "got: {s}");
     }
 

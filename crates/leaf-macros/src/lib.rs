@@ -409,22 +409,55 @@ pub fn profile(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! { #parsed #guard }.into()
 }
 
-/// `#[auto_config]` — register a struct as an AUTO-CONFIGURATION: the SAME const
-/// `::leaf_core::Descriptor` shape, but submitted into the SEPARATE `AUTO_CONFIGS`
-/// slice at `CandidateRole::FALLBACK` (so a user bean transparently supersedes it),
-/// and so component-scanning over `COMPONENTS` never picks it up. A generic target
-/// is a Tier-0 `compile_error!`.
+/// `#[auto_config]` — register an AUTO-CONFIGURATION. TWO forms:
 ///
-/// Gate it by stacking `#[conditional(...)]`/`#[profile(...)]` on the same struct.
+/// - on a STRUCT: the SAME const `::leaf_core::Descriptor` shape as `#[component]`,
+///   but submitted into the SEPARATE `AUTO_CONFIGS` slice at `CandidateRole::FALLBACK`
+///   (so a user bean transparently supersedes it), and so component-scanning over
+///   `COMPONENTS` never picks it up. The product is `Self` (the holder struct). Gate
+///   it by stacking `#[conditional(...)]`/`#[profile(...)]` on the same struct.
+/// - on an inherent IMPL BLOCK (`#[auto_config] impl RedisAutoConfig { #[bean] fn
+///   cache_manager(&self) -> Arc<dyn CacheManager> {..} }`): the DIFFERENTLY-TYPED
+///   contribution — Spring's `@AutoConfiguration` with `@Bean` methods. The macro
+///   reads each `#[bean]` METHOD and emits ONE const `::leaf_core::Descriptor` per
+///   method into `AUTO_CONFIGS` at `CandidateRole::FALLBACK`, whose product is the
+///   method's RETURN type (a bean DIFFERENT from the holder). A method may declare a
+///   dyn-view via `#[bean(provides = "dyn Svc")]`, an explicit `#[bean(name = "..")]`,
+///   and a per-method `#[conditional(..)]` back-off guard (keyed on the SAME
+///   contributed contract so leaf-boot's `Descriptor`/`SeedPairing`/`GuardPairing`
+///   JOIN aligns). The inner `#[bean]`/`#[conditional]` attrs are STRIPPED from the
+///   re-emitted impl (the impl-block macro, not the method attrs, owns the lowering).
+///
+/// A generic target is a Tier-0 `compile_error!`.
 #[proc_macro_attribute]
 pub fn auto_config(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed = parse_macro_input!(item as ItemStruct);
-    match conditional::emit_auto_config(&parsed, None) {
-        Ok(rows) => quote! { #parsed #rows }.into(),
-        Err(err) => {
-            let error = compile_error(&err);
-            quote! { #parsed #error }.into()
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Impl(item_impl) => {
+            let cleaned = strip_inner_attrs(item_impl.clone(), &["bean", "conditional"]);
+            match config_impl::emit_auto_config_impl(&item_impl) {
+                Ok(rows) => quote! { #cleaned #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #cleaned #error }.into()
+                }
+            }
         }
+        Item::Struct(item_struct) => match conditional::emit_auto_config(&item_struct, None) {
+            Ok(rows) => quote! { #item_struct #rows }.into(),
+            Err(err) => {
+                let error = compile_error(&err);
+                quote! { #item_struct #error }.into()
+            }
+        },
+        other => quote! {
+            #other
+            ::core::compile_error!(
+                "#[auto_config] applies to a `struct` (the holder bean) or an inherent \
+                 `impl` block (its `#[bean]` methods contributing differently-typed beans)"
+            );
+        }
+        .into(),
     }
 }
 

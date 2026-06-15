@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+# The auto-config registration scaffolding is emitted by the THIN macros
+# (`#[auto_config] impl { #[bean] .. }`); only the live `RedisClient::open` factory
+# body inside the `#[bean]` method stays hand-written (the ecosystem boundary).
+leaf-macros.workspace = true
 leaf-tokio.workspace = true
 redis.workspace = true
 

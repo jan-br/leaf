@@ -55,11 +55,11 @@
 //! standalone use.
 
 use proc_macro2::TokenStream;
-use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, Pat, ReturnType, Type};
+use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat, ReturnType, Type};
 
 use crate::advisor::{self, AdviceKind};
 use crate::concern;
-use crate::descriptor::{self, BeanInput, Dependency, EmitError, Scope};
+use crate::descriptor::{self, BeanInput, Dependency, EmitError, Scope, ServiceView, Slice};
 use crate::stereotype::Stereotype;
 
 /// The attribute name a method must carry to be lowered as a `@bean` factory method.
@@ -99,8 +99,63 @@ pub fn emit_configuration_impl(item: &ItemImpl) -> Result<TokenStream, EmitError
 
     let mut rows = TokenStream::new();
     for method in &bean_methods {
-        let input = config_method_input(&self_ty, method, &bean_idents)?;
+        let input = config_method_input(&self_ty, method, &bean_idents, false)?;
         rows.extend(descriptor::emit(&input)?);
+    }
+    Ok(rows)
+}
+
+/// Emit the full `#[auto_config] impl Cfg { #[bean] fn .. }` artifact — the
+/// AUTO-CONFIGURATION analogue of [`emit_configuration_impl`] (Spring's
+/// `@AutoConfiguration` with `@Bean` methods). Each `#[bean]` METHOD contributes its
+/// (potentially DIFFERENTLY-TYPED) product into the SEPARATE `AUTO_CONFIGS` slice at
+/// [`CandidateRole::FALLBACK`](leaf_core::CandidateRole) (so a user bean transparently
+/// supersedes it and component-scanning over `COMPONENTS` never picks it up), through
+/// the SAME [`descriptor::emit`] currency — one `Descriptor` + `ProviderSeed` per
+/// method, no second seed type.
+///
+/// This is the faithful surface for a Spring `@Bean`-method-shaped contribution: the
+/// product is the method's RETURN type (a different bean than the holder), optionally
+/// declaring a dyn-view via `#[bean(provides = "dyn Svc")]` and an explicit
+/// `#[bean(name = "..")]`, and optionally `#[conditional(..)]`-guarded.
+///
+/// THE LOAD-BEARING INVARIANT: each `#[conditional(..)]` guard is keyed on the SAME
+/// contributed contract (`module_path!()::<method>`) the `Descriptor` + `SeedPairingRow`
+/// carry — so leaf-boot's `Descriptor.contract == SeedPairingRow.contract ==
+/// GuardPairingRow.contract` JOIN finds the guard. The guard const is named off the
+/// METHOD ident (the pairing key), exactly like the descriptor's contract.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when the impl is generic, a `#[bean]` method has
+/// no return type / takes no `self` receiver, a `#[conditional(..)]` is malformed, or
+/// a `#[bean]` body makes an intra-config self-call.
+pub fn emit_auto_config_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
+    let self_ty = self_ty_of(item)?;
+    if !item.generics.params.is_empty() {
+        return Err(EmitError {
+            message: format!(
+                "`{}` is a generic `#[auto_config]` impl: a generic auto-config has no \
+                 single concrete holder type. Make the holder concrete (its `#[bean]` \
+                 methods contribute concrete products).",
+                type_ident(&self_ty)
+            ),
+        });
+    }
+
+    let bean_methods = bean_methods(item);
+    let bean_idents: Vec<String> = bean_methods.iter().map(|m| m.sig.ident.to_string()).collect();
+
+    let mut rows = TokenStream::new();
+    for method in &bean_methods {
+        let input = config_method_input(&self_ty, method, &bean_idents, true)?;
+        rows.extend(descriptor::emit(&input)?);
+        // The optional per-method `#[conditional(..)]` back-off guard. Keyed on the
+        // METHOD ident so the GuardPairingRow.contract == the contributed Descriptor
+        // contract (`module_path!()::<method>`) — the alignment leaf-boot JOINs on.
+        if let Some(attr) = find_attr(&method.attrs, "conditional") {
+            let expr = crate::conditional::parse_conditional(attr_tokens(attr))?;
+            rows.extend(crate::conditional::emit_guard(&method.sig.ident.to_string(), &expr));
+        }
     }
     Ok(rows)
 }
@@ -336,6 +391,7 @@ fn config_method_input(
     self_ty: &Type,
     method: &ImplItemFn,
     sibling_beans: &[String],
+    as_auto_config: bool,
 ) -> Result<BeanInput, EmitError> {
     let method_ident = method.sig.ident.to_string();
 
@@ -371,19 +427,107 @@ fn config_method_input(
     // so it is a loud compile_error! with the rewrite hint (phase3/05).
     lint_no_self_bean_call(method, &method_ident, sibling_beans)?;
 
-    let meta = crate::annotation::resolve(&Stereotype::Component.annotation())
+    // A config-class @bean is a plain @component; an auto-config @bean rides the
+    // SEPARATE AUTO_CONFIGS channel at CandidateRole::FALLBACK (the soft override) —
+    // resolved through the SAME annotation merge the struct `#[auto_config]` uses.
+    let (meta, slice) = if as_auto_config {
+        let fallback = crate::annotation::resolve(
+            &Stereotype::Configuration
+                .annotation()
+                .with_attr("fallback", crate::annotation::AttrValue::Bool(true)),
+        )
         .map_err(|e| EmitError { message: e.to_string() })?;
+        (fallback, Slice::AutoConfigs)
+    } else {
+        let component = crate::annotation::resolve(&Stereotype::Component.annotation())
+            .map_err(|e| EmitError { message: e.to_string() })?;
+        (component, Slice::Components)
+    };
+
+    // The optional `#[bean(provides = "dyn Svc", name = "..")]` args: the declared
+    // dyn-view upcasts (so a consumer resolving `Arc<dyn Svc>` finds the product) and
+    // the explicit Spring bean name. Reading these off the `#[bean]` attr is the
+    // method-level analogue of the struct stereotype's `provides`/`name`.
+    let (explicit_name, provides) = bean_attr_args(method, &method_ident)?;
 
     let mut input = BeanInput::new(ret_ty, method_ident.clone(), method_ident.clone());
     input.module_qualified = true;
     input.scope = Scope::Singleton;
     input.meta = meta;
+    input.slice = slice;
     input.deps = deps;
+    input.explicit_name = explicit_name;
+    input.provides = provides;
     input.ctor = Some(syn::parse_str(&method_ident).map_err(|e| EmitError {
         message: format!("`{method_ident}` is not a callable method ident: {e}"),
     })?);
     input.receiver_ty = Some(self_ty.clone());
     Ok(input)
+}
+
+/// Read the optional `#[bean(name = "..", provides = "dyn Svc", provides = "dyn Other")]`
+/// arguments off a `#[bean]` METHOD: an explicit canonical name (overriding the
+/// method-derived default) and zero or more declared dyn-view upcasts. A `provides`
+/// value is a `dyn Svc` TYPE string lowered to a [`ServiceView`] (the same upcast row
+/// shape the struct stereotype + `#[runner]` emit). Repeated `provides` accumulate.
+///
+/// # Errors
+/// [`EmitError`] on a malformed `#[bean]` arg, an unknown key, or a non-type `provides`.
+fn bean_attr_args(
+    method: &ImplItemFn,
+    method_ident: &str,
+) -> Result<(Option<String>, Vec<ServiceView>), EmitError> {
+    let Some(attr) = find_attr(&method.attrs, BEAN_ATTR) else {
+        return Ok((None, Vec::new()));
+    };
+    let tokens = attr_tokens(attr);
+    if tokens.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
+    let metas = syn::parse::Parser::parse2(parser, tokens).map_err(|e| EmitError {
+        message: format!("malformed `#[bean(..)]` arguments on `{method_ident}`: {e}"),
+    })?;
+    let mut name = None;
+    let mut provides = Vec::new();
+    for meta in metas {
+        let Meta::NameValue(nv) = meta else {
+            return Err(EmitError {
+                message: format!(
+                    "`#[bean(..)]` arguments on `{method_ident}` must be `key = \"value\"` pairs"
+                ),
+            });
+        };
+        let key = nv.path.get_ident().map(ToString::to_string).unwrap_or_default();
+        let value = match &nv.value {
+            syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) => s.value(),
+            _ => {
+                return Err(EmitError {
+                    message: format!("`{key}` on `{method_ident}` must be a string literal"),
+                });
+            }
+        };
+        match key.as_str() {
+            "name" => name = Some(value),
+            "provides" => {
+                let dyn_ty: Type = syn::parse_str(&value).map_err(|e| EmitError {
+                    message: format!(
+                        "`provides` on `{method_ident}` must be a `dyn Svc` type, got `{value}`: {e}"
+                    ),
+                })?;
+                provides.push(ServiceView { dyn_ty });
+            }
+            other => {
+                return Err(EmitError {
+                    message: format!(
+                        "unknown `#[bean]` argument `{other}` on `{method_ident}` \
+                         (expected `name`/`provides`)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok((name, provides))
 }
 
 /// Lower a `#[bean]` method's typed parameters to injection points, requiring a
@@ -532,6 +676,184 @@ mod tests {
 
     fn flat(ts: &TokenStream) -> String {
         ts.to_string().split_whitespace().collect::<String>()
+    }
+
+    // ── #[auto_config] impl Cfg { #[bean] fn .. } (the differently-typed contribution) ──
+
+    #[test]
+    fn an_auto_config_impl_bean_method_targets_the_auto_configs_slice_at_fallback() {
+        // The headline differently-typed contribution: `#[auto_config] impl RedisAutoConfig
+        // { #[bean] fn cache_manager(&self) -> Arc<dyn CacheManager> { .. } }` emits the
+        // method's product into the SEPARATE AUTO_CONFIGS slice at CandidateRole::FALLBACK
+        // (Spring's @AutoConfiguration-with-@Bean-method shape) — NOT COMPONENTS.
+        let item = impl_item(
+            "impl RedisAutoConfig {
+                #[bean]
+                fn cache_manager(&self) -> Arc<dyn CacheManager> { todo!() }
+             }",
+        );
+        let ts = emit_auto_config_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
+            "an auto-config @bean method rides AUTO_CONFIGS: {s}"
+        );
+        assert!(s.contains("::leaf_core::CandidateRole::FALLBACK"), "at FALLBACK: {s}");
+        // It must NOT land in COMPONENTS (the AutoConfigurationExcludeFilter boundary).
+        assert!(
+            !s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "an auto-config @bean method must not be a COMPONENTS row: {s}"
+        );
+        // The product type is the method's RETURN type (a DIFFERENT bean, not Self).
+        assert!(s.contains("::core::any::TypeId::of::<Arc<dynCacheManager>>()"), "got: {s}");
+    }
+
+    #[test]
+    fn an_auto_config_impl_bean_method_can_declare_a_dyn_view_provides() {
+        // `#[bean(provides = "dyn CacheManager")]` declares the injectable dyn-view so a
+        // consumer resolving `Arc<dyn CacheManager>` finds it (the provides[] upcast row),
+        // mirroring the struct stereotype's provides[].
+        let item = impl_item(
+            r#"impl RedisAutoConfig {
+                #[bean(provides = "dyn CacheManager")]
+                fn cache_manager(&self) -> RedisCacheManager { todo!() }
+             }"#,
+        );
+        let s = flat(&emit_auto_config_impl(&item).expect("emits"));
+        assert!(s.contains("::leaf_core::TypeRow"), "the dyn-view rides a provides[] TypeRow: {s}");
+        assert!(
+            s.contains("view:const{::core::any::TypeId::of::<dynCacheManager>()}"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn an_auto_config_impl_bean_method_can_carry_an_explicit_name() {
+        // `#[bean(name = "cacheManager")]` preserves Spring's bean identity over the
+        // method-derived default (the contributed Arc<dyn CacheManager> is "cacheManager").
+        let item = impl_item(
+            r#"impl RedisAutoConfig {
+                #[bean(name = "cacheManager")]
+                fn cache_manager(&self) -> RedisCacheManager { todo!() }
+             }"#,
+        );
+        let s = flat(&emit_auto_config_impl(&item).expect("emits"));
+        assert!(s.contains(r#"Some("cacheManager")"#), "got: {s}");
+    }
+
+    #[test]
+    fn an_auto_config_impl_bean_method_guard_keys_on_the_contributed_contract() {
+        // THE LOAD-BEARING INVARIANT: for leaf-boot's JOIN, the contributed bean's
+        // Descriptor.contract == SeedPairingRow.contract == GuardPairingRow.contract.
+        // A `#[conditional(..)]` on a `#[bean]` method must key the GuardPairingRow on
+        // the SAME contributed contract (`module_path!()::<method>`), NOT the holder
+        // struct — so the three contracts align for the JOIN to find the guard.
+        let item = impl_item(
+            r#"impl RedisAutoConfig {
+                #[bean(name = "cacheManager")]
+                #[conditional(on_property("leaf.redis.enabled", having_value = "true"))]
+                fn cache_manager(&self) -> RedisCacheManager { todo!() }
+             }"#,
+        );
+        let s = flat(&emit_auto_config_impl(&item).expect("emits"));
+        // The contributed contract is module-qualified on the METHOD ident.
+        let contributed =
+            r#"::leaf_core::ContractId::of(::core::concat!(::core::module_path!(),"::","cache_manager"))"#;
+        // The Descriptor row keys on it.
+        assert!(s.contains(&format!("contract:{contributed}")), "Descriptor contract: {s}");
+        // The SEED_PAIRINGS row keys on it.
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
+            "got: {s}"
+        );
+        // The GUARD_PAIRINGS row keys on the SAME contributed contract (the alignment).
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains(&format!("::leaf_core::GuardPairingRow{{contract:{contributed}")),
+            "the guard must key on the SAME contributed contract as the Descriptor: {s}"
+        );
+        // The guard const is named off the METHOD ident (the pairing key).
+        assert!(
+            s.contains("pubconst__leaf_guard_cache_manager:::leaf_core::CondExpr"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn the_three_contracts_align_for_a_contributed_bean_auto_config() {
+        // The exact codegen assertion the task mandates: parse the emitted artifact and
+        // verify the Descriptor, the SeedPairingRow, and the GuardPairingRow ALL carry
+        // the identical contributed-contract token expression.
+        let item = impl_item(
+            r#"impl RedisAutoConfig {
+                #[bean(name = "cacheManager")]
+                #[conditional(on_missing_bean(RedisCacheManager))]
+                fn cache_manager(&self) -> RedisCacheManager { todo!() }
+             }"#,
+        );
+        let s = flat(&emit_auto_config_impl(&item).expect("emits"));
+        let contributed =
+            r#"::core::concat!(::core::module_path!(),"::","cache_manager")"#;
+        // Count the three uses of the contributed contract path: Descriptor.contract,
+        // SeedPairingRow.contract, GuardPairingRow.contract (the contract is also used
+        // by the InjectionPlanPairingRow, so >= 3 — at minimum the load-bearing trio).
+        let uses = s.matches(contributed).count();
+        assert!(
+            uses >= 3,
+            "the contributed contract must appear on the Descriptor + SeedPairingRow + \
+             GuardPairingRow (the load-bearing JOIN trio); saw {uses}: {s}"
+        );
+    }
+
+    #[test]
+    fn an_auto_config_impl_resolves_the_holder_receiver_and_calls_the_method() {
+        // The construction recipe is unchanged: the provider resolves the holder (the
+        // receiver) through the one Engine::get seam and calls the bean METHOD on it —
+        // the SAME differently-typed contribution lowering config methods already use.
+        let item = impl_item(
+            "impl RedisAutoConfig {
+                #[bean]
+                fn cache_manager(&self) -> RedisCacheManager { todo!() }
+             }",
+        );
+        let s = flat(&emit_auto_config_impl(&item).expect("emits"));
+        assert!(
+            s.contains(
+                "let__recv:::leaf_core::Ref<RedisAutoConfig>=__engine.get::<RedisAutoConfig>().await?"
+            ),
+            "got: {s}"
+        );
+        assert!(s.contains("__recv.cache_manager()"), "got: {s}");
+    }
+
+    #[test]
+    fn an_auto_config_impl_with_an_unguarded_bean_emits_no_guard() {
+        // An unguarded `#[bean]` method contributes its product unconditionally (no
+        // GUARD_PAIRINGS row) — the Fallback role alone is the soft-override.
+        let item = impl_item(
+            "impl RedisAutoConfig {
+                #[bean]
+                fn cache_manager(&self) -> RedisCacheManager { todo!() }
+             }",
+        );
+        let s = flat(&emit_auto_config_impl(&item).expect("emits"));
+        assert!(
+            !s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]"),
+            "an unguarded auto-config @bean method emits no guard: {s}"
+        );
+    }
+
+    #[test]
+    fn a_generic_auto_config_impl_is_a_hard_error() {
+        let item = impl_item(
+            "impl<T> RedisAutoConfig<T> { #[bean] fn cm(&self) -> Mgr { todo!() } }",
+        );
+        let err = emit_auto_config_impl(&item).expect_err("a generic auto-config impl hard-errors");
+        assert!(err.message.contains("generic"), "got: {}", err.message);
     }
 
     #[test]

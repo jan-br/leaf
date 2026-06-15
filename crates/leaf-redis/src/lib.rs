@@ -10,16 +10,19 @@
 //!
 //! ## What this crate ships
 //!
-//! - [`RedisAutoConfig`](autoconfig) — NOT a struct but a set of const artifacts
-//!   modelling Spring's `RedisAutoConfiguration`: an
-//!   [`AUTO_CONFIGS`](leaf_core::AUTO_CONFIGS) [`Descriptor`](leaf_core::Descriptor)
-//!   at [`CandidateRole::FALLBACK`](leaf_core::CandidateRole) contributing the
-//!   Redis-backed `Arc<dyn CacheManager>` bean ([`REDIS_CACHE_MANAGER_DESCRIPTOR`]),
-//!   its [`ProviderSeed`](leaf_core::ProviderSeed) ([`REDIS_CACHE_MANAGER_SEED`]),
-//!   its [`Provider`](leaf_core::Provider) ([`RedisCacheManagerProvider`]), and the
-//!   back-off guard [`REDIS_AUTO_CONFIG_GUARD`] = `OnProperty(leaf.redis.enabled)`
-//!   AND `OnMissingBean(RedisCacheManager)`. leaf-boot's `run_autoconfig` runs the
-//!   `exclude > back-off > default` ladder over it.
+//! - [`RedisAutoConfig`](autoconfig) — the `#[auto_config] impl` holder modelling
+//!   Spring's `RedisAutoConfiguration`: its `#[bean]` `cache_manager` method
+//!   contributes the Redis-backed cache manager (concrete `RedisCacheManager`, exposed
+//!   as `dyn CacheManager`) into [`AUTO_CONFIGS`](leaf_core::AUTO_CONFIGS) as a
+//!   [`Descriptor`](leaf_core::Descriptor) at
+//!   [`CandidateRole::FALLBACK`](leaf_core::CandidateRole)
+//!   ([`redis_cache_manager_descriptor`]), with its macro-emitted
+//!   [`ProviderSeed`](leaf_core::ProviderSeed) ([`REDIS_CACHE_MANAGER_SEED`]) and the
+//!   back-off guard [`REDIS_AUTO_CONFIG_GUARD`] = `OnProperty(leaf.redis.enabled)` AND
+//!   `OnMissingBean(RedisCacheManager)`. leaf-boot's `run_autoconfig` runs the
+//!   `exclude > back-off > default` ladder over it. The LIVE `RedisClient::open` socket
+//!   factory stays hand-written inside the `#[bean]` body; only the const registration
+//!   scaffolding is macro-emitted.
 //! - [`RedisClient`] — the `Role::Infrastructure` connection-factory bean
 //!   ([`REDIS_CLIENT_DESCRIPTOR`]), contributed into
 //!   [`COMPONENTS`](leaf_core::COMPONENTS) the SAME way leaf-tokio contributes its
@@ -71,8 +74,8 @@ leaf_core::declare_source!("leaf-redis");
 // ── the flat integration surface ──
 
 pub use autoconfig::{
-    RedisCacheManagerProvider, REDIS_AUTO_CONFIG_GUARD, REDIS_CACHE_MANAGER_BEAN,
-    REDIS_CACHE_MANAGER_CONTRACT, REDIS_CACHE_MANAGER_DESCRIPTOR, REDIS_CACHE_MANAGER_SEED,
+    redis_cache_manager_descriptor, RedisAutoConfig, REDIS_AUTO_CONFIG_GUARD,
+    REDIS_CACHE_MANAGER_BEAN, REDIS_CACHE_MANAGER_CONTRACT, REDIS_CACHE_MANAGER_SEED,
 };
 pub use client::{
     RedisClient, RedisClientProvider, REDIS_CLIENT_BEAN, REDIS_CLIENT_CONTRACT,

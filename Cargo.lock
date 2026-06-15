@@ -677,6 +677,7 @@ dependencies = [
  "leaf-boot",
  "leaf-conditions",
  "leaf-core",
+ "leaf-macros",
  "leaf-tokio",
  "redis",
  "tokio",

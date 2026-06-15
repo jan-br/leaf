@@ -20,15 +20,16 @@ use leaf_core::{
 };
 
 use leaf_redis::{
-    RedisCacheManager, REDIS_AUTO_CONFIG_GUARD, REDIS_CACHE_MANAGER_CONTRACT,
-    REDIS_CACHE_MANAGER_DESCRIPTOR, REDIS_CACHE_MANAGER_SEED,
+    redis_cache_manager_descriptor, RedisCacheManager, REDIS_AUTO_CONFIG_GUARD,
+    REDIS_CACHE_MANAGER_CONTRACT, REDIS_CACHE_MANAGER_SEED,
 };
 
-/// Build the one Redis auto-config candidate from the crate's public const artifacts
-/// (descriptor + seed + guard) — exactly the JOIN leaf-boot performs over the slices.
+/// Build the one Redis auto-config candidate from the crate's macro-emitted public
+/// artifacts (the contributed `AUTO_CONFIGS` descriptor + its seed + its guard) —
+/// exactly the JOIN leaf-boot performs over the slices.
 fn redis_candidate() -> AutoConfigCandidate {
     AutoConfigCandidate::new(
-        REDIS_CACHE_MANAGER_DESCRIPTOR,
+        redis_cache_manager_descriptor(),
         REDIS_CACHE_MANAGER_SEED,
         Some(&REDIS_AUTO_CONFIG_GUARD),
     )
@@ -76,7 +77,7 @@ fn registers_the_redis_cache_manager_at_fallback_when_enabled_and_unclaimed() {
 #[test]
 fn the_registered_bean_carries_the_fallback_soft_override_role() {
     // The contributed descriptor is FALLBACK so a user bean transparently supersedes.
-    assert_eq!(REDIS_CACHE_MANAGER_DESCRIPTOR.meta.candidate_role, CandidateRole::FALLBACK);
+    assert_eq!(redis_cache_manager_descriptor().meta.candidate_role, CandidateRole::FALLBACK);
 }
 
 #[test]

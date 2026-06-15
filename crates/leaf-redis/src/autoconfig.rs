@@ -1,257 +1,156 @@
-//! `RedisAutoConfig` — the representative `#[auto_config]`-equivalent: an
+//! `RedisAutoConfig` — the representative `#[auto_config]` integration: an
 //! `AUTO_CONFIGS` row at [`CandidateRole::FALLBACK`](leaf_core::CandidateRole)
-//! contributing the Redis-backed `Arc<dyn CacheManager>` bean, guarded by a const
-//! [`CondExpr`] (`OnProperty(leaf.redis.enabled)` AND
-//! `OnMissingBean(RedisCacheManager)`).
+//! contributing the Redis-backed `Arc<dyn CacheManager>` bean (Spring's
+//! `RedisAutoConfiguration` with a `@Bean cacheManager()` method), guarded by
+//! `OnProperty(leaf.redis.enabled)` AND `OnMissingBean(RedisCacheManager)`.
 //!
-//! ## Why hand-built (not the `#[auto_config]` macro)
+//! ## The `#[auto_config] impl` form (Spring's @AutoConfiguration + @Bean methods)
 //!
-//! The thin `#[auto_config]` macro emits a `Descriptor` whose provider yields
-//! `Self` (the annotated struct), and whose `#[conditional]` guard can only
-//! reference the struct's OWN self-type for `OnMissingBean`. A Spring
-//! `@Configuration` contributes a *different* bean (here `Arc<dyn CacheManager>`)
-//! from a `@Bean` method — which the v1 struct-only macro cannot express. So this
-//! crate hand-writes the SAME const artifacts the macro/config-codegen emit (the
-//! `AUTO_CONFIGS` `Descriptor` at `FALLBACK`, its `ProviderSeed`, the `Provider`,
-//! the `SEED_PAIRINGS` JOIN, and the `GUARD_PAIRINGS` + `CONDITIONS` guard rows) —
-//! proving the data-driven auto-config contract end to end without depending on the
-//! macro crate. This IS the representative integration pattern: contribute DATA +
-//! Providers, never an Engine/kernel strategy.
+//! `#[auto_config] impl RedisAutoConfig { #[bean(name = "cacheManager", provides =
+//! "dyn CacheManager")] #[conditional(..)] fn cache_manager(&self) ->
+//! RedisCacheManager { .. } }` emits the SAME const artifacts a hand-built
+//! auto-config would — the `AUTO_CONFIGS` [`Descriptor`] at `FALLBACK` (carrying the
+//! `dyn CacheManager` provides[] view + the `"cacheManager"` declared name), its
+//! [`ProviderSeed`](leaf_core::ProviderSeed) + `SEED_PAIRINGS` JOIN, and the
+//! `#[conditional]` guard + its `GUARD_PAIRINGS` + `CONDITIONS` anchors — all keyed on
+//! the ONE contributed contract (`module_path!()::cache_manager`) so leaf-boot's
+//! `Descriptor.contract == SeedPairingRow.contract == GuardPairingRow.contract` JOIN
+//! finds them. The holder [`RedisAutoConfig`] is a managed `#[component]` (the `&self`
+//! receiver each `#[bean]` method reads — singleton-correct).
+//!
+//! The LIVE socket I/O ([`RedisClient::open`](crate::client::RedisClient::open)) stays
+//! hand-written inside the `#[bean]` factory body the macro calls — only the const
+//! REGISTRATION scaffolding is macro-emitted (the ecosystem boundary).
 //!
 //! ## The back-off contract
 //!
-//! The guard's `OnMissingBean(RedisCacheManager)` makes the auto-config back off
-//! when a bean of that concrete type is already present (the soft override: a user
-//! `CacheManager` supersedes it). leaf-boot's `run_autoconfig` evaluates the guard
-//! over the GROWING definition set in the Register sub-pass; the `OnProperty` leaf
+//! The guard's `OnMissingBean(RedisCacheManager)` makes the auto-config back off when a
+//! bean of that concrete type is already present (the soft override: a user
+//! `CacheManager` supersedes it). leaf-boot's `run_autoconfig` evaluates the guard over
+//! the GROWING definition set in the Register sub-pass; the `OnProperty` leaf
 //! additionally requires `leaf.redis.enabled` to be present-and-not-`false`.
 //!
-//! NOTE (honest deferral): leaf-boot's `BuilderProbe` keys back-off on the
-//! candidate's CONCRETE `self_type` (the in-process exact-match key), so the
-//! `OnMissingBean` here matches a user bean of type `RedisCacheManager`. A user
-//! `CacheManager` of a DIFFERENT concrete type (e.g. leaf-cache's
-//! `InMemoryCacheManager`) does not yet trip this probe — distributed-by-`dyn`-view
-//! back-off is a `provides[]`-aware-probe concern tracked for a later unit. The
-//! `provides[]` row below already declares the `dyn CacheManager` view so consumers
-//! resolve `Arc<dyn CacheManager>`.
+//! NOTE (honest deferral — `dyn`-view back-off): leaf-boot's `BuilderProbe` keys
+//! back-off on the candidate's CONCRETE `self_type`, so the `OnMissingBean` here matches
+//! a user bean of type `RedisCacheManager`. A user `CacheManager` of a DIFFERENT concrete
+//! type does not yet trip this probe — distributed-by-`dyn`-view back-off is a
+//! `provides[]`-aware-probe concern tracked for a later unit. The `provides[]` row
+//! already declares the `dyn CacheManager` view so consumers resolve `Arc<dyn CacheManager>`.
+//!
+//! NOTE (honest deferral — env-bound props): the `#[bean]` factory opens the (lazy)
+//! `RedisClient` from DEFAULT [`RedisProperties`]; threading the env-bound props into the
+//! factory is the config-bind seam the binary supplies (the `RedisProperties::from_env`
+//! projection is ready, and the default URL never fails to open — URL validation only).
 
-use std::any::TypeId;
-use std::sync::Arc;
-
-use leaf_core::{
-    Attr, BoxFuture, CondExpr, ConditionId, ContractId, Descriptor, LeafError, Published,
-    ResolveCtx,
-};
+use leaf_core::{CondExpr, ContractId, Descriptor, ProviderSeed};
 
 use crate::client::RedisClient;
 use crate::manager::RedisCacheManager;
-use crate::properties::{RedisProperties, ENABLED_PROPERTY};
-
-/// The stable contract path of the Redis auto-config's contributed cache-manager
-/// bean.
-pub const REDIS_CACHE_MANAGER_CONTRACT: &str = "leaf_redis::redisCacheManager";
+use crate::properties::RedisProperties;
 
 /// The declared name of the contributed `Arc<dyn CacheManager>` bean (Spring's
 /// `cacheManager` identity preserved).
 pub const REDIS_CACHE_MANAGER_BEAN: &str = "cacheManager";
 
-// ───────────────────────── the const CondExpr guard ─────────────────────────
+/// The stable contract path of the Redis auto-config's contributed cache-manager
+/// bean — the contract the `#[auto_config] impl` macro mints from the
+/// `module_path!()::<method>` of the `cache_manager` `#[bean]` method (the ONE
+/// contract the `Descriptor`, the `SeedPairingRow`, and the `GuardPairingRow` share).
+pub const REDIS_CACHE_MANAGER_CONTRACT: &str = "leaf_redis::autoconfig::cache_manager";
 
-/// The canonical `OnProperty` condition-kind FQN — the SAME input leaf-conditions
-/// mints its [`ConditionId`] from, so this leaf resolves to that runtime impl.
-const ON_PROPERTY_FQN: &str = "leaf::condition::OnProperty";
-/// The canonical `OnMissingBean` condition-kind FQN.
-const ON_MISSING_BEAN_FQN: &str = "leaf::condition::OnMissingBean";
+// ───────────────────────── the #[auto_config] holder ─────────────────────────
 
-/// Mint a [`ConditionId`] from a kind FQN exactly as leaf-conditions does
-/// (`contract_hash` truncated to the dense `u32` space) — reproducible cross-build.
-const fn cond_id(fqn: &str) -> ConditionId {
-    ConditionId(leaf_core::contract_hash(fqn) as u32)
-}
+/// The auto-configuration HOLDER (a managed `#[component]` singleton). The
+/// `#[auto_config] impl` block below contributes the cache manager from a `#[bean]`
+/// method that reads this holder as its `&self` receiver.
+#[leaf_macros::component]
+pub struct RedisAutoConfig;
 
-/// The `OnProperty(leaf.redis.enabled)` leaf attrs. The runtime `OnProperty` reads
-/// the `"name"` attr (multi-name = ALL must pass); present-and-not-`false` enables.
-static ON_PROPERTY_ATTRS: &[Attr] = &[Attr::Str("name", ENABLED_PROPERTY)];
-
-/// The `OnMissingBean(RedisCacheManager)` leaf attrs. The runtime `OnMissingBean`
-/// probes the `"type"` attr against the growing definition set.
-static ON_MISSING_BEAN_ATTRS: &[Attr] =
-    &[Attr::Type("type", TypeId::of::<RedisCacheManager>())];
-
-/// The two guard leaves: `OnProperty(leaf.redis.enabled)` AND
-/// `OnMissingBean(RedisCacheManager)`.
-static GUARD_LEAVES: &[CondExpr] = &[
-    CondExpr::Leaf(cond_id(ON_PROPERTY_FQN), ON_PROPERTY_ATTRS),
-    CondExpr::Leaf(cond_id(ON_MISSING_BEAN_FQN), ON_MISSING_BEAN_ATTRS),
-];
-
-/// The const back-off guard for `RedisAutoConfig`: it registers the Redis cache
-/// manager at `FALLBACK` IFF `leaf.redis.enabled` is set AND no `RedisCacheManager`
-/// bean already exists. An `OnBean`-family leaf (the `OnMissingBean`) defers the
-/// whole guard to the Register sub-pass (it must see the growing set).
-pub static REDIS_AUTO_CONFIG_GUARD: CondExpr = CondExpr::All(GUARD_LEAVES);
-
-// The GUARD_PAIRINGS submission keyed by the auto-config's contract — so leaf-boot's
-// condition routing JOINs the guard with NO hand-assembled `.with_guards`.
-#[allow(unsafe_code)]
-#[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]
-#[linkme(crate = ::leaf_core::linkme)]
-#[doc(hidden)]
-pub static REDIS_AUTO_CONFIG_GUARD_PAIRING: leaf_core::GuardPairingRow =
-    leaf_core::GuardPairingRow {
-        contract: ContractId::of(REDIS_CACHE_MANAGER_CONTRACT),
-        guard: &REDIS_AUTO_CONFIG_GUARD,
-    };
-
-// The anti-DCE CONDITIONS anchors — one per referenced kind, keyed by the kind FQN
-// (the same belt-and-suspenders anchor `#[conditional]` emits; the live impls are
-// force-linked from leaf-conditions in the binary).
-#[allow(unsafe_code)]
-#[::leaf_core::linkme::distributed_slice(::leaf_core::CONDITIONS)]
-#[linkme(crate = ::leaf_core::linkme)]
-#[doc(hidden)]
-pub static REDIS_AUTO_CONFIG_COND_ANCHOR_PROPERTY: leaf_core::ConditionRow =
-    leaf_core::ConditionRow {
-        contract: ContractId::of(ON_PROPERTY_FQN),
-        marker: leaf_core::MarkerId::of(ON_PROPERTY_FQN),
-    };
-
-#[allow(unsafe_code)]
-#[::leaf_core::linkme::distributed_slice(::leaf_core::CONDITIONS)]
-#[linkme(crate = ::leaf_core::linkme)]
-#[doc(hidden)]
-pub static REDIS_AUTO_CONFIG_COND_ANCHOR_MISSING_BEAN: leaf_core::ConditionRow =
-    leaf_core::ConditionRow {
-        contract: ContractId::of(ON_MISSING_BEAN_FQN),
-        marker: leaf_core::MarkerId::of(ON_MISSING_BEAN_FQN),
-    };
-
-// ─────────────────────── the AUTO_CONFIGS Fallback row ───────────────────────
-
-/// The flat const annotation table at [`CandidateRole::FALLBACK`](leaf_core::CandidateRole)
-/// — the auto-config soft override (a user bean of the same type/contract wins).
-static REDIS_CACHE_MANAGER_META: leaf_core::AnnotationMetadata = leaf_core::AnnotationMetadata {
-    qualifiers: &[],
-    markers: &[],
-    depends_on: &[],
-    candidate_role: leaf_core::CandidateRole::FALLBACK,
-    autowire_candidate: true,
-};
-
-/// The `dyn CacheManager` injectable view this bean provides — so a consumer
-/// resolving `Arc<dyn CacheManager>` finds it (the upcast is identity over the
-/// erased `Arc`, like every macro-emitted `provides[]` row).
-static REDIS_CACHE_MANAGER_PROVIDES: &[leaf_core::TypeRow] = &[leaf_core::TypeRow {
-    view: TypeId::of::<dyn leaf_core::CacheManager>(),
-    upcast: |bean: leaf_core::ErasedBean| -> leaf_core::ErasedBean { bean },
-}];
-
-/// The const `AUTO_CONFIGS` [`Descriptor`] for the Redis cache manager — at
-/// `FALLBACK`, on the SEPARATE auto-config channel (so component-scanning over
-/// `COMPONENTS` never picks it up), carrying the `dyn CacheManager` view.
-pub const REDIS_CACHE_MANAGER_DESCRIPTOR: Descriptor = Descriptor {
-    contract: ContractId::of(REDIS_CACHE_MANAGER_CONTRACT),
-    self_type: TypeId::of::<RedisCacheManager>(),
-    provides: REDIS_CACHE_MANAGER_PROVIDES,
-    declared_name: Some(REDIS_CACHE_MANAGER_BEAN),
-    aliases: &[],
-    scope: leaf_core::ScopeDef::SINGLETON,
-    role: leaf_core::Role::Application,
-    meta: &REDIS_CACHE_MANAGER_META,
-    parent: None,
-    origin: leaf_core::Origin::Native { crate_name: Some("leaf-redis") },
-};
-
-// The link-time element: submit the const Descriptor into the SEPARATE AUTO_CONFIGS
-// slice via the SAME `::leaf_core::linkme` path the config-codegen emits.
-#[allow(unsafe_code)]
-#[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]
-#[linkme(crate = ::leaf_core::linkme)]
-#[doc(hidden)]
-pub static REDIS_CACHE_MANAGER_ELEMENT: Descriptor = REDIS_CACHE_MANAGER_DESCRIPTOR;
-
-/// The [`Provider`](leaf_core::Provider) that constructs the Redis cache manager:
-/// it opens a (lazy) [`RedisClient`] from the resolved properties and publishes the
-/// shared `RedisCacheManager` (resolvable as `Arc<dyn CacheManager>` via the view).
-pub struct RedisCacheManagerProvider {
-    descriptor: Descriptor,
-    props: RedisProperties,
-}
-
-impl RedisCacheManagerProvider {
-    /// Construct the provider with default properties (the seed builds this; the
-    /// real env-bound props are threaded by a later config-bind step).
+impl RedisAutoConfig {
+    /// The no-collaborator constructor the `#[component]` provider calls.
     #[must_use]
     pub fn new() -> Self {
-        RedisCacheManagerProvider {
-            descriptor: REDIS_CACHE_MANAGER_DESCRIPTOR,
-            props: RedisProperties::default(),
-        }
-    }
-
-    /// Construct the provider over explicit properties (the env-bound path).
-    #[must_use]
-    pub fn with_properties(props: RedisProperties) -> Self {
-        RedisCacheManagerProvider { descriptor: REDIS_CACHE_MANAGER_DESCRIPTOR, props }
+        RedisAutoConfig
     }
 }
 
-impl Default for RedisCacheManagerProvider {
+impl Default for RedisAutoConfig {
     fn default() -> Self {
-        RedisCacheManagerProvider::new()
+        RedisAutoConfig::new()
     }
 }
 
-impl leaf_core::Provider for RedisCacheManagerProvider {
-    fn descriptor(&self) -> &Descriptor {
-        &self.descriptor
-    }
+// ───────────────────── the @bean-method cache-manager contribution ─────────────
 
-    fn provide<'a>(
-        &'a self,
-        _cx: &'a ResolveCtx<'a>,
-    ) -> BoxFuture<'a, Result<Published, LeafError>> {
-        let props = self.props.clone();
-        Box::pin(async move {
-            let client = RedisClient::open(props)?;
-            Ok(Published::shared_value(RedisCacheManager::new(client)))
-        })
+/// The differently-typed `@Bean`-method contribution: `cache_manager()` produces the
+/// concrete [`RedisCacheManager`] exposed as `dyn CacheManager` (the `provides[]`
+/// view), named `"cacheManager"`, into `AUTO_CONFIGS` at `FALLBACK`, gated by
+/// `OnProperty(leaf.redis.enabled)` AND `OnMissingBean(RedisCacheManager)`.
+#[leaf_macros::auto_config]
+impl RedisAutoConfig {
+    /// Build the Redis-backed cache manager (the ecosystem factory body the macro
+    /// calls). It opens a LAZY [`RedisClient`] from the DEFAULT properties — URL
+    /// validation only, no socket — and publishes the shared [`RedisCacheManager`].
+    ///
+    /// The default URL is a known-valid Redis connection URL, so `open` cannot fail
+    /// here (the env-bound props threading is the deferred config-bind seam); the
+    /// `.expect` documents that invariant rather than widening the macro to a fallible
+    /// `#[bean]` return.
+    #[bean(name = "cacheManager", provides = "dyn ::leaf_core::CacheManager")]
+    #[conditional(
+        on_property("leaf.redis.enabled"),
+        on_missing_bean(RedisCacheManager)
+    )]
+    fn cache_manager(&self) -> RedisCacheManager {
+        let client = RedisClient::open(RedisProperties::default())
+            .expect("the default Redis URL is always a valid (lazy) connection URL");
+        RedisCacheManager::new(client)
     }
 }
+
+// ───────────────────────── thin compatibility aliases ────────────────────────
+//
+// The macro emits the contributed bean's `ProviderSeed` as `__leaf_seed_cache_manager`
+// and its back-off guard as `__leaf_guard_cache_manager` (keyed off the METHOD ident),
+// and submits the `Descriptor` into the `AUTO_CONFIGS` slice. These thin aliases
+// preserve the crate's historical public surface over the macro-emitted artifacts.
 
 /// The const [`ProviderSeed`](leaf_core::ProviderSeed) leaf-boot's `run_autoconfig`
-/// invokes ONCE to mint the manager's `Provider` when the candidate survives the
-/// back-off ladder.
-pub const REDIS_CACHE_MANAGER_SEED: leaf_core::ProviderSeed =
-    || Arc::new(RedisCacheManagerProvider::new());
+/// invokes ONCE to mint the manager's `Provider` (the macro-emitted seed).
+pub const REDIS_CACHE_MANAGER_SEED: ProviderSeed = __leaf_seed_cache_manager;
 
-/// The [`SeedPairingRow`](leaf_core::SeedPairingRow) JOINing the `AUTO_CONFIGS`
-/// descriptor to its seed (the anti-DCE per-bean JOIN — an unconstructible
-/// auto-config must never silently vanish).
-#[allow(unsafe_code)]
-#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
-#[linkme(crate = ::leaf_core::linkme)]
-#[doc(hidden)]
-pub static REDIS_CACHE_MANAGER_SEED_PAIRING: leaf_core::SeedPairingRow =
-    leaf_core::SeedPairingRow {
-        contract: ContractId::of(REDIS_CACHE_MANAGER_CONTRACT),
-        seed: REDIS_CACHE_MANAGER_SEED,
-    };
+/// The const back-off guard for the Redis cache manager: it registers at `FALLBACK`
+/// IFF `leaf.redis.enabled` is set AND no `RedisCacheManager` bean already exists (the
+/// macro-emitted `#[conditional]` guard tree).
+pub static REDIS_AUTO_CONFIG_GUARD: CondExpr = __leaf_guard_cache_manager;
+
+/// The contributed `AUTO_CONFIGS` [`Descriptor`] for the Redis cache manager (looked up
+/// from the macro-emitted `AUTO_CONFIGS` slice row by its `"cacheManager"` name) — at
+/// `FALLBACK`, on the SEPARATE auto-config channel, carrying the `dyn CacheManager` view.
+#[must_use]
+pub fn redis_cache_manager_descriptor() -> Descriptor {
+    *leaf_core::AUTO_CONFIGS
+        .iter()
+        .find(|d| d.contract == ContractId::of(REDIS_CACHE_MANAGER_CONTRACT))
+        .expect("the #[auto_config] cache_manager Descriptor must reach the AUTO_CONFIGS slice")
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use leaf_core::{CandidateRole, ConditionKind, Provider};
+    use std::any::TypeId;
+    use leaf_core::{CandidateRole, ConditionKind, ResolveCtx};
 
     #[test]
     fn descriptor_is_a_fallback_auto_config_with_the_cache_manager_view() {
-        let d = &REDIS_CACHE_MANAGER_DESCRIPTOR;
+        let d = redis_cache_manager_descriptor();
         assert_eq!(
             d.meta.candidate_role,
             CandidateRole::FALLBACK,
             "an auto-config registers at FALLBACK so a user bean supersedes it"
         );
         assert_eq!(d.role, leaf_core::Role::Application);
+        // The product is the CONCRETE RedisCacheManager (the method return type).
         assert_eq!(d.self_type, TypeId::of::<RedisCacheManager>());
         assert_eq!(d.declared_name, Some(REDIS_CACHE_MANAGER_BEAN));
         // It provides the dyn CacheManager view (consumers resolve Arc<dyn CacheManager>).
@@ -263,36 +162,41 @@ mod tests {
 
     #[test]
     fn the_auto_config_rides_the_separate_auto_configs_channel_not_components() {
+        let contract = ContractId::of(REDIS_CACHE_MANAGER_CONTRACT);
         let autos = leaf_core::collect_slice(&leaf_core::AUTO_CONFIGS);
         assert!(
-            autos.iter().any(|r| r.contract == ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)),
+            autos.iter().any(|r| r.contract == contract),
             "the Redis cache manager must be an AUTO_CONFIGS row"
         );
         let comps = leaf_core::collect_slice(&leaf_core::COMPONENTS);
         assert!(
-            !comps.iter().any(|r| r.contract == ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)),
-            "the auto-config must NOT be in COMPONENTS (component-scanning never picks it up)"
+            !comps.iter().any(|r| r.contract == contract),
+            "the auto-config contribution must NOT be in COMPONENTS"
         );
     }
 
     #[test]
-    fn the_auto_config_descriptor_has_a_paired_seed() {
+    fn the_auto_config_descriptor_has_a_paired_seed_on_the_same_contract() {
+        // THE ALIGNMENT: the SeedPairingRow keys on the SAME contributed contract as the
+        // Descriptor (so leaf-boot's JOIN finds the construction recipe).
+        let contract = ContractId::of(REDIS_CACHE_MANAGER_CONTRACT);
         let seeds = leaf_core::collect_slice(&leaf_core::SEED_PAIRINGS);
         assert!(
-            seeds.iter().any(|r| r.contract == ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)),
-            "the AUTO_CONFIGS row must have a paired ProviderSeed (anti-DCE JOIN)"
+            seeds.iter().any(|r| r.contract == contract),
+            "the AUTO_CONFIGS row must have a paired ProviderSeed on its contract"
         );
     }
 
     #[test]
     fn the_guard_is_property_and_missing_bean_gated() {
-        // The guard tree is All([OnProperty, OnMissingBean]) — both leaves present.
+        // The guard tree is All([OnProperty, OnMissingBean]) — both leaves present (the
+        // comma-separated #[conditional] form ANDs them).
         match &REDIS_AUTO_CONFIG_GUARD {
             CondExpr::All(children) => {
                 assert_eq!(children.len(), 2, "OnProperty AND OnMissingBean");
-                assert!(matches!(children[0], CondExpr::Leaf(id, _) if id == cond_id(ON_PROPERTY_FQN)));
+                assert!(matches!(children[0], CondExpr::Leaf(id, _) if id == leaf_conditions::OnProperty::ID));
                 assert!(
-                    matches!(children[1], CondExpr::Leaf(id, _) if id == cond_id(ON_MISSING_BEAN_FQN))
+                    matches!(children[1], CondExpr::Leaf(id, _) if id == leaf_conditions::OnMissingBean::ID)
                 );
             }
             other => panic!("expected All([..]); got {other:?}"),
@@ -301,18 +205,28 @@ mod tests {
 
     #[test]
     fn the_guard_leaf_ids_match_the_leaf_conditions_kind_ids() {
-        // The hand-minted ids MUST equal leaf-conditions' ConditionKind::ID so the
+        // The macro-minted leaf ids MUST equal leaf-conditions' ConditionKind::ID so the
         // leaves resolve to the runtime impls (the cross-crate ID contract).
-        assert_eq!(cond_id(ON_PROPERTY_FQN), leaf_conditions::OnProperty::ID);
-        assert_eq!(cond_id(ON_MISSING_BEAN_FQN), leaf_conditions::OnMissingBean::ID);
+        match &REDIS_AUTO_CONFIG_GUARD {
+            CondExpr::All(children) => {
+                let ids: Vec<_> = children
+                    .iter()
+                    .filter_map(|c| match c {
+                        CondExpr::Leaf(id, _) => Some(*id),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(ids.contains(&leaf_conditions::OnProperty::ID));
+                assert!(ids.contains(&leaf_conditions::OnMissingBean::ID));
+            }
+            other => panic!("expected All([..]); got {other:?}"),
+        }
     }
 
     #[test]
     fn the_guard_defers_to_the_register_sub_pass_via_the_on_missing_bean_leaf() {
-        // An OnBean-family leaf forces the whole guard to evaluate at Register (it
-        // must see the growing definition set). The structural phase folds Parse over
-        // bare leaves; leaf-conditions wraps the OnMissingBean leaf so the binary
-        // defers it — here we assert the leaf id is the OnBean-family member.
+        // An OnBean-family leaf (the OnMissingBean) forces the whole guard to evaluate at
+        // Register (it must see the growing definition set).
         assert_eq!(
             leaf_conditions::OnMissingBean::SUB,
             leaf_core::SubPhase::Register,
@@ -322,32 +236,60 @@ mod tests {
 
     #[test]
     fn the_guard_is_paired_and_anchored_in_the_slices() {
+        // The guard is paired by the contributed contract (the SAME as the Descriptor),
+        // and one CONDITIONS anti-DCE anchor rides per referenced kind.
+        let contract = ContractId::of(REDIS_CACHE_MANAGER_CONTRACT);
         let guards = leaf_core::collect_slice(&leaf_core::GUARD_PAIRINGS);
         assert!(
-            guards.iter().any(|r| r.contract == ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)),
-            "the guard must be paired by the auto-config's contract"
+            guards.iter().any(|r| r.contract == contract),
+            "the guard must be paired by the auto-config's contributed contract"
         );
         let conds = leaf_core::collect_slice(&leaf_core::CONDITIONS);
         assert!(
-            conds.iter().any(|r| r.contract == ContractId::of(ON_PROPERTY_FQN)),
+            conds.iter().any(|r| r.contract == ContractId::of("leaf::condition::OnProperty")),
             "an OnProperty anti-DCE anchor must be present"
         );
         assert!(
-            conds.iter().any(|r| r.contract == ContractId::of(ON_MISSING_BEAN_FQN)),
+            conds.iter().any(|r| r.contract == ContractId::of("leaf::condition::OnMissingBean")),
             "an OnMissingBean anti-DCE anchor must be present"
         );
     }
 
     #[test]
     fn the_provider_publishes_a_shared_cache_manager() {
-        let p = RedisCacheManagerProvider::new();
-        let cx = ResolveCtx::root();
-        let published = futures::executor::block_on(p.provide(&cx)).expect("provides");
-        assert!(published.is_shared(), "a singleton cache manager publishes Shared");
-        let erased = published.into_shared().unwrap();
+        // The macro-emitted provider resolves the holder (the `&self` receiver) then
+        // calls cache_manager() — so it needs the holder registered. Drive the real
+        // engine over the holder + the contributed bean and assert the published bean is
+        // the concrete RedisCacheManager.
+        use leaf_core::CacheManager;
+        let mut builder = leaf_core::RegistryBuilder::new();
+        let holder = leaf_core::COMPONENTS
+            .iter()
+            .find(|d| d.declared_name == Some("redisAutoConfig"))
+            .copied()
+            .expect("the holder is a COMPONENTS row");
+        builder
+            .register(holder, __leaf_seed_RedisAutoConfig())
+            .expect("the holder registers");
+        builder
+            .register(redis_cache_manager_descriptor(), REDIS_CACHE_MANAGER_SEED())
+            .expect("the contributed cache manager registers");
+        let registry = builder.freeze().expect("freezes");
+        let engine = leaf_core::Engine::new(registry);
+        let mgr = futures::executor::block_on(engine.get::<RedisCacheManager>())
+            .expect("the contributed RedisCacheManager resolves");
+        // It is a working CacheManager (hands out a named cache via the trait ABI).
         assert!(
-            erased.downcast::<RedisCacheManager>().is_ok(),
-            "the published bean is the concrete RedisCacheManager"
+            CacheManager::cache(&*mgr, "users").is_some(),
+            "the published manager is a live CacheManager"
         );
+
+        // And the provider publishes Shared (a singleton cache manager).
+        let provider = engine.registry().provider(
+            engine.registry().by_contract(ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)).unwrap(),
+        );
+        let cx = ResolveCtx::for_engine(&engine);
+        let published = futures::executor::block_on(provider.provide(&cx)).expect("provides");
+        assert!(published.is_shared(), "a singleton cache manager publishes Shared");
     }
 }
