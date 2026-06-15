@@ -1,7 +1,7 @@
-//! [`StaticCatalog`] — an in-memory [`MessageCatalogProvider`](leaf_core::MessageCatalogProvider)
+//! [`StaticCatalog`] — an in-memory [`MessageCatalogProvider`]
 //! (expr-i18n-resources phase3/11).
 //!
-//! A catalog is the origin-agnostic backend the hierarchy [`MessageSource`] fans
+//! A catalog is the origin-agnostic backend the hierarchy [`MessageSource`](leaf_core::MessageSource) fans
 //! out over. `StaticCatalog` is the compiled-in / hand-built variant: a map of
 //! `(locale-tag, code) → pattern` populated at construction. It is the testable
 //! shape the `register_catalog!` macro / build.rs `.ftl`/`.properties` codegen
@@ -10,7 +10,7 @@
 //! `Role::Infrastructure` bean.
 //!
 //! Lookup is an exact `(tag, code)` hit (ready-future, no IO). The per-locale
-//! FALLBACK walk (`de-DE` → `de` → root) is the [`MessageSource`]'s job
+//! FALLBACK walk (`de-DE` → `de` → root) is the [`MessageSource`](leaf_core::MessageSource)'s job
 //! ([`crate::source`]), so a catalog stays a flat, dumb table — one
 //! responsibility each.
 

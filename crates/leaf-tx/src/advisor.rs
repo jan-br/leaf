@@ -139,7 +139,7 @@ where
 }
 
 /// Like [`make_transaction_interceptor`] but ALSO installs a
-/// [`result_classifier`](crate::interceptor::result_classifier) for a method
+/// [`result_classifier`] for a method
 /// returning `Result<T, LeafError>`, so a business `Result::Err` (returned through
 /// the chain's `Ok(ErasedRet)`) also drives the commit-vs-rollback decision.
 ///
@@ -200,7 +200,7 @@ where
 }
 
 /// Like [`tx_advisor_pairing`] but binds a per-return-type
-/// [`result_classifier`](crate::interceptor::result_classifier) (via
+/// [`result_classifier`] (via
 /// [`make_transaction_interceptor_for`]) so a method returning `Result<T, LeafError>`
 /// rolls back on a business `Result::Err` too. `T` is the advised method's `Ok` type.
 #[must_use]

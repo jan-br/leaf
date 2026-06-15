@@ -117,7 +117,7 @@ type Candidates = SmallVec<[BeanId; 1]>;
 /// Built ONCE by [`RegistryBuilder::freeze`]; every field is joined on the dense
 /// `BeanId(u32)`. After freeze it is never mutated — concurrent resolution reads
 /// it lock-free, and the only per-bean synchronization is the per-slot `OnceCell`
-/// in [`singletons`](Registry::singletons).
+/// in its private `singletons` table.
 pub struct Registry {
     /// The frozen `Descriptor` rows, indexed by `BeanId.0` (parent→merge already
     /// collapsed at freeze; no per-def `Arc`).

@@ -3,7 +3,7 @@
 //! A resolved [`MessagePattern`](leaf_core::MessagePattern) carries `{0}`/`{1}`
 //! positional placeholders (the Java `MessageFormat` lineage, trimmed to the
 //! positional subset). [`format_pattern`] substitutes the positional
-//! [`Arg`](leaf_core::Arg)s into the pattern.
+//! [`Arg`]s into the pattern.
 //!
 //! Scope note (honest): this is the POSITIONAL, locale-INSENSITIVE substitution
 //! only. Locale-sensitive number/date/plural formatting is delegated to the

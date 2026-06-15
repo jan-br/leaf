@@ -22,7 +22,7 @@
 //! 3. **annotation distance** — the rank used to order attribute sources so the
 //!    nearest declaration wins.
 //!
-//! The lowering ([`AnnotationModel::lower`]) targets the FROZEN core shape — the
+//! The lowering ([`MergedAnnotation::lower`]) targets the FROZEN core shape — the
 //! flat `AnnotationMetadata { qualifiers, markers, depends_on, candidate_role,
 //! autowire_candidate }` (NOT the open `attrs` bag the early design sketch
 //! floated; that never landed in core). Attributes are a codegen-internal driver:

@@ -2,7 +2,7 @@
 //! phase3/09 §validation).
 //!
 //! The leaf-core [`ValidationContext`] is the collect-all sink (it owns the
-//! [`Violation`](leaf_core::Violation) accumulator + the dotted path stack); this
+//! [`Violation`] accumulator + the dotted path stack); this
 //! module adds the two pieces the kernel ABI deliberately left to leaf-validation:
 //!
 //! - the **cascade** ([`validate_root`]/[`Cascade::enter`]) — `@Valid`-nested

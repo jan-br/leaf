@@ -154,7 +154,7 @@ fn slice_has_contract(contract: ContractId) -> bool {
 /// `#[conditional]` guard end-to-end and (b) trip the builder's loud double-register
 /// collision guard against the ladder. The run path builds its candidate set from the
 /// same `AUTO_CONFIGS` slice + the same seed/guard JOIN tables (see
-/// [`collect_autoconfig_candidates`]).
+/// `collect_autoconfig_candidates`).
 ///
 /// The anti-DCE seed JOIN is STILL validated over `AUTO_CONFIGS`: an auto-config with
 /// no matching `SeedPairing` is an unconstructible bean and must be loud here, exactly

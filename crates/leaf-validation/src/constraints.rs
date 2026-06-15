@@ -9,7 +9,7 @@
 //! helpers in [`crate::cascade`]).
 //!
 //! A constraint returns `Some(Violation)` on FAILURE (collect-all: the caller pushes
-//! it into the [`ValidationContext`] and keeps going — never fail-first) and `None`
+//! it into the [`ValidationContext`](leaf_core::ValidationContext) and keeps going — never fail-first) and `None`
 //! when the value satisfies the constraint. The [`Violation`] stores a stable
 //! `constraint_id` ([`ContractId`]), a `message_key` + `params` (resolved LATER at
 //! error-render time against messages-i18n + the ambient locale — the sync validate

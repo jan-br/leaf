@@ -8,16 +8,16 @@
 //!
 //! - **[`TransactionInterceptor`]** — the `Role::Infrastructure`, `TX_ORDER`
 //!   around-advice. It reads the resolved [`TxAttribute`](leaf_core::TxAttribute),
-//!   resolves the [`TxAction`](propagation::TxAction) from the propagation + the
-//!   ambient [`TxResourceKey`](leaf_core::TxResourceKey), `begin`s when it owns the
-//!   tx, INSTALLs the [`TxState`](leaf_core::TxState) on the ambient
-//!   [`Cx`](leaf_core::Cx) (re-installed per poll via
+//!   resolves the [`TxAction`] from the propagation + the
+//!   ambient [`TxResourceKey`], `begin`s when it owns the
+//!   tx, INSTALLs the [`TxState`] on the ambient
+//!   [`Cx`] (re-installed per poll via
 //!   [`Scoped`](leaf_core::Scoped) so it survives work-stealing and is
 //!   never inherited across a spawn — `POLICY = Isolate`), runs the body, then on
 //!   `Ok` COMMITs (firing BEFORE_COMMIT then AFTER_COMMIT syncs), on a rollback-rule
 //!   `Err` ROLLs BACK (firing AFTER_ROLLBACK), and ALWAYS fires AFTER_COMPLETION.
 //! - **propagation** ([`propagation`]) — `REQUIRED`/`REQUIRES_NEW`/`SUPPORTS`/
-//!   `MANDATORY`/`NEVER`/`NOT_SUPPORTED`/`NESTED` resolved to a [`TxAction`](propagation::TxAction).
+//!   `MANDATORY`/`NEVER`/`NOT_SUPPORTED`/`NESTED` resolved to a [`TxAction`].
 //! - **rollback rules** ([`rollback`]) — `should_rollback` over the
 //!   [`ErrorMatch`](leaf_core::ErrorMatch) rules + the typed
 //!   [`ErrorKind`](leaf_core::ErrorKind) (default: any `Err` rolls back unless a
@@ -77,7 +77,7 @@ pub use propagation::{resolve as resolve_propagation, TxAction};
 pub use rollback::should_rollback;
 
 /// The active transaction's [`TxState`], read from the ambient
-/// [`Cx`](leaf_core::Cx) under the ONE [`TxResourceKey`](leaf_core::TxResourceKey)
+/// [`Cx`] under the ONE [`TxResourceKey`]
 /// (the design's `current_tx()`). `None` when no transaction is active on the
 /// current thread of execution.
 ///

@@ -5,7 +5,7 @@
 //! calls. It reads a named-field struct's `#[validate(..)]` field attributes and
 //! emits ONE `impl ::leaf_validation::ValidateInto` whose `validate_into` body drives
 //! a per-field constraint check (or a nested `@Valid` cascade) into the
-//! [`leaf_validation::Cascade`] — the SAME hand `impl ValidateInto` token pattern a
+//! `leaf_validation::Cascade` — the SAME hand `impl ValidateInto` token pattern a
 //! user would write by hand (cascade.rs), now derived.
 //!
 //! Per the thin-macro path rule (charter §2.10) every emitted path is ABSOLUTE
@@ -35,7 +35,7 @@ use syn::{Data, DeriveInput, Expr, ExprLit, Fields, Lit, Meta, Type};
 
 use crate::descriptor::EmitError;
 
-/// Derive the [`leaf_validation::ValidateInto`] impl for a named-field `struct`:
+/// Derive the `leaf_validation::ValidateInto` impl for a named-field `struct`:
 /// one `validate_into` body with one statement per `#[validate(..)]` field (in
 /// declaration order). All emitted paths are absolute `::leaf_validation::`.
 ///

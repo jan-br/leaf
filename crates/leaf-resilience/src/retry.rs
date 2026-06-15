@@ -9,8 +9,8 @@
 //!    substrate's REPLAYABLE `Next` guarantee);
 //! 2. on `Ok` → return it;
 //! 3. on a framework `AdviceError` whose [`LeafError`] is retryable → consult the
-//!    [`ResilientRetry`](crate::ResilientRetry) decision, AWAIT the backoff on the
-//!    reactive [`Sleeper`](crate::Sleeper) (NEVER a busy-wait), then re-proceed;
+//!    [`ResilientRetry`] decision, AWAIT the backoff on the
+//!    reactive [`Sleeper`] (NEVER a busy-wait), then re-proceed;
 //! 4. exhaust into the LAST error.
 //!
 //! It sits at [`RETRY_ORDER`](leaf_core::RETRY_ORDER) (200) — INSIDE validation
@@ -56,7 +56,7 @@ pub fn result_classifier<T: std::any::Any + Send>() -> ReturnClassifier {
 
 /// The around-advice [`Interceptor`] that retries the call on a retryable error.
 ///
-/// Holds the [`ResilientRetry`](crate::ResilientRetry) (policy + backoff + the
+/// Holds the [`ResilientRetry`] (policy + backoff + the
 /// reactive sleeper) + an optional [`ReturnClassifier`] for the business-`Result::Err`
 /// path. Each attempt is a fresh `next.proceed(call)` (the substrate's REPLAYABLE
 /// `Next`).
@@ -79,7 +79,7 @@ impl RetryInterceptor {
         RetryInterceptor::new(ResilientRetry::new(policy, backoff))
     }
 
-    /// Bind the reactive [`Sleeper`](crate::Sleeper) the backoff awaits on
+    /// Bind the reactive [`Sleeper`] the backoff awaits on
     /// (builder style).
     #[must_use]
     pub fn with_sleeper(mut self, sleeper: Arc<dyn Sleeper>) -> Self {

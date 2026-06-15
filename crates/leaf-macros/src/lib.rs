@@ -183,7 +183,7 @@ pub fn bean(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Optional trailing `key = "value"` args (the SAME vocabulary as `#[component]`):
 /// `register_component!(Concrete, role = "infrastructure", name = "applicationTaskExecutor")`
-/// carries a provenance [`leaf_core::Role`] override + a Spring bean-name. This lets a
+/// carries a provenance `leaf_core::Role` override + a Spring bean-name. This lets a
 /// FRAMEWORK construct-via-`new()` bean (whose fields are internal state, NOT injection
 /// points — so the `#[component]` struct-field path does not fit) register through the
 /// same maximal-magic channel, e.g. leaf-tokio's primary execution facility.
@@ -1044,7 +1044,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
     rows.into()
 }
 
-/// `#[runner]` — a [`leaf_core::Runner`] bean. Structurally a `#[component]` that
+/// `#[runner]` — a `leaf_core::Runner` bean. Structurally a `#[component]` that
 /// ALSO declares it is injectable as `dyn ::leaf_core::Runner` (the `provides[]`
 /// upcast the run pipeline collects the runner stream from). A generic runner
 /// hard-errors with the `register_component!(Concrete)` hint.
@@ -1060,7 +1060,7 @@ pub fn runner(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// `#[failure_analyzer]` — register a [`leaf_core::FailureAnalyzer`] impl into the
+/// `#[failure_analyzer]` — register a `leaf_core::FailureAnalyzer` impl into the
 /// frozen `FAILURE_ANALYZERS` slice (the error-model SPI reused — never a second
 /// analyzer trait). The user writes the `impl ::leaf_core::FailureAnalyzer for Ty`;
 /// this emits a `static` instance + the `&'static dyn FailureAnalyzer` row. Applied

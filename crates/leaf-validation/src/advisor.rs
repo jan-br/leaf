@@ -11,8 +11,8 @@
 //!   [`enable_validation`]) so a binary that links leaf-validation gets the
 //!   validation advisor in the run pipeline's proxy plan with NO hand-assembled
 //!   `.with_advisors`;
-//! - the programmatic [`validation_advisor_pairing`] / [`make_validation_interceptor`]
-//!   builders a binary or test uses to bind ITS per-method [`ArgValidator`] + a finer
+//! - the programmatic [`validation_advisor_pairing`] / [`single_arg_make_interceptor`]
+//!   builders a binary or test uses to bind ITS per-method [`ArgValidator`](crate::ArgValidator) + a finer
 //!   pointcut.
 //!
 //! The pointcut is [`ValidationPointcut`] — leaf-validation's own const-constructible

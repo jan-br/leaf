@@ -18,7 +18,7 @@
 //! [`OverlapPolicy::SkipIfRunning`] (the default) skips a fire that is due while
 //! the prior body is still in flight; the fixed-delay completion-feedback
 //! contract (next fire measured from completion, not the scheduled time) is
-//! honored by a bookkeeping task that awaits the body's [`SpawnHandle`] and
+//! honored by a bookkeeping task that awaits the body's [`SpawnHandle`](leaf_core::SpawnHandle) and
 //! re-arms the trigger from the ACTUAL completion `Instant`.
 //!
 //! Unlike tokio there is no virtual-clock test mode, so the wheel runs on the

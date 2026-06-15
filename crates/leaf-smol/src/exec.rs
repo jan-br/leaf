@@ -1,4 +1,4 @@
-//! [`SmolExecutionFacility`] — the ALTERNATIVE [`ExecutionFacility`] over smol.
+//! [`SmolExecutionFacility`] — the ALTERNATIVE [`ExecutionFacility`](leaf_core::ExecutionFacility) over smol.
 //!
 //! The mirror of `leaf-tokio`'s `TokioExecutionFacility`, proving the
 //! runtime-agnostic seam (charter §2.6, phase3/10 `task-execution`, ADR-07 5c).
@@ -12,19 +12,19 @@
 //! - [`ConcurrencyGate`] via an [`async_lock::Semaphore`](smol::lock::Semaphore)
 //!   — the ONE bounded permit primitive shared by retry + scheduling overlap.
 //!
-//! The smol [`Task`](smol::Task) is wrapped in a [`JoinSeam`](leaf_core::JoinSeam)
-//! so the runtime-agnostic [`SpawnHandle`](leaf_core::SpawnHandle) /
-//! [`BlockingHandle`](leaf_core::BlockingHandle) never name smol; an owned
-//! semaphore guard is wrapped in a [`PermitSeam`](leaf_core::PermitSeam) so the
-//! RAII [`Permit`](leaf_core::Permit) is likewise runtime-agnostic (`Drop`
+//! The smol [`Task`] is wrapped in a [`JoinSeam`]
+//! so the runtime-agnostic [`SpawnHandle`] /
+//! [`BlockingHandle`] never name smol; an owned
+//! semaphore guard is wrapped in a [`PermitSeam`] so the
+//! RAII [`Permit`] is likewise runtime-agnostic (`Drop`
 //! releases the slot even on cancel).
 //!
 //! ## Panic vs cancellation
 //!
-//! smol's [`Task`](smol::Task), when awaited directly, *resumes-unwind* on a body
+//! smol's [`Task`], when awaited directly, *resumes-unwind* on a body
 //! panic, and its `fallible()` task collapses BOTH panic and cancellation to
 //! `None` — neither distinguishes the two, which the
-//! [`JoinError`](leaf_core::JoinError) contract requires. So the facility wraps
+//! [`JoinError`] contract requires. So the facility wraps
 //! each spawned body in a [`catch_unwind`](std::panic::catch_unwind) that swallows
 //! the panic and flips a shared flag: the task then always completes normally (so
 //! the task resolving to `None` means cancelled), and the flag tells `poll_join`
@@ -336,7 +336,7 @@ impl leaf_core::Provider for SmolExecutionFacilityProvider {
 }
 
 /// The const [`ProviderSeed`](leaf_core::ProviderSeed) a smol-runtime boot binds
-/// to the `applicationTaskExecutor` [`Descriptor`] (the construction recipe on the
+/// to the `applicationTaskExecutor` [`Descriptor`](leaf_core::Descriptor) (the construction recipe on the
 /// const row path; mints the `Arc<dyn Provider>` once at register/freeze).
 pub const APPLICATION_TASK_EXECUTOR_SEED: leaf_core::ProviderSeed =
     || std::sync::Arc::new(SmolExecutionFacilityProvider::new());

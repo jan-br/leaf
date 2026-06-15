@@ -15,7 +15,7 @@
 //!   every starter/integration crate it re-exports (Cargo has no native BOM, so the
 //!   internal `[workspace.dependencies]` half + this version-pinned umbrella are the
 //!   two halves).
-//! - **Dep-hidden capability features** ([`Cargo.toml`]): `redis` → `dep:leaf-starter-redis`,
+//! - **Dep-hidden capability features** (`Cargo.toml`): `redis` → `dep:leaf-starter-redis`,
 //!   `web` → `dep:leaf-starter-web`. The feature names are the capability vocabulary;
 //!   the `dep:` prefix hides the optional crate so the ONLY public names are the
 //!   capabilities. Enabling a feature pulls the starter (→ its integration crate +
@@ -26,11 +26,11 @@
 //! - **The force-link + `ExpectedManifest` seam** ([`forcelink`]). The umbrella owns
 //!   the binary-crate anti-DCE codegen: the [`force_link!`] macro the app's `main`
 //!   invokes (so an enabled capability's integration crate is path-referenced and
-//!   its `linkme` rows survive Layer-0 DCE) + the const [`expected_manifest`] over
+//!   its `linkme` rows survive Layer-0 DCE) + the const [`expected_manifest`](crate::forcelink::expected_manifest) over
 //!   the enabled participating set (the expected-vs-found self-check anchor).
 //! - **The default runtime** ([`runtime`]). The base always pulls leaf-tokio as the
-//!   default [`ExecutionFacility`](leaf_core::ExecutionFacility); [`bootstrap`]
-//!   installs its ambient store + supplies its [`Spawner`](leaf_core::Spawner) to a
+//!   default [`ExecutionFacility`]; [`bootstrap`](fn@bootstrap)
+//!   installs its ambient store + supplies its [`Spawner`] to a
 //!   ready-to-run [`Application`](leaf_boot::Application).
 
 #![deny(unsafe_code)]
@@ -116,8 +116,8 @@ pub use leaf_macros::main;
 pub use tokio;
 
 /// The default tokio runtime integration (`leaf-tokio`): the
-/// [`ExecutionFacility`](leaf_core::ExecutionFacility) /
-/// [`AmbientStore`](leaf_core::AmbientStore) impls the base always pulls.
+/// [`ExecutionFacility`] /
+/// [`AmbientStore`] impls the base always pulls.
 #[doc(no_inline)]
 pub use leaf_tokio as tokio_runtime;
 

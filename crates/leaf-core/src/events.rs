@@ -2,7 +2,7 @@
 //!
 //! leaf's publish/subscribe model (phase3/12-events): `@EventListener` /
 //! [`ApplicationListener`] registration, the single replaceable multicaster that
-//! owns dispatch policy (sync-ordered by [`cmp_order`](crate::cmp_order), opt-in
+//! owns dispatch policy (sync-ordered by [`cmp_order`], opt-in
 //! async, return-value-as-new-event chaining, error isolation), and the built-in
 //! lifecycle/availability facts that ride the SAME bus.
 //!
@@ -12,7 +12,7 @@
 //! around-advice trait that fans OUT over N listeners — structurally DISTINCT from
 //! the proxy substrate's one-[`Call`](crate::proxy::Call)
 //! [`Interceptor`](crate::proxy::Interceptor). It SHARES with AOP only
-//! [`cmp_chain`](crate::cmp_chain) + the [`RoleTier`](crate::RoleTier) grade, NOT
+//! [`cmp_chain`] + the [`RoleTier`] grade, NOT
 //! the `Interceptor` type. Async / error-isolation / context-propagation / metrics
 //! are [`DispatchInterceptor`] chain entries ordered by `cmp_chain` over the pinned
 //! `ASYNC_DISPATCH`/`ERROR_ISOLATION`/`CONTEXT_PROP`/`METRICS` consts, with the
@@ -21,7 +21,7 @@
 //! ## Availability over watch RunState
 //!
 //! Availability liveness/readiness is the upstream `watch`-shaped reactive cell
-//! ([`WatchSender`](crate::WatchSender)/[`WatchReceiver`](crate::WatchReceiver) —
+//! ([`WatchSender`]/[`WatchReceiver`] —
 //! the ONE primitive the lifecycle unit minted), NOT a second mechanism. A single
 //! projector re-publishes each transition as an [`AvailabilityChanged`] event so
 //! the bus stays stateless.
@@ -381,7 +381,7 @@ pub fn detached_dispatch_body(
 /// tasks (the [`DispatchOutcome::Scheduled`] path).
 ///
 /// Owned by the `EventPublisher` / `RunUnit` (per-app — NEVER a process global): a
-/// detached spawn MUST register its [`SpawnHandle`] here, so clean shutdown can
+/// detached spawn MUST register its [`SpawnHandle`](crate::SpawnHandle) here, so clean shutdown can
 /// reactively DRAIN the in-flight tasks under the grace budget, then ABORT past
 /// the deadline. An unregistered detach = no shutdown drain = a contract violation.
 ///
@@ -401,7 +401,7 @@ impl DetachedTaskRegistry {
         }
     }
 
-    /// Register a detached task's [`SpawnHandle`] for the shutdown drain.
+    /// Register a detached task's [`SpawnHandle`](crate::SpawnHandle) for the shutdown drain.
     ///
     /// The handle's [`DropPolicy::Detach`](crate::DropPolicy::Detach) keeps the
     /// task running; this registry retains the handle so the drain can await it
@@ -428,7 +428,7 @@ impl DetachedTaskRegistry {
     }
 
     /// Reactively DRAIN every registered detached task to completion (await the
-    /// held [`SpawnHandle`]s). NO deadline — the unbounded clean-drain path.
+    /// held [`SpawnHandle`](crate::SpawnHandle)s). NO deadline — the unbounded clean-drain path.
     pub async fn drain_all(&self) {
         let handles = self.take();
         for handle in handles {
@@ -595,8 +595,8 @@ impl<'a> ListenerNext<'a> {
 /// STRUCTURALLY DISTINCT from the proxy [`Interceptor`](crate::proxy::Interceptor)
 /// (which wraps ONE [`Call`](crate::proxy::Call)): it wraps the whole dispatch over
 /// a [`ListenerSeq`]. Async-dispatch / error-isolation / context-propagation /
-/// metrics are entries ordered by [`cmp_chain`](crate::cmp_chain). It SHARES with
-/// AOP only `cmp_chain` + the [`RoleTier`](crate::RoleTier) grade.
+/// metrics are entries ordered by [`cmp_chain`]. It SHARES with
+/// AOP only `cmp_chain` + the [`RoleTier`] grade.
 pub trait DispatchInterceptor: Send + Sync {
     /// Wrap the dispatch: do work before/after/around `next.proceed(ev, seq)`.
     fn intercept<'a>(
@@ -633,7 +633,7 @@ pub trait Multicaster: Send + Sync {
 /// The DEFAULT multicaster: the [`DispatchInterceptor`] pipeline over a
 /// [`CoreDispatch`] sink.
 ///
-/// The chain is sorted by [`cmp_chain`](crate::cmp_chain) at construction
+/// The chain is sorted by [`cmp_chain`] at construction
 /// ([`PipelineMulticaster::new`]); "replace the whole multicaster" is the
 /// degenerate case of swapping [`CoreDispatch`].
 pub struct PipelineMulticaster {

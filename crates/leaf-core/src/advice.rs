@@ -16,7 +16,8 @@
 //! - **Retry / resilience:** the imperative [`RetryTemplate`] + [`RetryPolicy`] /
 //!   [`BackoffPolicy`] primitive.
 //! - **Exception translation:** [`DataAccessExceptionTranslator`] + the
-//!   [`DataAccessKind`] payload that rides [`ErrorKind::Integration`].
+//!   [`DataAccessKind`] payload that rides
+//!   [`ErrorKind::Integration`](crate::ErrorKind::Integration).
 //! - **Transactional events:** the [`TxDeferral`] field a `ListenerDescriptor`
 //!   carries.
 //!
@@ -45,7 +46,7 @@ use crate::provider::ResolveCtx;
 /// `Propagation` semantics.
 ///
 /// Named `TxPropagation` (NOT bare `Propagation`) to avoid colliding with the
-/// ambient-context [`Propagation`](crate::cx::Propagation) enum, which is an
+/// ambient-context [`Propagation`] enum, which is an
 /// orthogonal `{Inherit, Isolate}` axis on a [`CxKey`]. The two never mix.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum TxPropagation {

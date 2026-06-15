@@ -1,8 +1,8 @@
-//! [`TokioSleeper`] — the timer-backed [`Sleeper`](leaf_resilience::Sleeper) over
+//! [`TokioSleeper`] — the timer-backed [`Sleeper`] over
 //! [`tokio::time::sleep`], the runtime half of leaf-resilience's reactive backoff
 //! seam (retry/resilience, phase3/09).
 //!
-//! leaf-resilience declares the runtime-agnostic [`Sleeper`](leaf_resilience::Sleeper)
+//! leaf-resilience declares the runtime-agnostic [`Sleeper`]
 //! one-method seam (a future that completes after a delay, parked on a reactive
 //! timer — NEVER a busy-poll); leaf-core names no runtime sleep. THIS crate is the
 //! runtime: [`TokioSleeper`] awaits `tokio::time::sleep(dur)`, parking on the tokio
@@ -33,7 +33,7 @@ use std::time::Duration;
 use leaf_core::BoxFuture;
 use leaf_resilience::Sleeper;
 
-/// The timer-backed [`Sleeper`](leaf_resilience::Sleeper): a `sleep(delay)` future
+/// The timer-backed [`Sleeper`]: a `sleep(delay)` future
 /// that parks on the tokio timer-wheel (`tokio::time::sleep`) — NEVER a busy-poll.
 ///
 /// Zero-sized: it carries no state (the timer is the ambient tokio runtime). A
@@ -59,7 +59,7 @@ impl Sleeper for TokioSleeper {
 }
 
 /// Install [`TokioSleeper`] as the process-wide default reactive
-/// [`Sleeper`](leaf_resilience::Sleeper) the auto-wired retry advisor consults (the
+/// [`Sleeper`] the auto-wired retry advisor consults (the
 /// runtime install at boot, before refresh — the
 /// [`install_ambient_store`](crate::install_ambient_store) analogue for the backoff
 /// timer).

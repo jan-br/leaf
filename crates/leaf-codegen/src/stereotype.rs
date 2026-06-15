@@ -6,7 +6,7 @@
 //! `role` axis + its `meta.markers` transitive closure (the design's "differing
 //! only in Role + meta markers"). This module owns that vocabulary as DATA and the
 //! whole parse-to-[`BeanInput`] lowering, so the proc-macro stays thin: it parses
-//! with `syn`, calls [`component`] (or the per-stereotype entry), and emits.
+//! with `syn`, calls `component` (or the per-stereotype entry), and emits.
 //!
 //! The lowering reads the struct's FIELDS as the constructor's injection points
 //! (each field's ident is the implicit string qualifier; its type is the

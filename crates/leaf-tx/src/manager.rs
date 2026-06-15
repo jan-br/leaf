@@ -2,14 +2,14 @@
 //! per-Cx-thread-of-execution synchronization storage
 //! (transaction-management, phase3/09).
 //!
-//! leaf-core's [`TxSyncRegistry`](leaf_core::TxSyncRegistry) pins the registration
+//! leaf-core's [`TxSyncRegistry`] pins the registration
 //! SEAM (an object-safe `register(phase, cb)`), but its kernel storage is a no-op
 //! placeholder (the live per-phase buckets need interior mutability + ordering,
 //! which is leaf-tx's concern). This module owns that storage: [`TxSync`] is the
 //! interior-mutable per-phase callback bucket the
 //! [`TransactionInterceptor`](crate::TransactionInterceptor) fires at the
 //! [`TxPhase`] boundaries; it rides INSIDE the manager-minted
-//! [`TxState`](leaf_core::TxState) so the one tx-resource bundle (the
+//! [`TxState`] so the one tx-resource bundle (the
 //! [`TxResourceKey`](leaf_core::TxResourceKey) value) carries both the connection
 //! analogue AND the synchronization registry — exactly the seam transactional-events
 //! reads via `current_tx()?` to register an AFTER_COMMIT callback.

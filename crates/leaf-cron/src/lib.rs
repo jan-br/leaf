@@ -6,7 +6,7 @@
 //! rare CPU-bound bit on a cold path). Pure + synchronous — no async, no runtime
 //! named. The pieces:
 //!
-//! - [`parse`] — the [`ParsedCron`] field parser (`*`, `N`, `A-B`, `*/K`,
+//! - [`parse`](mod@parse) — the [`ParsedCron`] field parser (`*`, `N`, `A-B`, `*/K`,
 //!   `A-B/K`, `A/K`, comma lists, month/day-of-week names, the Quartz `?`).
 //! - [`engine`] — [`ParsedCron::next_after`] (the field-by-field forward search,
 //!   correct across minute/hour/day/month/year rollover and the Quartz dom/dow
@@ -14,8 +14,8 @@
 //! - [`time`] — a minimal `std`-only naive civil time ([`CivilTime`]); the
 //!   documented UTC / no-DST contract lives there.
 //! - [`CronTrigger`] — the bridge that adapts the calendar engine to leaf-core's
-//!   SYNC [`Trigger`](leaf_core::Trigger) SPI over opaque
-//!   [`Instant`](std::time::Instant)s, via a wall-clock anchor leaf-boot supplies.
+//!   SYNC [`Trigger`] SPI over opaque
+//!   [`Instant`]s, via a wall-clock anchor leaf-boot supplies.
 //!
 //! A malformed expression is a Tier-2 assembly failure ([`CronError`]) folded
 //! into the ONE [`LeafError`](leaf_core::LeafError) chain (see [`error`]).
@@ -38,10 +38,10 @@ pub use error::CronError;
 pub use parse::{parse, ParsedCron};
 pub use time::CivilTime;
 
-/// A [`Trigger`](leaf_core::Trigger) backed by the cron calendar engine.
+/// A [`Trigger`] backed by the cron calendar engine.
 ///
 /// leaf-core's `Trigger` SPI is intentionally calendar-blind — it computes over
-/// opaque monotonic [`Instant`](std::time::Instant)s. Cron is a wall-clock
+/// opaque monotonic [`Instant`]s. Cron is a wall-clock
 /// cadence, so this bridge holds an **anchor**: one `(Instant, CivilTime)` pair
 /// pinning the monotonic clock to civil time (leaf-boot captures it once at
 /// scheduler arm-time from the system wall clock). `next_fire` converts the

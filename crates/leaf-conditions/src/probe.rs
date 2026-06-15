@@ -19,8 +19,8 @@
 //! Until the kernel ABI grows a `probe` field on `ConditionCtx`, leaf-boot
 //! installs the per-assembly probe into the [`with_probe`] ambient scope around
 //! the Register sub-pass; the `OnBean`-family impls read it through
-//! [`current_probe`]. This is a thin, honest, `unsafe`-free bridge — the probe
-//! is shared as an [`Arc`] for the cold, synchronous App<Resolve> scope, with NO
+//! [`current_probe`](crate::current_probe_query). This is a thin, honest, `unsafe`-free bridge — the probe
+//! is shared as an [`Arc`] for the cold, synchronous `App<Resolve>` scope, with NO
 //! global lock — and collapses to a direct `ctx.probe` field read once the
 //! kernel exposes it.
 

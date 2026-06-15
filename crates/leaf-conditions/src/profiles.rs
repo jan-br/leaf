@@ -2,7 +2,7 @@
 //!
 //! conditions-autoconfig (phase3/05) profiles: profiles own only the ALGEBRA;
 //! environment-config harvests the [`ProfileLevers`] transport. The pure
-//! activation algebra ([`resolve_active`]), the pure evaluator ([`matches`] over
+//! activation algebra ([`resolve_active`]), the pure evaluator ([`matches`](macro@matches) over
 //! `& | !`), and the runtime-string escape hatch ([`accepts_profiles`]) all live
 //! in leaf-core (frozen ABI); this module RE-EXPORTS them as the leaf-conditions
 //! surface. The `OnProfile` runtime impl reads the sealed active set directly off

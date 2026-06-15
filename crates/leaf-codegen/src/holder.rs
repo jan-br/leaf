@@ -1,11 +1,11 @@
-//! The `#[holder]` attribute lowering — the thin sugar over a [`CxKey`] declaration.
+//! The `#[holder]` attribute lowering — the thin sugar over a [`CxKey`](leaf_core::CxKey) declaration.
 //!
 //! `#[holder]` is the declare-once sugar a concept-owning crate puts on a unit
 //! struct to mint an ambient context key (locale in leaf-i18n, request attrs in a
 //! web crate, tx in the tx crate — NEVER hardcoded in core). Unlike `#[catalog]`
 //! / `#[component]`, a `CxKey` is PLAIN DATA, not a registered bean: there is NO
 //! `linkme` row / NO `inventory` / NO `Descriptor` — the macro emits only the
-//! trait impl + the `const`-constructed [`Holder`] accessor a user could hand-write.
+//! trait impl + the `const`-constructed [`Holder`](leaf_core::Holder) accessor a user could hand-write.
 //!
 //! Given the parsed args `{name, policy, value, accessor}` and the user's unit
 //! struct ident, [`emit_holder`] reproduces TOKEN-FOR-TOKEN the hand pattern:
@@ -145,7 +145,7 @@ pub fn validate_holder_struct(item: &syn::ItemStruct) -> Result<(), EmitError> {
     }
 }
 
-/// Emit the `CxKey` impl + the const-constructed [`Holder`] accessor `static` for a
+/// Emit the `CxKey` impl + the const-constructed [`Holder`](leaf_core::Holder) accessor `static` for a
 /// `#[holder]` declaration on the unit struct `ident`.
 ///
 /// Emits NO `linkme` row — a `CxKey` is plain data, not a registered bean.

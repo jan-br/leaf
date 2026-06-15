@@ -70,8 +70,8 @@ impl ApplicationArguments {
     ///
     /// # Errors
     /// Returns a [`LeafError`] only if an argument is not valid UTF-8 (the
-    /// kernel's args model is `String`-based; lossy bytes are a [`ConfigIo`]
-    /// fault). [`ErrorKind::ConfigIo`](crate::ErrorKind::ConfigIo).
+    /// kernel's args model is `String`-based; lossy bytes are a
+    /// [`ConfigIo`](crate::ErrorKind::ConfigIo) fault.
     pub fn parse(argv: Vec<std::ffi::OsString>) -> Result<Self, LeafError> {
         let mut source_args = Vec::with_capacity(argv.len());
         for os in argv {

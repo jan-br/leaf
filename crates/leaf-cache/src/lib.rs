@@ -26,7 +26,7 @@
 //!   sync `Drop`). A real backend (Caffeine/Redis) is a separate integration crate
 //!   contributing an `Arc<dyn CacheManager>` bean.
 //! - **advisor** ([`advisor`]) — the Infrastructure [`AdvisorPairingRow`](leaf_core::AdvisorPairingRow)
-//!   builders ([`cache_advisor_pairing`]/[`make_cache_interceptor`]) +
+//!   builders ([`cache_advisor_pairing`]/[`build_cache_interceptor`]) +
 //!   [`CachePointcut`] that auto-wire the advisor through `Application::run`'s
 //!   `ADVISOR_PAIRINGS` collection.
 //!
@@ -37,7 +37,7 @@
 //!   but (like leaf-tx's `#[transactional]`) it does NOT yet emit the
 //!   `ADVISOR_PAIRINGS` auto-wire row or the typed key fn — so the auto-wire row
 //!   (built by [`cache_advisor_pairing`]) is supplied at the binding site, which
-//!   passes the [`CacheOpMeta`] + a typed key fn + the return type `T`. Until the
+//!   passes the [`CacheOpMeta`](leaf_core::CacheOpMeta) + a typed key fn + the return type `T`. Until the
 //!   macro threads a per-method key expression, the default key fn hashes the whole
 //!   erased arg tuple's `TypeId` + a caller-supplied discriminator.
 //! - `CacheErrorHandler` policy (swallow-and-fall-through vs fail-fast on a backend

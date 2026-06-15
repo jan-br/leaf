@@ -28,7 +28,7 @@
 //! - Profiles as a PRESET, not a parallel engine: [`ON_PROFILE`] is one fixed
 //!   `(Runtime, Parse)` row in the same tier-map; [`ProfileExpr`] (`!`/`&`/`|`)
 //!   is a bounded micro-grammar; [`resolve_active`] is the pure activation
-//!   algebra; [`matches`] is the pure evaluator (`And`=all, `Or`=any,
+//!   algebra; [`matches`](fn@matches) is the pure evaluator (`And`=all, `Or`=any,
 //!   `Not`=absence); [`accepts_profiles`] is the runtime-string escape hatch.
 //! - The auto-config metamodel additions carried on `Descriptor.meta`:
 //!   [`OrderHint`] (the three-pass batch sort data) and the closed
@@ -696,7 +696,7 @@ impl Default for OrderHint {
 pub enum ImportRef {
     /// Import by stable cross-build [`ContractId`].
     ByContract(ContractId),
-    /// Import by a registered [`MarkerId`].
+    /// Import by a registered [`MarkerId`](crate::MarkerId).
     Marker(crate::identity::MarkerId),
 }
 

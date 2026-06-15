@@ -4,7 +4,7 @@
 //! Realizes the async-dispatch half of the events/context interaction
 //! (phase3/10, phase3/12): the dispatch interceptor pipeline is the events
 //! analogue of the proxy advisor chain. This entry sits at the OUTERMOST
-//! [`ASYNC_DISPATCH_ORDER`](leaf_core::ASYNC_DISPATCH_ORDER) slot. Its job is the
+//! [`ASYNC_DISPATCH_ORDER`] slot. Its job is the
 //! context half of "async dispatch carries context only when propagation is
 //! enabled" (ISOLATE-by-default, ADR-07 5a): it captures the ambient
 //! [`Cx`](leaf_core::Cx) via a [`CxDecorator`] at dispatch time and re-installs it
@@ -14,7 +14,7 @@
 //!
 //! NOTE (deferred to leaf-boot): true fire-and-forget async dispatch (return to
 //! the caller immediately, run the listeners on a spawned task) needs a `'static`
-//! event/seq snapshot and the wired [`Spawner`](leaf_core::Spawner); the
+//! event/seq snapshot and the wired [`Spawner`]; the
 //! borrowed-lifetime [`intercept`](DispatchInterceptor::intercept) seam yields a
 //! `BoxFuture<'a>`, so this entry does the SOUND, in-task context-preserving wrap.
 //! Detached dispatch is wired where the multicaster is assembled (leaf-boot), with

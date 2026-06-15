@@ -6,12 +6,12 @@
 //! chain entry handles a `@Cacheable` `find` AND a `@CacheEvict` `evict` on the same
 //! bean, and any UN-cached method passes straight through to `next.proceed()`. Each
 //! rule carries the resolved [`CacheOp`] lowered from the `#[cacheable]`/`#[cache_put]`/
-//! `#[cache_evict]` [`CacheOpMeta`](leaf_core::CacheOpMeta), the cache name(s), the
+//! `#[cache_evict]` [`CacheOpMeta`], the cache name(s), the
 //! typed [`CacheKeyFn`], and the per-return-`T` hit-repack / miss-capture fns.
 //!
 //! The per-rule body, per phase3/09 §caching:
 //!
-//! - **`@Cacheable`** — build the [`CacheKey`](leaf_core::CacheKey) from the call
+//! - **`@Cacheable`** — build the [`CacheKey`] from the call
 //!   args (the typed [`CacheKeyFn`]); `cache.get(key)` → on HIT re-pack the typed
 //!   value and SKIP `next.proceed()` (the substrate short-circuit — the body never
 //!   runs); on MISS `next.proceed()`, then `cache.put`. With `sync=true` a per-cache
@@ -28,7 +28,7 @@
 //! `StoredValue` transport: each rule is monomorphized over its method's return
 //! type `T`, so a HIT re-packs a typed `T` and a MISS captures the typed `T` — with
 //! a `TypeId` guard so a cross-method wrong-type read is a loud
-//! [`LeafError`](leaf_core::LeafError), never a silent mis-cast.
+//! [`LeafError`], never a silent mis-cast.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

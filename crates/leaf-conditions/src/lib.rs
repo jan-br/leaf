@@ -2,9 +2,9 @@
 //! `CondExpr`/`ConditionId`/`ConditionCtx` SPIs.
 //!
 //! Realizes conditions-autoconfig (phase3/05) `condition-family` + `profiles`:
-//! the hand-written runtime [`Condition`](leaf_core::Condition) impls behind
-//! stable [`ConditionId`](leaf_core::ConditionId)s, each a
-//! [`ConditionKind`](leaf_core::ConditionKind) tier-map row, plus the profile
+//! the hand-written runtime [`Condition`] impls behind
+//! stable [`ConditionId`]s, each a
+//! [`ConditionKind`] tier-map row, plus the profile
 //! activation algebra + evaluator. The ONE gating algebra (`CondExpr`), the
 //! evaluator ([`evaluate`](leaf_core::evaluate)), the report shapes, and the
 //! profile grammar are leaf-core's frozen ABI — this crate POPULATES the catalog
@@ -14,12 +14,12 @@
 //!
 //! | member | tier | sub-phase | verdict source |
 //! |---|---|---|---|
-//! | [`OnProperty`](kinds::OnProperty) / [`OnBooleanProperty`](kinds::OnBooleanProperty) | Runtime | Parse | sealed `Env` |
-//! | [`OnExpression`](kinds::OnExpression) | Runtime | Parse | `Env` `${}` / `ctx.expr` `#{}` |
-//! | [`OnResource`](kinds::OnResource) | Runtime | Parse | filesystem / `ctx.loader` |
-//! | [`OnProfile`](kinds::OnProfile) (`ON_PROFILE`) | Runtime | Parse | `ctx.profiles` |
-//! | [`OnBean`](kinds::OnBean) / [`OnMissingBean`](kinds::OnMissingBean) / [`OnSingleCandidate`](kinds::OnSingleCandidate) | Runtime | Register | [`DefinitionProbe`] |
-//! | [`OnRustVersion`](kinds::OnRustVersion) | ConstFold | (folded) | toolchain version |
+//! | [`OnProperty`] / [`OnBooleanProperty`] | Runtime | Parse | sealed `Env` |
+//! | [`OnExpression`] | Runtime | Parse | `Env` `${}` / `ctx.expr` `#{}` |
+//! | [`OnResource`] | Runtime | Parse | filesystem / `ctx.loader` |
+//! | [`OnProfile`] (`ON_PROFILE`) | Runtime | Parse | `ctx.profiles` |
+//! | [`OnBean`] / [`OnMissingBean`] / [`OnSingleCandidate`] | Runtime | Register | [`DefinitionProbe`] |
+//! | [`OnRustVersion`] | ConstFold | (folded) | toolchain version |
 //!
 //! ## Tier refinement (lowering each leaf to where it can decide)
 //!
@@ -33,7 +33,7 @@
 //!
 //! ## The ctx fields + the residual leaf-boot probe bridge
 //!
-//! The [`ConditionCtx`](leaf_core::ConditionCtx) now carries the sealed
+//! The [`ConditionCtx`] now carries the sealed
 //! `&ActiveProfiles` (`ctx.profiles`) plus the optional
 //! [`ExpressionEvaluator`](leaf_core::ExpressionEvaluator) (`ctx.expr`) and
 //! [`ResourceLoader`](leaf_core::ResourceLoader) (`ctx.loader`) borrows, in

@@ -101,7 +101,7 @@ impl RunState {
     /// `true` iff a direct `self → next` transition is structurally legal.
     ///
     /// Encodes the SEAMS seam #1 (D) template: the linear bring-up/teardown spine
-    /// plus the always-available cancel jump to [`Failed`] from any non-terminal
+    /// plus the always-available cancel jump to [`Failed`](RunState::Failed) from any non-terminal
     /// state. `Closed` and `Failed` are terminal (no outgoing edge); the
     /// cancel-vs-close fork is structural (you reach `Failed` XOR `Closed`,
     /// never both).

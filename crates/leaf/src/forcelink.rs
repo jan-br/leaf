@@ -17,7 +17,7 @@
 //!   integration crate (`use leaf_redis as _;`) behind its `#[cfg(feature = …)]`,
 //!   so MERELY depending on `leaf` with the feature pins the rlib onto the link
 //!   graph. This is the always-on half (no app boilerplate required).
-//! - **[`force_link!`] — the app-invoked belt-and-suspenders.** The binary crate
+//! - **[`force_link!`](crate::force_link) — the app-invoked belt-and-suspenders.** The binary crate
 //!   can ALSO invoke `leaf::force_link!();` in its `main` module so the references
 //!   originate in the BINARY crate itself (the strongest anti-`--gc-sections`
 //!   anchor — a reference from the final link unit, not a transitive rlib). It

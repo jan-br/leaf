@@ -22,7 +22,7 @@
 //!   per-locale fallback chain over the providers, reads the ambient
 //!   [`LocaleKey`] when locale is `None`, delegates to a parent source on a local
 //!   miss (the container hierarchy, child-shadows-parent), and substitutes
-//!   positional message-format args ([`format`]).
+//!   positional message-format args ([`format`](mod@format)).
 //!
 //! All resolution rides the ONE leaf-core spine: the async-across-`dyn`
 //! [`BoxFuture`](leaf_core::BoxFuture) seam, the [`Arc<str>`](std::sync::Arc)
@@ -46,7 +46,7 @@
 //!   leaf-boot's concern (per the phase3/11 crate hints). This crate ships the
 //!   RUNTIME shapes ([`StaticCatalog`]/[`HierarchicalMessageSource`]) those fronts
 //!   target; a catalog is built explicitly via its builder here.
-//! - **Locale-sensitive formatting.** `{n}` substitution ([`format`]) is the
+//! - **Locale-sensitive formatting.** `{n}` substitution ([`format`](mod@format)) is the
 //!   POSITIONAL, locale-insensitive subset; locale-aware number/date/plural
 //!   formatting is delegated to the type-conversion neighbour (phase3/11) and is
 //!   not yet wired.

@@ -23,13 +23,13 @@
 //!   combinators ([`within`]/[`annotated_marker`]/[`returns`] composing with
 //!   `&`/`|`/`!`).
 //! - AUTO-PROXY-CREATOR — the frozen [`ProxyPlan`] computed at `seal()`
-//!   ([`ProxyPlan::freeze`], sorted by [`cmp_chain`](crate::cmp_chain)), the
+//!   ([`ProxyPlan::freeze`], sorted by [`cmp_chain`]), the
 //!   O(1) [`ProxyPlan::advisors_for`] decoration lookup, [`AdvisorRef`], and the
 //!   binary-root-assembled [`CreatorPolicy`] capability lattice.
 //! - ERRORS — [`AdviceError`] flowing into the one [`LeafError`] chain.
 //!
-//! It SHARES with the events multicaster ONLY [`cmp_chain`](crate::cmp_chain) +
-//! the [`RoleTier`](crate::RoleTier) grade — the events `DispatchInterceptor` is a
+//! It SHARES with the events multicaster ONLY [`cmp_chain`] +
+//! the [`RoleTier`] grade — the events `DispatchInterceptor` is a
 //! STRUCTURALLY DISTINCT sibling trait (C5), not this one-[`Call`] [`Interceptor`].
 
 use std::any::{Any, TypeId};
@@ -537,7 +537,7 @@ pub trait Interceptor: Send + Sync {
 
 /// The ordered, replayable, short-circuitable interceptor chain.
 ///
-/// `ordered` is outermost-first (already sorted by [`cmp_chain`](crate::cmp_chain)
+/// `ordered` is outermost-first (already sorted by [`cmp_chain`]
 /// at [`ProxyPlan::freeze`]). [`AdviceChain::invoke`] walks the chain then finally
 /// resolves the [`TargetSource`] + invokes the real method via the supplied tail.
 pub struct AdviceChain {
@@ -900,7 +900,7 @@ impl Default for CreatorPolicy {
 ///
 /// `freeze` runs each advisor's pointcut over each bean's join-point metadata
 /// (a pure predicate, never a reflective walk), filters by the [`CreatorPolicy`],
-/// computes the UNION, and sorts by [`cmp_chain`](crate::cmp_chain). At
+/// computes the UNION, and sorts by [`cmp_chain`]. At
 /// `after_init` the creator does the O(1) [`ProxyPlan::advisors_for`] lookup;
 /// `getEarlyBeanReference` consults the SAME plan so early-ref == final.
 #[derive(Debug, Default)]

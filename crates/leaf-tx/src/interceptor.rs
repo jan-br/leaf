@@ -3,13 +3,13 @@
 //!
 //! The body, per phase3/09 §transaction-management:
 //!
-//! 1. read the resolved [`TxAttribute`](leaf_core::TxAttribute) →
-//!    [`resolve`](crate::propagation::resolve) the
+//! 1. read the resolved [`TxAttribute`] →
+//!    [`resolve`] the
 //!    [`TxAction`](crate::propagation::TxAction) from the propagation + whether a
-//!    tx is already active on the ambient [`Cx`](leaf_core::Cx);
+//!    tx is already active on the ambient [`Cx`];
 //! 2. if this call OWNS the tx, `manager.begin()` and INSTALL the
-//!    [`TxState`](leaf_core::TxState) on the ambient `Cx` under the ONE
-//!    [`TxResourceKey`](leaf_core::TxResourceKey) (`POLICY = Isolate` — never
+//!    [`TxState`] on the ambient `Cx` under the ONE
+//!    [`TxResourceKey`] (`POLICY = Isolate` — never
 //!    inherited across a spawn), wrapping `next.proceed()` in
 //!    [`Scoped`](leaf_core::Scoped) so the binding re-installs per poll and
 //!    survives work-stealing;

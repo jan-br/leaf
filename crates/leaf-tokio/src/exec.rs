@@ -1,4 +1,4 @@
-//! [`TokioExecutionFacility`] — the DEFAULT [`ExecutionFacility`] over tokio.
+//! [`TokioExecutionFacility`] — the DEFAULT [`ExecutionFacility`](leaf_core::ExecutionFacility) over tokio.
 //!
 //! The capability split made concrete (phase3/10 `task-execution`, ADR-07 5c):
 //!
@@ -8,7 +8,7 @@
 //! - [`ConcurrencyGate`] via a [`tokio::sync::Semaphore`] — the ONE bounded
 //!   permit primitive shared by retry + scheduling overlap.
 //!
-//! The runtime [`JoinHandle`](tokio::task::JoinHandle) is wrapped in a
+//! The runtime [`JoinHandle`] is wrapped in a
 //! [`JoinSeam`] so the runtime-agnostic [`SpawnHandle`]/[`BlockingHandle`] never
 //! name tokio; an owned semaphore permit is wrapped in a [`PermitSeam`] so the
 //! RAII [`Permit`] is likewise runtime-agnostic (`Drop` releases the slot even on

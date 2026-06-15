@@ -3,7 +3,7 @@
 //! (`Role::Infrastructure`, `order = CACHE_ORDER = 400`, sorted OUTSIDE/before tx
 //! since `CACHE_ORDER < TX_ORDER`) whose `make_interceptor` resolves a
 //! [`CacheManager`](leaf_core::CacheManager) through the ordinary container + builds
-//! a [`CacheInterceptor`](crate::CacheInterceptor).
+//! a [`CacheInterceptor`].
 //!
 //! Two faces, one shape (mirroring leaf-tx):
 //!
@@ -11,9 +11,9 @@
 //!   [`ADVISOR_PAIRINGS`](leaf_core::ADVISOR_PAIRINGS) (force-linked by
 //!   [`enable_caching`]) so a binary that links leaf-cache gets the cache advisor in
 //!   the run pipeline's proxy plan with NO hand-assembled `.with_advisors`;
-//! - the programmatic [`cache_advisor_pairing`] / [`make_cache_interceptor`]
+//! - the programmatic [`cache_advisor_pairing`] / [`build_cache_interceptor`]
 //!   builders an integration crate (leaf-redis, …) or a test uses to bind ITS
-//!   concrete manager + a finer pointcut + the per-method [`CacheOpMeta`] + key fn.
+//!   concrete manager + a finer pointcut + the per-method [`CacheOpMeta`](leaf_core::CacheOpMeta) + key fn.
 //!
 //! The pointcut is [`CachePointcut`] — leaf-cache's own const-constructible
 //! predicate (matching by the bean's concrete `TypeId`), since the kernel `within`
@@ -23,11 +23,11 @@
 //!
 //! The NATURAL `#[cacheable("users", key = "#0", manager = Mgr)]` annotation (and the
 //! `#[cache_put]`/`#[cache_evict]` variants) on a `#[advisable]`-impl method auto-wires
-//! the cache advisor: the impl-block macro emits the per-method [`CacheOpMeta`] const
+//! the cache advisor: the impl-block macro emits the per-method [`CacheOpMeta`](leaf_core::CacheOpMeta) const
 //! PLUS a per-method-unique [`AdvisorPairingRow`] keyed by the bean's `TypeId`, whose
 //! `make_interceptor` calls [`build_cache_interceptor`] with the named manager `M`, the
-//! method's return type `T`, the [`CacheOp`], the [`CacheOpMeta`], and the typed
-//! [`CacheKeyFn`](crate::CacheKeyFn) (`key = "#N"` → a closure reading positional arg N
+//! method's return type `T`, the [`CacheOp`], the [`CacheOpMeta`](leaf_core::CacheOpMeta), and the typed
+//! [`CacheKeyFn`] (`key = "#N"` → a closure reading positional arg N
 //! off `Call.args`; unset → [`unit_key_fn`](crate::unit_key_fn)). The contract is
 //! per-method-unique so two cache methods on one bean do not collide in the row index.
 

@@ -4,7 +4,7 @@
 //! Validation runs as a SEPARATE pass over an ALREADY-CONVERTED value (Spring's
 //! deliberate separation; phase3/09): after the binder binds a typed config tree,
 //! the same [`Validate`](leaf_core::Validate) engine runs and each
-//! [`Violation`](leaf_core::Violation) path is mapped back to the canonical property
+//! [`Violation`] path is mapped back to the canonical property
 //! KEY (`<prefix>.<field-path>`) + an [`Origin`], then aggregated into a single
 //! `ValidationError` [`LeafError`] pushed into the binder's fault accumulator (the
 //! C2 [`ConfigBindOutcome`](leaf_core::ConfigBindOutcome) `Err(Vec<LeafError>)`).
@@ -91,7 +91,7 @@ pub fn canonical_key(prefix: &str, path: &str) -> String {
 /// the SAME [`validate_root`](crate::validate_root) engine the method-validation face
 /// uses (one engine, never two), with the property-path remapping the config face
 /// adds. The bound value `T` is [`ValidateInto`]; it is adapted to the kernel
-/// [`Validate`](leaf_core::Validate) seam via [`AsValidate`] (so this also works for
+/// [`Validate`](leaf_core::Validate) seam via [`AsValidate`](crate::AsValidate) (so this also works for
 /// a value reached as `&dyn Validate`).
 #[must_use]
 pub fn validate_config<T: ValidateInto + ?Sized>(prefix: &str, bound: &T) -> Option<LeafError> {

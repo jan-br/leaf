@@ -1,7 +1,7 @@
 //! Backoff policies + the reactive [`Sleeper`] seam (retry/resilience, phase3/09).
 //!
 //! leaf-core ships the PURE decision primitives ([`RetryPolicy`](leaf_core::RetryPolicy),
-//! the [`BackoffPolicy`](leaf_core::BackoffPolicy) trait, [`FixedBackoff`](leaf_core::FixedBackoff),
+//! the [`BackoffPolicy`] trait, [`FixedBackoff`],
 //! and [`RetryTemplate::should_retry`](leaf_core::RetryTemplate::should_retry) — the
 //! pure delay decision). This module adds the two backoff impls the design names
 //! beyond Fixed — [`ExponentialBackoff`]`{base, mult, max, jitter}` and [`NoBackoff`] —

@@ -3,9 +3,9 @@
 //! Per phase3/10, a malformed cron is a **Tier-2 assembly failure** aggregated
 //! into the `AssemblyReport` at the startup validation pass. This crate surfaces
 //! a precise, position-named [`CronError`]; [`CronError::into_leaf`] folds it
-//! into the ONE [`LeafError`](leaf_core::LeafError) causal chain (the spec-string
+//! into the ONE [`LeafError`] causal chain (the spec-string
 //! parse is a value-shape conversion, so it rides
-//! [`ErrorKind::ConvertError`](leaf_core::ErrorKind::ConvertError)) for leaf-boot
+//! [`ErrorKind::ConvertError`]) for leaf-boot
 //! to render via [`Diagnostic`](leaf_core::Diagnostic).
 
 use leaf_core::{Cause, ErrorKind, LeafError};

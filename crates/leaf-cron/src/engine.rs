@@ -4,7 +4,7 @@
 //! [`CivilTime`] to the next instant whose every field is in its cron set,
 //! correctly rolling minute → hour → day → month → year (and respecting the
 //! Quartz day-of-month / day-of-week OR-semantics). The search is bounded by
-//! [`MAX_YEAR`](crate::time::MAX_YEAR) so an impossible expression terminates.
+//! [`MAX_YEAR`] so an impossible expression terminates.
 
 use crate::parse::ParsedCron;
 use crate::time::{days_in_month, CivilTime, MAX_YEAR};
@@ -27,7 +27,7 @@ pub enum MissedFire {
 
 impl ParsedCron {
     /// The next fire strictly after `from`, or `None` if none exists before
-    /// [`MAX_YEAR`](crate::time::MAX_YEAR).
+    /// [`MAX_YEAR`].
     ///
     /// Strict: a `from` that itself matches does NOT re-fire — the search starts
     /// at `from + 1s`. This is the contract the scheduler wants (it asks "what's

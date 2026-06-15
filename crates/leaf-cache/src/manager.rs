@@ -6,8 +6,8 @@
 //! storage: one heterogeneous physical [`InMemoryCache`] keyed by the typed
 //! [`CacheKey`] (`(MethodKey, payload)` — the `MethodKey` component prevents a
 //! wrong-type read across two methods sharing one cache name+payload), holding the
-//! cloneable [`CachedValue`](crate::CachedValue) carrier, plus a per-cache
-//! single-flight in-flight map ([`InFlight`]) so concurrent identical `sync=true`
+//! cloneable [`CachedValue`] carrier, plus a per-cache
+//! single-flight in-flight map (`InFlight`) so concurrent identical `sync=true`
 //! keys await ONE computation. [`InMemoryCacheManager`] hands out named caches (the
 //! `Arc<dyn CacheManager>` bean a real backend — Caffeine/Redis — replaces as an
 //! ordinary bean).
@@ -16,7 +16,7 @@
 //! (the value lands on the [`Cache::put`] path, not a Drop); a cancelled WAITER
 //! releases only its shared completion handle and never cancels the computation; a
 //! computer cancelled mid-flight clears its slot via a sync-`Drop`
-//! [`FlightGuard`] so the next caller is promoted to recompute — no async Drop.
+//! `FlightGuard` so the next caller is promoted to recompute — no async Drop.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

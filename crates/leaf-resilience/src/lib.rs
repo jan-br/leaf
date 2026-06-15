@@ -7,12 +7,12 @@
 //! The pieces (all resting on the leaf-core ABI — nothing minted twice):
 //!
 //! - **the imperative primitive** ([`ResilientRetry`]) — the core
-//!   [`RetryTemplate`](leaf_core::RetryTemplate)`{policy, backoff}` + a reactive
+//!   [`RetryTemplate`]`{policy, backoff}` + a reactive
 //!   [`Sleeper`] with the awaiting [`execute`](ResilientRetry::execute) loop (on a
 //!   retryable error it AWAITs the backoff on the reactive timer — NEVER a
 //!   busy-wait — and re-attempts, exhausting into the last error). Container-free
 //!   (the self-invocation escape hatch).
-//! - **backoff** ([`backoff`]) — [`FixedBackoff`](leaf_core::FixedBackoff) (reused
+//! - **backoff** ([`backoff`]) — [`FixedBackoff`] (reused
 //!   from core), [`ExponentialBackoff`]`{base, mult, max, jitter}`, [`NoBackoff`],
 //!   plus the reactive [`Sleeper`] seam ([`ImmediateSleeper`] is the runtime-free
 //!   default; a runtime crate supplies a timer-backed sleeper).
@@ -34,7 +34,7 @@
 //! ## Deferred (honest NOTEs)
 //!
 //! - The `#[retryable(max=…, backoff=…)]` / `#[concurrency_limit(n)]` attribute
-//!   macros (which would emit the per-method [`RetryPolicy`](leaf_core::RetryPolicy)
+//!   macros (which would emit the per-method [`RetryPolicy`]
 //!   /gate-size + the resilience markers the pointcut keys on) are NOT in
 //!   leaf-macros; until they land the auto-wire row keys on a leaf-resilience-owned
 //!   marker (or a concrete `TypeId` via [`ResiliencePointcut`]) and a binding site

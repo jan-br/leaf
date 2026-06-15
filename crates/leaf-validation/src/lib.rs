@@ -55,13 +55,13 @@
 //! - The `#[validated]` METHOD attribute (the per-method validation ADVISOR) is wired
 //!   separately by the `#[advisable]` impl-block macro (it lowers `#[validated]` to a
 //!   const [`AdvisorPairingRow`](leaf_core::AdvisorPairingRow) binding the
-//!   per-method [`ArgValidator`](interceptor::ArgValidator) over the `@Valid` arg via
+//!   per-method [`ArgValidator`] over the `@Valid` arg via
 //!   [`single_arg_make_interceptor`] — see the integration test). The
 //!   `#[derive(Validate)]` constraint-derive (above) supplies the `ValidateInto` that
 //!   validator runs.
 //! - Multi-`@Valid`-argument method validation: [`single_arg_make_interceptor`]
 //!   covers the one-`@Valid`-arg method; a multi-arg method writes a hand-written
-//!   [`ArgValidator`](interceptor::ArgValidator) over its concrete arg tuple. Groups
+//!   [`ArgValidator`] over its concrete arg tuple. Groups
 //!   / group-sequences are deliberately dropped in v1 (phase3/09).
 
 #![deny(unsafe_code)]

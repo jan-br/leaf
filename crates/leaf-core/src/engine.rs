@@ -31,7 +31,7 @@
 //! - [`Multiplicity::PerResolution`] → the prototype Owned-move lane: run the
 //!   pipeline once, write no store slot, register no destroyer — a
 //!   [`Published::Owned`] hand-off the container retains NOTHING of.
-//! - [`Multiplicity::PerContextKey`] → resolve the ambient [`InstanceStore`] for
+//! - [`Multiplicity::PerContextKey`] → resolve the ambient [`InstanceStore`](crate::InstanceStore) for
 //!   the scope kind via the `cx` and memoize there (the store holds the bare
 //!   [`ErasedBean`]).
 //!

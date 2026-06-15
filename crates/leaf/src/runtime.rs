@@ -1,6 +1,6 @@
 //! The default-runtime bootstrap bridge: wire the leaf-tokio
 //! [`ExecutionFacility`](leaf_core::ExecutionFacility) into the
-//! [`Application`](leaf_boot::Application) run pipeline (charter §2.6: async-first,
+//! [`Application`] run pipeline (charter §2.6: async-first,
 //! a real runtime out of the box).
 //!
 //! The base umbrella always pulls `leaf-tokio` as the default runtime. The run

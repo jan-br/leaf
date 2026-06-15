@@ -356,7 +356,7 @@ pub enum Existence {
     Unknown,
 }
 
-/// A resource's stable identity (resource-loading) — its [`Origin`] +
+/// A resource's stable identity (resource-loading) — its origin +
 /// [`Location`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ResourceId {

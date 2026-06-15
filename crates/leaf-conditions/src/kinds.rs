@@ -3,7 +3,7 @@
 //!
 //! conditions-autoconfig (phase3/05) condition-family: each member is (1) a
 //! stable [`ConditionId`] const minted through the one
-//! [`contract_hash`](leaf_core::contract_hash) over a canonical FQN (reproducible
+//! [`contract_hash`] over a canonical FQN (reproducible
 //! cross-build); (2) a [`ConditionKind`] tier-map row (`TIER`/`SUB`); (3) a
 //! hand-written [`Condition`] impl. The fixed tier-map entries:
 //!

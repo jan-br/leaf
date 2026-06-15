@@ -20,7 +20,7 @@
 //!
 //! The NATURAL `#[retryable(max = 3, backoff = ..)]` annotation on a `#[advisable]`-impl
 //! method auto-wires the retry advisor (a per-method-unique [`AdvisorPairingRow`] keyed
-//! by the bean's `TypeId`, building a [`RetryInterceptor`](crate::RetryInterceptor) over
+//! by the bean's `TypeId`, building a [`RetryInterceptor`] over
 //! the parsed [`RetryPolicy`] + backoff + the method's `Result<T,_>` retry classifier);
 //! `#[concurrency_limit(n, gate = G)]` auto-wires the concurrency-limit advisor (resolving
 //! the named gate `G` via [`make_concurrency_interceptor`]). The contract is

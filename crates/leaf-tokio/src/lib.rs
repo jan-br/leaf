@@ -35,7 +35,7 @@
 //! - [`AsyncDispatchInterceptor`] — the async-dispatch concern as a
 //!   [`DispatchInterceptor`](leaf_core::DispatchInterceptor) entry (captures +
 //!   re-installs the ambient `Cx` around the listener fan-out).
-//! - [`availability`] — the process-wide availability watch-cell home.
+//! - [`availability`](mod@availability) — the process-wide availability watch-cell home.
 //! - [`TokioShutdownTrigger`] — the `tokio::signal`-based
 //!   [`ShutdownTrigger`](leaf_core::ShutdownTrigger).
 //!

@@ -7,7 +7,7 @@
 //! macros emit one const row per declaration into the matching slice via
 //! absolute `::leaf_core` paths; the binary crate force-links every
 //! participating crate (`use <crate> as _;`), and the cold `App<Define→Resolve>`
-//! assembly pass lifts the rows through [`RegistryBuilder::from_slices`] (a later
+//! assembly pass lifts the rows through [`RegistryBuilder`](crate::RegistryBuilder)`::from_slices` (a later
 //! unit) and seals the dense `BeanId` registry.
 //!
 //! ## Why `linkme`, and the three things that can silently delete a row
@@ -35,7 +35,7 @@
 //! [`ErrorKind::AntiDce`](crate::ErrorKind::AntiDce), never a confusing
 //! `NoSuchBean`. **Ordering is NEVER read from the slice** (link/section order is
 //! unspecified and may be randomized); the freeze computes one canonical total
-//! order from the stable [`ContractId`](crate::ContractId).
+//! order from the stable [`ContractId`].
 //!
 //! ## One substrate, many typed channels
 //!
@@ -50,7 +50,7 @@
 //!
 //! ## Macros reference `linkme` THROUGH leaf-core
 //!
-//! [`linkme`](crate::linkme) is re-exported so emitted code writes
+//! [`linkme`] is re-exported so emitted code writes
 //! `::leaf_core::linkme::distributed_slice` (plus `#[linkme(crate =
 //! ::leaf_core::linkme)]` so linkme's runtime types resolve there too), never a
 //! bare `::linkme` (which would force every contributing crate to declare a
@@ -595,7 +595,7 @@ pub static FAILURE_ANALYZERS: [&'static dyn FailureAnalyzer] = [..];
 /// This is a thin `&'static [T] -> Vec<T>` copy. It exists as ONE named helper
 /// so every channel is lifted identically and the slice is read in exactly one
 /// idiom (never indexed by link position — ordering is computed at freeze from
-/// the stable [`ContractId`](crate::ContractId), never the slice order). `T: Copy`
+/// the stable [`ContractId`], never the slice order). `T: Copy`
 /// because every const row in this family is `Copy`; `T: 'static` because a
 /// distributed-slice element type is always `'static`.
 #[must_use]

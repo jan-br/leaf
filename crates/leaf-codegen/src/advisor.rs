@@ -349,7 +349,7 @@ pub struct MethodSpec {
     /// `::`-segment of `method_path` via [`MethodSpec::call_ident`] when unset.
     pub method_ident: Option<String>,
     /// `true` iff the method is `async fn` — the thunk `.await`s the call before
-    /// packing the [`ErasedRet`] (a sync method is awaited via an immediate value).
+    /// packing the [`ErasedRet`](leaf_core::ErasedRet) (a sync method is awaited via an immediate value).
     pub is_async: bool,
     /// The method's argument types (lowered through the const `TypeId`-of seam).
     pub arg_types: Vec<syn::Type>,

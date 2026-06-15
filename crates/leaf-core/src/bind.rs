@@ -566,7 +566,7 @@ pub type ConfigBindOutcome = Result<crate::handle::Published, Vec<LeafError>>;
 ///
 /// `#[config_properties]` emits — beside the bean's `Descriptor` — one PUBLIC const
 /// of this type (`__leaf_config_bind_<Ident>`) that BINDS the bean from the sealed
-/// [`Env`](crate::Env) through the derived [`BindTarget`] (a pure-projection bind:
+/// [`Env`] through the derived [`BindTarget`] (a pure-projection bind:
 /// `&Env` only, NO `ResolveCtx`, so it is safe to run before wiring is live) + the
 /// stock JSR validation, returning the bound [`Published`](crate::Published) to
 /// pre-bind into the slot or the aggregated faults. leaf-boot's `App<Wired>::validate`

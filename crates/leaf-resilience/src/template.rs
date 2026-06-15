@@ -2,11 +2,11 @@
 //! phase3/09).
 //!
 //! leaf-core ships the data + the PURE decision
-//! ([`RetryTemplate`](leaf_core::RetryTemplate)`{policy, backoff}` +
+//! ([`RetryTemplate`]`{policy, backoff}` +
 //! [`should_retry`](leaf_core::RetryTemplate::should_retry)). The design pins that
 //! "the awaiting `execute` loop with real sleeps lives in leaf-resilience over the
 //! ExecutionFacility" — so this module adds [`ResilientRetry`]: the core template
-//! PLUS a [`Sleeper`](crate::Sleeper), with the async [`execute`](ResilientRetry::execute)
+//! PLUS a [`Sleeper`], with the async [`execute`](ResilientRetry::execute)
 //! loop the RETRY advisor AND container-free user code both drive.
 //!
 //! The loop, per phase3/09 §retry-resilience:
@@ -16,7 +16,7 @@
 //! 2. on `Ok` → return it;
 //! 3. on `Err` → consult [`should_retry`](leaf_core::RetryTemplate::should_retry)
 //!    (max-attempts + the typed retryability predicate): if it yields a delay, AWAIT
-//!    the [`Sleeper`](crate::Sleeper) (parked on the reactive timer — NEVER a
+//!    the [`Sleeper`] (parked on the reactive timer — NEVER a
 //!    busy-wait), then loop; else EXHAUST into the last error.
 //!
 //! It is container-free (the self-invocation escape hatch): a user constructs a
@@ -30,7 +30,7 @@ use leaf_core::{BoxFuture, LeafError, RetryPolicy, RetryTemplate};
 use crate::backoff::{immediate_sleeper, BackoffPolicy, Sleeper};
 
 /// The imperative retry primitive WITH its reactive sleeper: the core
-/// [`RetryTemplate`] (policy + backoff) plus the [`Sleeper`](crate::Sleeper) the
+/// [`RetryTemplate`] (policy + backoff) plus the [`Sleeper`] the
 /// awaiting [`execute`](ResilientRetry::execute) loop parks on.
 #[derive(Clone)]
 pub struct ResilientRetry {
@@ -57,7 +57,7 @@ impl ResilientRetry {
         ResilientRetry { template, sleeper: immediate_sleeper() }
     }
 
-    /// Bind the reactive [`Sleeper`](crate::Sleeper) the backoff awaits on
+    /// Bind the reactive [`Sleeper`] the backoff awaits on
     /// (builder style) — a runtime crate's timer-backed sleeper for real delays.
     #[must_use]
     pub fn with_sleeper(mut self, sleeper: Arc<dyn Sleeper>) -> Self {
@@ -79,7 +79,7 @@ impl ResilientRetry {
         self.template.should_retry(attempt, err)
     }
 
-    /// Await `delay` on the bound reactive [`Sleeper`](crate::Sleeper) (parked on
+    /// Await `delay` on the bound reactive [`Sleeper`] (parked on
     /// the timer — NEVER a busy-wait). The [`RetryInterceptor`](crate::RetryInterceptor)
     /// drives this between attempts (it owns the `Next` borrow, so it cannot route
     /// through [`execute`](Self::execute)'s `FnMut` closure).
@@ -89,7 +89,7 @@ impl ResilientRetry {
 
     /// Run `op` with retry: each call is a FRESH attempt (a fresh future — the
     /// substrate's REPLAYABLE `Next::proceed`). On a retryable error it AWAITs the
-    /// backoff delay on the reactive [`Sleeper`](crate::Sleeper) (never busy-waits),
+    /// backoff delay on the reactive [`Sleeper`] (never busy-waits),
     /// then re-attempts; it exhausts into the LAST error.
     ///
     /// `op` is `FnMut` so it can be re-invoked; it yields a `BoxFuture` so the

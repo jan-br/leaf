@@ -19,7 +19,7 @@
 //!    `CandidateRole::FALLBACK` (`auto_config_role()`); `#[import]` emits the
 //!    `ImportEdge` composition rows.
 //!
-//! Every emitted const ([`CondExpr`]/[`ProfileExpr`]/[`ConditionRow`]/[`Descriptor`])
+//! Every emitted const ([`CondExpr`]/[`ProfileExpr`]/[`ConditionRow`](leaf_core::ConditionRow)/[`Descriptor`](leaf_core::Descriptor))
 //! is absolute-`::leaf_core`-pathed, so the macro stays thin and a user crate's
 //! imports cannot shadow the seam (the thin-macro rule, charter §2.10). The guard
 //! tree is emitted as a PUBLIC const beside the element (the frozen
@@ -36,7 +36,7 @@ use crate::descriptor::EmitError;
 
 /// One parsed condition expression — the codegen mirror of the frozen
 /// [`leaf_core::CondExpr`] algebra (owned here; lowered to a const tree by
-/// [`emit_cond`]).
+/// [`CondExpr::lower`]).
 ///
 /// A `Leaf` carries the canonical condition-kind path (the `ConditionId` minting
 /// input, hashed through the one [`leaf_core::contract_hash`]) plus its typed
@@ -408,7 +408,7 @@ fn expr_to_type(expr: &syn::Expr) -> Option<syn::Type> {
 // ─────────────────────────── the profile grammar ────────────────────────────
 
 /// One parsed profile expression — the codegen mirror of the frozen
-/// [`leaf_core::ProfileExpr`] (owned here; lowered to a const tree by [`lower`]).
+/// [`leaf_core::ProfileExpr`] (owned here; lowered to a const tree by [`ProfileExpr::lower`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProfileExpr {
     /// A bare profile name; matches iff active.

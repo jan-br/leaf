@@ -18,11 +18,11 @@
 //! 3. ONE deferral driver — [`resolve`](Resolve) over the renamed consumer family
 //!    [`Lookup`]/[`LazyRef`]/[`Inject`], with [`SelfRef`] for self-injection. The
 //!    handle holds the ownership-model `Resolve = Arc<dyn Fn(..) -> BoxFuture>`
-//!    closure over a [`Weak`](std::sync::Weak) container back-ref (no `Arc` cycle).
+//!    closure over a [`Weak`] container back-ref (no `Arc` cycle).
 //!    These are the HONEST VISIBLE handles (the docs' own preference): advice is
 //!    transparent `dyn Svc`, but the deferral family is a visible-in-the-type
 //!    handle — no CGLIB-style transparent `@Lazy`.
-//! 4. ONE comparator — [`cmp_order`](crate::cmp_order) for [`PriorityRank`] and
+//! 4. ONE comparator — [`cmp_order`] for priority-rank and
 //!    collection/map ordering. No site mints its own.
 //!
 //! ## Single-phase construction; deferral-only cycle break
@@ -48,7 +48,7 @@
 //!
 //! An advised bean MUST be injected through a declared service-trait view; a
 //! [`Selector`] concrete-`TypeId` match against an advised bean is REJECTED as
-//! [`ErrorKind::AdvisedConcreteInjection`](crate::ErrorKind::AdvisedConcreteInjection)
+//! [`ErrorKind::AdvisedConcreteInjection`]
 //! (never a silent un-advised raw-target handoff). [`reject_advised_concrete`]
 //! is the kernel check the `App<Wired>` pass calls.
 
@@ -814,7 +814,7 @@ impl Selector {
 /// path (collection-injection BYPASSES selection).
 ///
 /// Selection layers (`primary_promote`/`name_match`/…) are STRUCTURALLY skipped;
-/// this only sorts the already-filtered set by the one [`cmp_order`](crate::cmp_order)
+/// this only sorts the already-filtered set by the one [`cmp_order`]
 /// (interface-source beats annotation-source before numerics; lower value wins;
 /// `BeanId` registration order as the stable final tie-break). An empty set is an
 /// empty collection (never `NoSuchBean`).
@@ -1013,14 +1013,14 @@ pub type Resolve = Arc<ResolveFn>;
 /// The ordering applied to a multi-candidate enumeration ([`Container::resolve_many`]).
 ///
 /// `Registration` is the dense-`BeanId` registration order (`Lookup::stream`);
-/// `CmpOrder` applies the ONE [`cmp_order`](crate::cmp_order) over each
+/// `CmpOrder` applies the ONE [`cmp_order`] over each
 /// candidate's `OrderKey` (`Lookup::ordered_stream`), so the lazy stream and the
 /// eager `Vec<T>` injection never diverge.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum StreamOrder {
     /// Dense `BeanId` registration order (the `stream` default).
     Registration,
-    /// The one [`cmp_order`](crate::cmp_order) over each candidate's `OrderKey`.
+    /// The one [`cmp_order`] over each candidate's `OrderKey`.
     CmpOrder,
 }
 
@@ -1047,7 +1047,7 @@ pub trait Container: Send + Sync {
     /// path that backs [`Lookup::stream`]/[`ordered_stream`](Lookup::ordered_stream)/
     /// [`stream_filtered`](Lookup::stream_filtered)).
     ///
-    /// `mode` selects registration vs [`cmp_order`](crate::cmp_order) ordering;
+    /// `mode` selects registration vs [`cmp_order`] ordering;
     /// `filter`, if present, drops candidates by their frozen
     /// [`Descriptor`](crate::Descriptor) BEFORE any construction. An empty
     /// candidate set is an empty `Vec`, never `NoSuchBean` (collection semantics).
@@ -1098,7 +1098,7 @@ fn container_gone() -> LeafError {
 /// `dyn Svc` view.
 ///
 /// This is the [`Lookup::get_view`] counterpart of the kernel's concrete
-/// [`published_to_ref`] (which is `downcast_ref`-based and `Sized`-only). The
+/// `published_to_ref` (which is `downcast_ref`-based and `Sized`-only). The
 /// macro emits — beside the bean's `provides[]`/[`TypeRow`](crate::TypeRow) row —
 /// a `fn(Published) -> Result<Ref<dyn Svc>, LeafError>` that downcasts to the
 /// concrete and unsizes the `Arc` to the `dyn Svc` view (trait upcasting).
@@ -1265,7 +1265,7 @@ impl<T: ?Sized + 'static> Lookup<T> {
     }
 
     /// `ordered_stream` — the lazy 0..N collection in the ONE
-    /// [`cmp_order`](crate::cmp_order) (`ObjectProvider::orderedStream`), so it
+    /// [`cmp_order`] (`ObjectProvider::orderedStream`), so it
     /// never diverges from the eager `Vec<T>`'s ordering.
     pub fn ordered_stream(&self) -> impl futures::Stream<Item = Result<Ref<T>, LeafError>> + '_
     where

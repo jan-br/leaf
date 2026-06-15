@@ -21,7 +21,7 @@
 //!   `leaf-cron`), the [`SchedulerCore`] registration/quiesce seam (one reactive
 //!   timer-wheel that spawns the due body onto the [`Spawner`] — the body NEVER
 //!   runs on the driver), and the const [`ScheduledMethodDescriptor`] the thin
-//!   `#[scheduled]` macro emits into the [`SCHEDULED`](crate::SCHEDULED) slice.
+//!   `#[scheduled]` macro emits into the [`SCHEDULED`] slice.
 
 use std::time::{Duration, Instant};
 
@@ -484,7 +484,7 @@ impl MethodKey {
 }
 
 /// The const descriptor the thin `#[scheduled(...)]` macro emits into the
-/// [`SCHEDULED`](crate::SCHEDULED) slice (data only, charter 2.10).
+/// [`SCHEDULED`] slice (data only, charter 2.10).
 ///
 /// An instance-tier post-processor at `after_init` binds each descriptor to the
 /// live bean `Ref`, resolves its [`Trigger`] from the [`spec`], and registers
@@ -535,7 +535,7 @@ impl ScheduledMethodDescriptor {
     }
 
     /// Bridge to the link-time anti-DCE identity row in the
-    /// [`SCHEDULED`](crate::SCHEDULED) slice (mirrors
+    /// [`SCHEDULED`] slice (mirrors
     /// [`group_to_row`](crate::group_to_row) → `ConfigMetadataRow`).
     ///
     /// The slice carries the cheap identity row (for the expected-vs-found
@@ -548,7 +548,7 @@ impl ScheduledMethodDescriptor {
     }
 }
 
-/// Collect the link-discovered [`SCHEDULED`](crate::SCHEDULED) identity rows
+/// Collect the link-discovered [`SCHEDULED`] identity rows
 /// (the anti-DCE expected-vs-found input). One `Vec` read idiom, like
 /// [`collect_config_metadata`](crate::collect_config_metadata).
 #[must_use]

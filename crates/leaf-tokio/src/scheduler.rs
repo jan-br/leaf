@@ -19,7 +19,7 @@
 //! (async has no implicit ceiling — the inverted gotcha). The fixed-delay
 //! completion-feedback contract (next fire measured from completion, not the
 //! scheduled time) is honored: the driver spawns the body, then a small
-//! bookkeeping task awaits the body's [`SpawnHandle`] and re-arms the trigger from
+//! bookkeeping task awaits the body's [`SpawnHandle`](leaf_core::SpawnHandle) and re-arms the trigger from
 //! the ACTUAL completion `Instant` threaded into
 //! [`TriggerContext::last_completion`]. Fixed-rate re-arms eagerly (from the
 //! scheduled time) so a slow body does not push the cadence.

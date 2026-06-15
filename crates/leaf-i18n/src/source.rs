@@ -1,5 +1,5 @@
 //! [`HierarchicalMessageSource`] — the always-present hierarchy-aware
-//! [`MessageSource`](leaf_core::MessageSource) bean (expr-i18n-resources
+//! [`MessageSource`] bean (expr-i18n-resources
 //! phase3/11).
 //!
 //! Resolution is the unification primitive of phase3/11: a sync-pure resolution
@@ -9,10 +9,10 @@
 //!
 //! 1. **Locale.** `locale = locale.or(ambient LocaleKey).or(default_locale)`
 //!    — the single "current locale" read of phase3/11 (None reads
-//!    [`current_locale`](crate::current_locale)); a missing ambient degrades to
+//!    [`current_locale`]); a missing ambient degrades to
 //!    the configured default, never a crash.
 //! 2. **Per-locale fallback.** For each tag in
-//!    [`fallback_chain`](crate::fallback_chain) (`de-DE` → `de` → root), ask each
+//!    [`fallback_chain`] (`de-DE` → `de` → root), ask each
 //!    provider IN ORDER (child catalogs shadow parent — registration order is
 //!    precedence).
 //! 3. **Hierarchy.** On a total local miss, delegate to the `parent`
@@ -21,11 +21,11 @@
 //!    a possibly-different ambient.
 //! 4. **Default / error.** `message_or`/`resolve` fall back to the supplied
 //!    default; `message`/`resolve`-without-default produce a
-//!    [`ErrorKind::NoSuchMessage`](leaf_core::ErrorKind::NoSuchMessage) node.
+//!    [`ErrorKind::NoSuchMessage`] node.
 //!
 //! A resolved pattern's `{n}` placeholders are substituted by
-//! [`format_pattern`](crate::format::format_pattern). The async-across-`dyn`
-//! boxing is accepted (phase3/11 5b); a compiled-in [`StaticCatalog`] hit is a
+//! [`format_pattern`]. The async-across-`dyn`
+//! boxing is accepted (phase3/11 5b); a compiled-in [`StaticCatalog`](crate::StaticCatalog) hit is a
 //! ready future, so a hit allocates only the `Box<dyn Future>` and the `Arc<str>`.
 
 use std::sync::Arc;

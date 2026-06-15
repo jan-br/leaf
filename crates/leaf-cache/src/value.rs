@@ -1,5 +1,5 @@
 //! The cloneable, typed-rebuildable cache value carrier ([`CachedValue`]) that
-//! rides leaf-core's [`StoredValue`](leaf_core::StoredValue) transport (caching,
+//! rides leaf-core's [`StoredValue`] transport (caching,
 //! phase3/09).
 //!
 //! leaf-core's [`StoredValue`] is a `TypeId`-checked `Box<dyn Any + Send + Sync>`
@@ -12,11 +12,11 @@
 //! wrapper type regardless of the inner `T`.
 //!
 //! The win: on a HIT the interceptor rebuilds the TYPED
-//! [`ErasedRet`](leaf_core::ErasedRet) directly from the carrier
-//! ([`CachedValue::pack_ret`]) — the value's concrete `T` is preserved through the
-//! erased boundary via a monomorphized [`Holder<T>`] that knows how to re-pack it,
+//! [`ErasedRet`] directly from the carrier
+//! ([`CachedValue::pack_ret_as`]) — the value's concrete `T` is preserved through the
+//! erased boundary via a monomorphized `Holder<T>` that knows how to re-pack it,
 //! with a `TypeId` guard so a cross-method wrong-type read is a loud
-//! [`LeafError`](leaf_core::LeafError), never a silent mis-cast.
+//! [`LeafError`], never a silent mis-cast.
 
 use std::any::{Any, TypeId};
 use std::sync::Arc;
@@ -58,7 +58,7 @@ impl<T: Clone + Send + Sync + 'static> CachedInner for Holder<T> {
 /// ([`CachedValue::of`]); transported through the erased
 /// [`Cache`](leaf_core::Cache) trait inside a [`StoredValue`]
 /// ([`CachedValue::into_stored`] / [`CachedValue::from_stored`]); and on a HIT
-/// re-packed into the typed [`ErasedRet`] ([`CachedValue::pack_ret`]).
+/// re-packed into the typed [`ErasedRet`] ([`CachedValue::pack_ret_as`]).
 #[derive(Clone)]
 pub struct CachedValue(Arc<dyn CachedInner>);
 

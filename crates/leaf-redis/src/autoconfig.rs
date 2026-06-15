@@ -11,7 +11,7 @@
 //! RedisCacheManager { .. } }` emits the SAME const artifacts a hand-built
 //! auto-config would — the `AUTO_CONFIGS` [`Descriptor`] at `FALLBACK` (carrying the
 //! `dyn CacheManager` provides[] view + the `"cacheManager"` declared name), its
-//! [`ProviderSeed`](leaf_core::ProviderSeed) + `SEED_PAIRINGS` JOIN, and the
+//! [`ProviderSeed`] + `SEED_PAIRINGS` JOIN, and the
 //! `#[conditional]` guard + its `GUARD_PAIRINGS` + `CONDITIONS` anchors — all keyed on
 //! the ONE contributed contract (`module_path!()::cache_manager`) so leaf-boot's
 //! `Descriptor.contract == SeedPairingRow.contract == GuardPairingRow.contract` JOIN
@@ -115,7 +115,7 @@ impl RedisAutoConfig {
 // and submits the `Descriptor` into the `AUTO_CONFIGS` slice. These thin aliases
 // preserve the crate's historical public surface over the macro-emitted artifacts.
 
-/// The const [`ProviderSeed`](leaf_core::ProviderSeed) leaf-boot's `run_autoconfig`
+/// The const [`ProviderSeed`] leaf-boot's `run_autoconfig`
 /// invokes ONCE to mint the manager's `Provider` (the macro-emitted seed).
 pub const REDIS_CACHE_MANAGER_SEED: ProviderSeed = __leaf_seed_cache_manager;
 

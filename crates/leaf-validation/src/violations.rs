@@ -1,7 +1,7 @@
 //! Aggregating accumulated [`Violation`]s into the ONE [`LeafError`] spine
 //! (validation, phase3/09 §validation + §error-model).
 //!
-//! Validation is collect-all: a [`ValidationContext`] holds EVERY violation found
+//! Validation is collect-all: a [`ValidationContext`](leaf_core::ValidationContext) holds EVERY violation found
 //! across a typed boundary. When the boundary fails (the method-validation
 //! short-circuit, or a config-bind node), the whole set is folded into a single
 //! `ErrorKind::ValidationError` [`LeafError`] whose causal chain carries one

@@ -423,7 +423,7 @@ impl LeafError {
     /// Push a [`Cause`] node onto the chain (builder style).
     ///
     /// Nodes are stored in causal order (each appended node is a deeper cause);
-    /// [`source`](LeafError::source) walks them from the first downward.
+    /// [`source`](std::error::Error::source) walks them from the first downward.
     #[must_use]
     pub fn caused_by(mut self, cause: Cause) -> Self {
         let mut v = self.chain.into_vec();
