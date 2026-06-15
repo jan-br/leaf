@@ -6,3 +6,21 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+# serde is OPTIONAL and gated behind the `serde-bridge` feature so that
+# leaf-core's `FromConfigValue` stays the CANONICAL coercion surface: a build
+# that does not opt into the bridge pulls in zero serde machinery. The feature
+# is ON by default (the crate's reason to exist is the bridge), but the
+# `serde = ["dep:serde"]` mapping keeps the dependency strictly feature-keyed.
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde-bridge"]
+# The serde bridge: a `Converter` (serde Deserialize → ConvertCtx/FromConfigValue)
+# plus the `ConfigDeserializer` alternate (bind a config subtree into any serde
+# `Deserialize` type via leaf-core's Binder/Env). Pulls in serde.
+serde-bridge = ["dep:serde"]
+
+[dev-dependencies]
+# The bridge tests drive a `#[derive(Deserialize)]` struct, so the dev build
+# needs serde's derive macro.
+serde = { workspace = true, features = ["derive"] }

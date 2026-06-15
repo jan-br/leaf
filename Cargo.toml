@@ -42,13 +42,20 @@ futures = "0.3"
 linkme = "0.3"
 pin-project-lite = "0.2"
 tokio = { version = "1", default-features = false }
+smol = "2"
 
 # Codegen deps (leaf-codegen is a normal lib using proc-macro2/syn/quote so it is
 # unit-testable without a compiler; leaf-macros is the thin proc-macro that calls it).
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 trybuild = "1"
 yaml-rust2 = "0.11"
+
+# Ecosystem integration deps (leaf-redis — the representative binding crate).
+# `tokio-comp` wires the async multiplexed connection onto the same tokio runtime
+# leaf-tokio installs; default features stay on for the sync `Client`/`Commands`.
+redis = { version = "1", features = ["tokio-comp"] }

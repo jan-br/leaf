@@ -7,3 +7,17 @@ license.workspace = true
 [dependencies]
 leaf-core.workspace = true
 leaf-tokio.workspace = true
+redis.workspace = true
+
+[features]
+# Gate the single live-Redis round-trip test (needs a server at $LEAF_REDIS_TEST_URL
+# or redis://127.0.0.1/). Off by default so `cargo test` never touches the network.
+live-redis = []
+
+[dev-dependencies]
+# The wiring tests drive the macro-emitted AUTO_CONFIGS / COMPONENTS rows + the
+# auto-config back-off ladder through leaf-boot's run_autoconfig (no live server).
+leaf-boot.workspace = true
+leaf-conditions.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

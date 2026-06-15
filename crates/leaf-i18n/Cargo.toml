@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+
+[dev-dependencies]
+# Tests drive the async MessageSource ABI (BoxFuture seam) to completion with a
+# minimal executor — no runtime/network, just `block_on`.
+futures.workspace = true
