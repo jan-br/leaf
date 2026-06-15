@@ -36,7 +36,7 @@ use leaf_core::{
 };
 
 use crate::app::App;
-use crate::assembly::SeedPairing;
+use crate::assembly::{self, SeedPairing};
 use crate::autoconfig::{AutoConfigCandidate, ExclusionSet};
 use crate::conditions::GuardPairing;
 use crate::environment::SealInputs;
@@ -631,6 +631,34 @@ impl Application {
             std::mem::take(&mut self.advisors),
             |p| p.contract,
         );
+
+        // auto-config candidates (the AUTO_CONFIGS channel, held back from from_slices
+        // so the `exclude > back-off > default` ladder gates them — the FIX for the
+        // force-linked-auto-config-guard-ignored gap). The slice-built candidates JOIN
+        // each AUTO_CONFIGS Descriptor to its seed (the now-merged `self.seeds`) + its
+        // guard (GUARD_PAIRINGS); an explicit `.with_autoconfig` candidate OVERRIDES a
+        // slice one on a ContractId collision (the same escape-hatch merge). A seed/guard
+        // JOIN miss is the same loud anti-DCE error `from_slices` surfaces.
+        //
+        // NOTE: a degraded fallback to the unmerged explicit set on the (impossible-in-a
+        // -healthy-app) duplicate-seed error keeps `collect_from_slices` infallible — the
+        // loud error re-surfaces at the `from_slices` call in `run_inner`, where the run
+        // pipeline routes it through failure analysis.
+        let slice_candidates =
+            assembly::collect_autoconfig_candidates(&self.seeds).unwrap_or_default();
+        self.autoconfig = merge_by_contract(
+            slice_candidates,
+            std::mem::take(&mut self.autoconfig),
+            |c| c.descriptor.contract,
+        );
+
+        // The auto-config back-off seed-probe: the (self_type, role) of every COMPONENTS
+        // bean from_slices registers (so the first candidate's OnMissingBean sees them),
+        // UNDER the explicit `.with_inventory` set (a `#[leaf::main]`-supplied inventory
+        // is additive — duplicates are harmless to the count-based probe).
+        let mut inventory = assembly::component_seed_probe();
+        inventory.append(&mut self.inventory);
+        self.inventory = inventory;
     }
 
     /// The slice-collected per-bean [`InjectionPlan`] resolver: JOIN each

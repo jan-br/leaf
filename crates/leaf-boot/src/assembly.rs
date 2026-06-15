@@ -28,12 +28,15 @@
 //! [`leaf_core::RegistryBuilder::freeze`] compute the one canonical total order
 //! from the stable [`leaf_core::ContractId`]. The lift here only accumulates rows.
 
+use std::any::TypeId;
 use std::collections::HashMap;
 
 use leaf_core::{
-    collect_slice, Cause, ContractId, Descriptor, ErrorKind, LeafError, ProviderSeed,
-    RegistryBuilder, AUTO_CONFIGS, COMPONENTS,
+    collect_slice, CandidateRole, Cause, CondExpr, ContractId, Descriptor, ErrorKind, LeafError,
+    ProviderSeed, RegistryBuilder, AUTO_CONFIGS, COMPONENTS, GUARD_PAIRINGS,
 };
+
+use crate::autoconfig::AutoConfigCandidate;
 
 /// One macro-emitted Descriptor → ProviderSeed pairing, keyed by the bean's
 /// stable [`ContractId`].
@@ -96,24 +99,17 @@ fn builtin_pairings() -> Vec<SeedPairing> {
     }
 }
 
-/// Lift the link-collected bean channels ([`COMPONENTS`] + [`AUTO_CONFIGS`]) and
-/// JOIN each `Descriptor` to its [`ProviderSeed`] via `pairings` (plus leaf-boot's
-/// `builtin_pairings` for the framework beans it force-links), building the
-/// append-only [`RegistryBuilder`] (NOT yet frozen — the `App<Resolve>` assembly
-/// fixpoint runs conditions/exclusions/registrars before `seal()`).
-///
-/// Both bean channels carry the identical const `Descriptor` shape (an auto-config
-/// differs only in the channel + its `CandidateRole::FALLBACK`), so both lift
-/// through the same JOIN.
+/// Build the `ContractId → ProviderSeed` JOIN index from leaf-boot's built-in
+/// framework pairings (force-linked beans) + the binary's `pairings` (which win on a
+/// collision). A duplicate WITHIN the binary's own table is a loud build-seam error
+/// (a double-emitted `__leaf_seed_*`).
 ///
 /// # Errors
-/// A [`LeafError`] (`ErrorKind::AntiDce`) if a lifted `Descriptor` has no matching
-/// `SeedPairing` (an unconstructible bean must be loud, never a silent skip), or
-/// the builder's own loud name/collision guard fires at `register`.
-pub fn from_slices(pairings: &[SeedPairing]) -> Result<RegistryBuilder, LeafError> {
-    // Index the pairing table by ContractId for an O(1) per-descriptor JOIN.
-    // leaf-boot's built-in framework pairings seed the table first; a binary's
-    // explicit `pairings` win on a contract collision (they override).
+/// A [`LeafError`] (`ErrorKind::AntiDce`) if one contract has more than one
+/// non-built-in pairing.
+fn build_seed_index(
+    pairings: &[SeedPairing],
+) -> Result<HashMap<ContractId, ProviderSeed>, LeafError> {
     let builtins = builtin_pairings();
     let mut seed_of: HashMap<ContractId, ProviderSeed> =
         HashMap::with_capacity(pairings.len() + builtins.len());
@@ -130,15 +126,43 @@ pub fn from_slices(pairings: &[SeedPairing]) -> Result<RegistryBuilder, LeafErro
             return Err(duplicate_pairing(p.contract));
         }
     }
+    Ok(seed_of)
+}
+
+/// Lift the link-collected [`COMPONENTS`] channel and JOIN each `Descriptor` to its
+/// [`ProviderSeed`] via `pairings` (plus leaf-boot's `builtin_pairings` for the
+/// framework beans it force-links), building the append-only [`RegistryBuilder`]
+/// (NOT yet frozen — the `App<Resolve>` assembly fixpoint runs
+/// conditions/exclusions/auto-config before `seal()`).
+///
+/// The [`AUTO_CONFIGS`] channel is deliberately NOT registered here: an auto-config
+/// is gated by the `exclude > back-off > default` ladder
+/// ([`run_autoconfig`](crate::run_autoconfig)), which registers each SURVIVOR itself
+/// (at `CandidateRole::FALLBACK`). Registering it here too would (a) defeat its
+/// `#[conditional]` guard end-to-end and (b) trip the builder's loud double-register
+/// collision guard against the ladder. The run path builds its candidate set from the
+/// same `AUTO_CONFIGS` slice + the same seed/guard JOIN tables (see
+/// [`collect_autoconfig_candidates`]).
+///
+/// The anti-DCE seed JOIN is STILL validated over `AUTO_CONFIGS`: an auto-config with
+/// no matching `SeedPairing` is an unconstructible bean and must be loud here, exactly
+/// as for a component (the ladder is the registrar, but the seed must exist so the
+/// ladder can mint the bean).
+///
+/// # Errors
+/// A [`LeafError`] (`ErrorKind::AntiDce`) if a lifted/validated `Descriptor` has no
+/// matching `SeedPairing` (an unconstructible bean must be loud, never a silent skip),
+/// or the builder's own loud name/collision guard fires at `register`.
+pub fn from_slices(pairings: &[SeedPairing]) -> Result<RegistryBuilder, LeafError> {
+    // Index the pairing table by ContractId for an O(1) per-descriptor JOIN.
+    let seed_of = build_seed_index(pairings)?;
 
     let mut builder = RegistryBuilder::new();
 
-    // Lift BOTH bean channels through the one read idiom (never indexed by link
-    // position — the freeze computes order from the stable ContractId).
-    let components: Vec<Descriptor> = collect_slice(&COMPONENTS);
-    let auto_configs: Vec<Descriptor> = collect_slice(&AUTO_CONFIGS);
-
-    for descriptor in components.into_iter().chain(auto_configs) {
+    // Register the COMPONENTS channel (the unconditional user/framework beans). Read
+    // through the one collect_slice idiom (never indexed by link position — the freeze
+    // computes order from the stable ContractId).
+    for descriptor in collect_slice(&COMPONENTS) {
         // JOIN the bare row to its construction recipe by the stable identity.
         let Some(&seed) = seed_of.get(&descriptor.contract) else {
             return Err(missing_seed(&descriptor));
@@ -147,7 +171,69 @@ pub fn from_slices(pairings: &[SeedPairing]) -> Result<RegistryBuilder, LeafErro
         builder.register(descriptor, seed())?;
     }
 
+    // The AUTO_CONFIGS channel is gated by the ladder (NOT registered here), but its
+    // anti-DCE seed JOIN is still validated: an auto-config with no SeedPairing cannot
+    // be constructed by the ladder either, so surface it loud at the same seam.
+    for descriptor in collect_slice(&AUTO_CONFIGS) {
+        if !seed_of.contains_key(&descriptor.contract) {
+            return Err(missing_seed(&descriptor));
+        }
+    }
+
     Ok(builder)
+}
+
+/// Build the auto-config candidate set from the link-collected [`AUTO_CONFIGS`]
+/// channel, JOINing each `Descriptor` to its [`ProviderSeed`] (by `ContractId`, via
+/// `pairings` + leaf-boot's built-in framework pairings) and its back-off guard (by
+/// `ContractId`, from the link-collected [`GUARD_PAIRINGS`]; `None` when the auto-config
+/// declares no `#[conditional]`).
+///
+/// This is the run path's input to [`run_autoconfig`](crate::run_autoconfig): the
+/// `from_slices` lift holds the auto-configs BACK from the builder, and the ladder
+/// gates them here — the same `AUTO_CONFIGS` + seed-table + guard-table JOIN sources
+/// `from_slices` validates against.
+///
+/// # Errors
+/// A [`LeafError`] (`ErrorKind::AntiDce`) if a duplicate seed pairing for one contract
+/// exists (the same build-seam guard `from_slices` enforces), or an `AUTO_CONFIGS`
+/// descriptor has no matching `SeedPairing` (an unconstructible candidate).
+pub fn collect_autoconfig_candidates(
+    pairings: &[SeedPairing],
+) -> Result<Vec<AutoConfigCandidate>, LeafError> {
+    let seed_of = build_seed_index(pairings)?;
+
+    // The guard JOIN table (ContractId → const guard tree); an auto-config with no
+    // `#[conditional]` has no row here (None → registers unconditionally at Fallback).
+    let guard_of: HashMap<ContractId, &'static CondExpr> = collect_slice(&GUARD_PAIRINGS)
+        .into_iter()
+        .map(|r| (r.contract, r.guard))
+        .collect();
+
+    let mut candidates = Vec::new();
+    for descriptor in collect_slice(&AUTO_CONFIGS) {
+        let Some(&seed) = seed_of.get(&descriptor.contract) else {
+            return Err(missing_seed(&descriptor));
+        };
+        let guard = guard_of.get(&descriptor.contract).copied();
+        candidates.push(AutoConfigCandidate::new(descriptor, seed, guard));
+    }
+    Ok(candidates)
+}
+
+/// The auto-config back-off seed-probe over the link-collected [`COMPONENTS`] channel:
+/// the `(self_type, candidate_role)` of every component bean `from_slices` registers,
+/// so the FIRST auto-config candidate's `OnMissingBean`/`OnSingleCandidate` back-off
+/// sees the user/framework beans already in the builder.
+///
+/// The auto-configs themselves are NOT in this probe (the ladder grows the probe
+/// incrementally as each survivor registers — see [`run_autoconfig`](crate::run_autoconfig)).
+#[must_use]
+pub fn component_seed_probe() -> Vec<(TypeId, CandidateRole)> {
+    collect_slice(&COMPONENTS)
+        .into_iter()
+        .map(|d| (d.self_type, d.meta.candidate_role))
+        .collect()
 }
 
 fn missing_seed(descriptor: &Descriptor) -> LeafError {
@@ -246,14 +332,25 @@ mod tests {
     }
 
     #[test]
-    fn lifting_is_total_over_the_link_collected_bean_channels() {
-        // The lift reads EVERY row in COMPONENTS + AUTO_CONFIGS through the one
-        // collect_slice idiom; with leaf-boot's built-in pairings covering the
-        // framework beans it force-links (leaf-tokio's applicationTaskExecutor
-        // under the default `tokio` feature), the bare lift succeeds and the
-        // builder holds exactly one row per link-collected descriptor.
+    fn lifting_registers_only_the_components_channel() {
+        // The lift registers ONLY the COMPONENTS channel through the one collect_slice
+        // idiom (the AUTO_CONFIGS channel is held back for the ladder to gate); with
+        // leaf-boot's built-in pairings covering the framework beans it force-links
+        // (leaf-tokio's applicationTaskExecutor under the default `tokio` feature), the
+        // bare lift succeeds and the builder holds exactly one row per COMPONENTS
+        // descriptor — NOT the auto-configs.
         let builder = from_slices(&[]).expect("the bare lift succeeds via built-in pairings");
-        assert_eq!(builder.len(), COMPONENTS.len() + AUTO_CONFIGS.len());
+        assert_eq!(builder.len(), COMPONENTS.len());
+    }
+
+    #[test]
+    fn collect_candidates_is_total_over_the_auto_configs_channel() {
+        // The run path builds one AutoConfigCandidate per AUTO_CONFIGS row (held back
+        // from from_slices); with the built-in pairings covering the force-linked
+        // framework beans, the bare collect succeeds and yields one candidate per row.
+        let cands =
+            collect_autoconfig_candidates(&[]).expect("collect succeeds via built-in pairings");
+        assert_eq!(cands.len(), AUTO_CONFIGS.len());
     }
 
     #[cfg(feature = "tokio")]
