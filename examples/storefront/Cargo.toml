@@ -1,0 +1,20 @@
+[package]
+name = "storefront"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# An umbrella-only demo: EXACTLY ONE `leaf` dependency (no internal `leaf-*` crate,
+# no `linkme`, no `tokio`). `features = ["redis"]` pulls the redis capability into the
+# force-link / ExpectedManifest set, so its auto-config participates and backs off to
+# the in-memory cache.
+[dependencies]
+leaf = { path = "../../crates/leaf", features = ["redis"] }
+
+# Mirror the umbrella's capability features so the binary-crate `leaf::force_link!()`
+# shim's `#[cfg(feature = "redis")]` gate (checked in THIS crate's namespace) matches.
+[features]
+default = ["redis"]
+redis = ["leaf/redis"]
+web = ["leaf/web"]
