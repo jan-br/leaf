@@ -1,0 +1,7 @@
+error: `data_source` is a @bean with a `self` receiver: the method-on-a-@configuration form (threading the config instance) is not supported yet — use a free `fn` factory.
+  --> tests/ui/bean_with_self_receiver_is_deferred.rs:11:5
+   |
+11 |     #[bean]
+   |     ^^^^^^^
+   |
+   = note: this error originates in the attribute macro `bean` (in Nightly builds, run with -Z macro-backtrace for more info)

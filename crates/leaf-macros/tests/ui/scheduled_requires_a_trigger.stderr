@@ -1,0 +1,7 @@
+error: #[scheduled] requires one of `cron`/`fixed_rate`/`fixed_delay`
+ --> tests/ui/scheduled_requires_a_trigger.rs:6:1
+  |
+6 | #[scheduled]
+  | ^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `scheduled` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,7 @@
+error: `make` is a generic @bean factory: a generic factory has no single concrete product type. Register a concrete instantiation with `register_component!(Concrete)`.
+  --> tests/ui/generic_bean_factory_is_a_hard_error.rs:10:1
+   |
+10 | #[bean]
+   | ^^^^^^^
+   |
+   = note: this error originates in the attribute macro `bean` (in Nightly builds, run with -Z macro-backtrace for more info)

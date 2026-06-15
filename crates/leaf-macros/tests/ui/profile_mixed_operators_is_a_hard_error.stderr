@@ -1,0 +1,7 @@
+error: mixed `&` and `|` without parentheses in profile expression
+ --> tests/ui/profile_mixed_operators_is_a_hard_error.rs:6:1
+  |
+6 | #[profile("a & b | c")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `profile` (in Nightly builds, run with -Z macro-backtrace for more info)

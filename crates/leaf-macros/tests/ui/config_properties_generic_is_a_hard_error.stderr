@@ -1,0 +1,7 @@
+error: `Props` is a generic #[derive(BindTarget)]: a generic config target has no single concrete bind schema. Bind a concrete instantiation.
+ --> tests/ui/config_properties_generic_is_a_hard_error.rs:7:1
+  |
+7 | #[config_properties(prefix = "app")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `config_properties` (in Nightly builds, run with -Z macro-backtrace for more info)

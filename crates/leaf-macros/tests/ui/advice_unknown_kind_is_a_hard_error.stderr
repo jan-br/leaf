@@ -1,0 +1,7 @@
+error: unknown advice kind `sideways` (expected before/after/after_returning/after_throwing/around)
+ --> tests/ui/advice_unknown_kind_is_a_hard_error.rs:6:1
+  |
+6 | #[advice(sideways)]
+  | ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `advice` (in Nightly builds, run with -Z macro-backtrace for more info)

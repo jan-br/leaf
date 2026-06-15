@@ -1,0 +1,7 @@
+error: `Generic` is generic: a generic bean has no single concrete type to register as a const Descriptor row. Register a concrete instantiation with `register_component!(Generic<Concrete>)`.
+ --> tests/ui/generic_aspect_is_a_hard_error.rs:8:1
+  |
+8 | #[aspect]
+  | ^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `aspect` (in Nightly builds, run with -Z macro-backtrace for more info)

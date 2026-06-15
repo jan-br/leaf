@@ -1,0 +1,7 @@
+error: unknown stereotype argument `bogus` (expected `name`/`scope`)
+ --> tests/ui/unknown_stereotype_arg_is_a_hard_error.rs:6:1
+  |
+6 | #[component(bogus = "x")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `component` (in Nightly builds, run with -Z macro-backtrace for more info)

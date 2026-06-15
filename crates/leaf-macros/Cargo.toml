@@ -4,8 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The THIN proc-macro crate (charter §2.10): parse with syn, delegate ALL logic to
+# leaf-codegen (a normal, unit-testable library), emit. Tested via INTEGRATION
+# tests in `tests/` (separate crates that USE the macros) + trybuild compile-fail.
 [lib]
 proc-macro = true
 
 [dependencies]
 leaf-codegen.workspace = true
+syn = { workspace = true }
+quote.workspace = true
+proc-macro2.workspace = true
+
+# dev-deps: the integration tests are real crates that put the macros on sample
+# types and assert the macro->leaf_core roundtrip through the frozen ABI. `linkme`
+# is a direct dep because the `#[distributed_slice]` ATTRIBUTE macro resolves the
+# bare `linkme` crate at the contributing crate's root (a hard linkme constraint —
+# see the roundtrip test NOTE); `futures` drives the cold async resolution.
+[dev-dependencies]
+leaf-core.workspace = true
+linkme.workspace = true
+futures.workspace = true
+trybuild.workspace = true

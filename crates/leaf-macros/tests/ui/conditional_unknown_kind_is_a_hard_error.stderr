@@ -1,0 +1,7 @@
+error: unknown #[conditional] kind `on_quux` (expected on_property/on_bean/on_missing_bean/on_single_candidate/on_class/on_missing_class/all/any/not)
+ --> tests/ui/conditional_unknown_kind_is_a_hard_error.rs:6:1
+  |
+6 | #[conditional(on_quux("x"))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `conditional` (in Nightly builds, run with -Z macro-backtrace for more info)

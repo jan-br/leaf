@@ -1,0 +1,7 @@
+error: #[cacheable] requires at least one cache name
+ --> tests/ui/cacheable_requires_a_name.rs:6:1
+  |
+6 | #[cacheable]
+  | ^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `cacheable` (in Nightly builds, run with -Z macro-backtrace for more info)
