@@ -2,9 +2,14 @@
 
 use std::any::TypeId;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 
 use leaf::core::{ErasedArgs, MethodKey, ReadinessState, RunState};
 use leaf::LeafError;
+
+/// Serialize the app-booting tests: `StartupRunner` places an order at boot (bumping the
+/// process-global `PRICE_LOOKUPS`), so two concurrent boots would race the cache-hit proof.
+static APP_BOOT: Mutex<()> = Mutex::new(());
 
 use crate::catalog::catalog_service::{CatalogService, PRICE_LOOKUPS};
 use crate::orders::order_repository::OrderRepository;
@@ -13,6 +18,7 @@ use crate::platform::app_properties::AppProperties;
 use crate::platform::startup_runner::RUNNER_FIRED;
 use crate::platform::transaction_manager::LocalTransactionManager;
 use crate::pricing::discount_policy::DiscountPolicy;
+use crate::pricing::promo_runner::{PromoRunner, PROMO_FIRED};
 
 fn runtime() -> leaf::tokio::runtime::Runtime {
     leaf::tokio::runtime::Builder::new_multi_thread()
@@ -26,6 +32,7 @@ fn runtime() -> leaf::tokio::runtime::Runtime {
 /// auto-advised, the runner fires, and shutdown drains cleanly.
 #[test]
 fn the_storefront_wires_advises_runs_and_shuts_down() {
+    let _boot = APP_BOOT.lock().unwrap_or_else(|e| e.into_inner());
     runtime().block_on(async {
         let running = leaf::bootstrap("storefront")
             .run(
@@ -62,6 +69,8 @@ fn the_storefront_wires_advises_runs_and_shuts_down() {
             .first()
             .expect("OrderService in registry");
         assert!(running.is_advised(orders_id), "the transactional bean is auto-advised");
+        // StartupRunner already placed one order at boot; assert the delta from THIS call.
+        let saved_before = repo.saved_count();
         let placed: Result<crate::orders::order::Order, LeafError> = running
             .invoke_advised(
                 orders_id,
@@ -74,7 +83,7 @@ fn the_storefront_wires_advises_runs_and_shuts_down() {
             .unwrap();
         let order = placed.expect("the order places");
         assert_eq!(order.total_cents, 1299 * 2, "total = unit price * qty");
-        assert_eq!(repo.saved_count(), 1, "the order was saved");
+        assert_eq!(repo.saved_count(), saved_before + 1, "the order was saved");
 
         let tx = running.context().get::<LocalTransactionManager>().await.expect("tx manager");
         assert!(tx.begins() >= 1, "a tx was begun for the order");
@@ -108,10 +117,15 @@ fn the_storefront_wires_advises_runs_and_shuts_down() {
         assert_eq!(p2.expect("Ok"), 799, "the CACHED value returns");
         assert_eq!(PRICE_LOOKUPS.load(Ordering::SeqCst), 1, "a cache HIT short-circuited the body");
 
-        // (5) #[conditional] gating: discounts unset → DiscountPolicy is ABSENT.
+        // (5) #[conditional] gating: discounts unset → the pricing feature (the
+        // DiscountPolicy bean AND the PromoRunner that uses it) is entirely ABSENT.
         assert!(
             registry.candidates(TypeId::of::<DiscountPolicy>()).is_empty(),
             "DiscountPolicy is absent when pricing.discounts.enabled is unset"
+        );
+        assert!(
+            registry.candidates(TypeId::of::<PromoRunner>()).is_empty(),
+            "the conditional PromoRunner is absent (and never fires) when the flag is unset"
         );
 
         // (6) reached Running + AcceptingTraffic; shutdown drains cleanly.
@@ -128,6 +142,7 @@ fn the_storefront_wires_advises_runs_and_shuts_down() {
 /// `DiscountPolicy` IS present and resolves.
 #[test]
 fn the_discount_policy_registers_when_enabled() {
+    let _boot = APP_BOOT.lock().unwrap_or_else(|e| e.into_inner());
     runtime().block_on(async {
         let running = leaf::bootstrap("storefront")
             .run(
@@ -146,6 +161,13 @@ fn the_discount_policy_registers_when_enabled() {
         );
         let policy = running.context().get::<DiscountPolicy>().await.expect("DiscountPolicy resolves");
         assert_eq!(policy.discount_cents(1000), 100, "10% discount");
+
+        // The conditional PromoRunner is ALSO present and fired during the readiness window.
+        assert!(
+            !registry.candidates(TypeId::of::<PromoRunner>()).is_empty(),
+            "the conditional PromoRunner IS present when the flag is set"
+        );
+        assert!(PROMO_FIRED.load(Ordering::SeqCst) >= 1, "the conditional runner fired");
 
         let report = running.shutdown().await;
         assert_eq!(report.run_state, RunState::Closed);
