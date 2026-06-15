@@ -1,4 +1,4 @@
-error: unknown stereotype argument `bogus` (expected `name`/`scope`)
+error: unknown stereotype argument `bogus` (expected `name`/`scope`/`role`)
  --> tests/ui/unknown_stereotype_arg_is_a_hard_error.rs:6:1
   |
 6 | #[component(bogus = "x")]

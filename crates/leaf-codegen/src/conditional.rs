@@ -763,6 +763,7 @@ pub fn auto_config_input(item: &syn::ItemStruct) -> Result<crate::descriptor::Be
         item,
         crate::stereotype::Stereotype::Configuration,
         None,
+        None,
         crate::descriptor::Scope::Singleton,
     )?;
     input.slice = crate::descriptor::Slice::AutoConfigs;

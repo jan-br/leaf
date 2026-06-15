@@ -29,6 +29,12 @@ pub struct StereotypeArgs {
     pub name: Option<String>,
     /// The scope triple (`scope = "prototype"`), defaulting to singleton.
     pub scope: Scope,
+    /// An explicit provenance [`Role`] override (`role = "infrastructure"`), or
+    /// `None` to keep the stereotype's own role (Application). The orthogonal
+    /// framework-vs-application axis the stereotype NAME cannot carry — the one knob
+    /// that lets a `#[component]` register a `Role::Infrastructure` bean (e.g. the
+    /// primary `applicationTaskExecutor`).
+    pub role: Option<Role>,
 }
 
 /// Parse the comma-separated `#[stereotype(name = "…", scope = "…")]` argument
@@ -63,9 +69,12 @@ pub fn parse_args(attr: proc_macro2::TokenStream) -> Result<StereotypeArgs, Emit
         match key.as_str() {
             "name" => out.name = Some(value),
             "scope" => out.scope = parse_scope(&value)?,
+            "role" => out.role = Some(parse_role(&value)?),
             other => {
                 return Err(EmitError {
-                    message: format!("unknown stereotype argument `{other}` (expected `name`/`scope`)"),
+                    message: format!(
+                        "unknown stereotype argument `{other}` (expected `name`/`scope`/`role`)"
+                    ),
                 });
             }
         }
@@ -90,6 +99,24 @@ fn parse_scope(value: &str) -> Result<Scope, EmitError> {
         other => Err(EmitError {
             message: format!(
                 "unknown scope `{other}` (expected `singleton`/`prototype`/`request`)"
+            ),
+        }),
+    }
+}
+
+/// Map a `role = "…"` value to the provenance [`Role`] axis. The stereotype name
+/// carries the marker closure; this orthogonal knob carries the
+/// framework-vs-application provenance (`Context::refresh()` infrastructure
+/// auto-detection), so a `#[component(role = "infrastructure")]` can register the
+/// primary `applicationTaskExecutor` the same maximal-magic way as a user bean.
+fn parse_role(value: &str) -> Result<Role, EmitError> {
+    match value {
+        "application" => Ok(Role::Application),
+        "support" => Ok(Role::Support),
+        "infrastructure" => Ok(Role::Infrastructure),
+        other => Err(EmitError {
+            message: format!(
+                "unknown role `{other}` (expected `application`/`support`/`infrastructure`)"
             ),
         }),
     }
@@ -164,6 +191,7 @@ pub fn struct_input(
     item: &ItemStruct,
     stereotype: Stereotype,
     explicit_name: Option<String>,
+    explicit_role: Option<Role>,
     scope: Scope,
 ) -> Result<BeanInput, EmitError> {
     let ident = item.ident.to_string();
@@ -181,7 +209,10 @@ pub fn struct_input(
 
     let mut input = BeanInput::new(self_ty, ident.clone(), ident);
     input.module_qualified = true;
-    input.role = stereotype.role();
+    // An explicit `role = "…"` arg overrides the stereotype's own role (the
+    // orthogonal provenance axis); otherwise the stereotype's role (Application)
+    // applies.
+    input.role = explicit_role.unwrap_or_else(|| stereotype.role());
     input.scope = scope;
     input.explicit_name = explicit_name;
     input.meta = meta;
@@ -207,7 +238,7 @@ pub fn emit_struct(
     attr: proc_macro2::TokenStream,
 ) -> Result<proc_macro2::TokenStream, EmitError> {
     let args = parse_args(attr)?;
-    let input = struct_input(item, stereotype, args.name, args.scope)?;
+    let input = struct_input(item, stereotype, args.name, args.role, args.scope)?;
     crate::descriptor::emit(&input)
 }
 
@@ -226,6 +257,28 @@ pub fn emit_struct(
 /// [`EmitError`] if the type has no nameable leading ident, or its annotation is
 /// malformed.
 pub fn register_input(ty: &Type) -> Result<BeanInput, EmitError> {
+    register_input_with(ty, None, None)
+}
+
+/// Lower a concrete `register_component!(Concrete, role = "…", name = "…")` type to a
+/// [`BeanInput`], carrying an optional explicit [`Role`] provenance override + an
+/// optional Spring bean-name override.
+///
+/// Same construct-via-`new()`, no-field-injection shape as [`register_input`] (a bare
+/// type has no fields, so the user supplies an arity-0 `new()`); the extra knobs let a
+/// FRAMEWORK bean register through this same maximal-magic channel — e.g. leaf-tokio's
+/// `TokioExecutionFacility` as the `Role::Infrastructure` `applicationTaskExecutor`
+/// (whose `gate` field is internal state, NOT an injection point, so the `#[component]`
+/// struct-field path does not fit). `None`/`None` is the plain `register_component!`.
+///
+/// # Errors
+/// [`EmitError`] if the type has no nameable leading ident, or its annotation is
+/// malformed.
+pub fn register_input_with(
+    ty: &Type,
+    explicit_name: Option<String>,
+    explicit_role: Option<Role>,
+) -> Result<BeanInput, EmitError> {
     let ident = leading_ident(ty).ok_or_else(|| EmitError {
         message: "register_component! expects a concrete type with a nameable identifier".into(),
     })?;
@@ -235,6 +288,10 @@ pub fn register_input(ty: &Type) -> Result<BeanInput, EmitError> {
     let mut input = BeanInput::new(ty.clone(), ident.clone(), ident);
     input.module_qualified = true;
     input.meta = meta;
+    input.explicit_name = explicit_name;
+    if let Some(role) = explicit_role {
+        input.role = role;
+    }
     Ok(input)
 }
 
@@ -246,6 +303,21 @@ pub fn register_input(ty: &Type) -> Result<BeanInput, EmitError> {
 /// annotation.
 pub fn emit_register(ty: &Type) -> Result<proc_macro2::TokenStream, EmitError> {
     crate::descriptor::emit(&register_input(ty)?)
+}
+
+/// Emit the const registration artifact for a
+/// `register_component!(Concrete, role = "…", name = "…")` invocation — the
+/// role/name-carrying form (see [`register_input_with`]).
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) on an unnameable type or a malformed
+/// annotation.
+pub fn emit_register_with(
+    ty: &Type,
+    explicit_name: Option<String>,
+    explicit_role: Option<Role>,
+) -> Result<proc_macro2::TokenStream, EmitError> {
+    crate::descriptor::emit(&register_input_with(ty, explicit_name, explicit_role)?)
 }
 
 /// The leading path-segment ident of a type (`Repo<u32>` → `Repo`), used as the
@@ -464,6 +536,7 @@ mod tests {
             &item("struct Greeter;"),
             Stereotype::Component,
             None,
+            None,
             Scope::Singleton,
         )
         .expect("a unit struct lowers");
@@ -481,6 +554,7 @@ mod tests {
         let input = struct_input(
             &item("struct Loud { greeter: Greeter, count: usize }"),
             Stereotype::Component,
+            None,
             None,
             Scope::Singleton,
         )
@@ -501,6 +575,7 @@ mod tests {
             &item("struct Loud { greeter: leaf_core::Ref<Greeter> }"),
             Stereotype::Component,
             None,
+            None,
             Scope::Singleton,
         )
         .expect("lowers");
@@ -517,6 +592,7 @@ mod tests {
             &item("struct Pair(Greeter, usize);"),
             Stereotype::Component,
             None,
+            None,
             Scope::Singleton,
         )
         .expect("lowers");
@@ -531,6 +607,7 @@ mod tests {
             &item("struct Greeter;"),
             Stereotype::Component,
             Some("theGreeter".into()),
+            None,
             Scope::Singleton,
         )
         .expect("lowers");
@@ -542,6 +619,7 @@ mod tests {
         let input = struct_input(
             &item("struct UserService;"),
             Stereotype::Service,
+            None,
             None,
             Scope::Singleton,
         )
@@ -579,6 +657,59 @@ mod tests {
         let attr: proc_macro2::TokenStream = syn::parse_str(r#"scope = "galaxy""#).expect("tokens");
         let err = parse_args(attr).expect_err("unknown scope errors");
         assert!(err.message.contains("unknown scope"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn parse_args_reads_an_infrastructure_role() {
+        // The infra-role surface: `#[component(role = "infrastructure", name = "..")]`
+        // requests `Role::Infrastructure` on the emitted Descriptor (the orthogonal
+        // provenance axis the stereotype NAME cannot carry). The default is `None`
+        // (the stereotype's own `role()` — Application — applies).
+        let attr: proc_macro2::TokenStream =
+            syn::parse_str(r#"role = "infrastructure", name = "applicationTaskExecutor""#)
+                .expect("tokens");
+        let args = parse_args(attr).expect("parses");
+        assert_eq!(args.role, Some(Role::Infrastructure));
+        assert_eq!(args.name, Some("applicationTaskExecutor".into()));
+    }
+
+    #[test]
+    fn parse_args_rejects_an_unknown_role() {
+        let attr: proc_macro2::TokenStream = syn::parse_str(r#"role = "wizard""#).expect("tokens");
+        let err = parse_args(attr).expect_err("unknown role errors");
+        assert!(err.message.contains("unknown role"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn an_explicit_role_arg_overrides_the_stereotype_role_in_the_emitted_descriptor() {
+        // The whole point: a `role = "infrastructure"` arg makes the emitted const
+        // Descriptor carry `Role::Infrastructure` (+ the custom declared_name),
+        // replacing the hand-written infrastructure bean block with the macro.
+        let ts = emit_struct(
+            &item("struct TokioExecutionFacility;"),
+            Stereotype::Component,
+            syn::parse_str(r#"role = "infrastructure", name = "applicationTaskExecutor""#)
+                .expect("tokens"),
+        )
+        .expect("emits");
+        let s: String = ts.to_string().split_whitespace().collect();
+        assert!(s.contains("role:::leaf_core::Role::Infrastructure"), "got: {s}");
+        assert!(s.contains(r#"Some("applicationTaskExecutor")"#), "got: {s}");
+    }
+
+    #[test]
+    fn no_role_arg_keeps_the_stereotype_role_application() {
+        // Without a `role` arg, the stereotype's own role (Application) is emitted.
+        let input = struct_input(
+            &item("struct Greeter;"),
+            Stereotype::Component,
+            None,
+            None,
+            Scope::Singleton,
+        )
+        .expect("lowers");
+        let s = flat(&input);
+        assert!(s.contains("role:::leaf_core::Role::Application"), "got: {s}");
     }
 
     #[test]
@@ -645,6 +776,54 @@ mod tests {
         let s: String = ts.to_string().split_whitespace().collect();
         assert!(
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn register_input_with_carries_an_infrastructure_role_and_custom_name() {
+        // The infra-role `register_component!` form: a concrete construct-via-`new()`
+        // bean (NO field injection — the facility shape) carrying the
+        // `Role::Infrastructure` provenance + a custom Spring bean-name. This is how
+        // `TokioExecutionFacility` registers the primary `applicationTaskExecutor`
+        // through the macro instead of a hand-written const block.
+        let ty: Type = syn::parse_str("TokioExecutionFacility").expect("a concrete type");
+        let input = register_input_with(
+            &ty,
+            Some("applicationTaskExecutor".into()),
+            Some(Role::Infrastructure),
+        )
+        .expect("lowers");
+        assert!(input.deps.is_empty(), "no field injection on the register form");
+        assert_eq!(input.role, Role::Infrastructure);
+        assert_eq!(input.explicit_name, Some("applicationTaskExecutor".into()));
+        let s = flat(&input);
+        assert!(s.contains("role:::leaf_core::Role::Infrastructure"), "got: {s}");
+        assert!(s.contains(r#"Some("applicationTaskExecutor")"#), "got: {s}");
+        // The provider constructs via the arity-0 `::new()` (construct-and-publish).
+        assert!(s.contains("<TokioExecutionFacility>::new()"), "got: {s}");
+    }
+
+    #[test]
+    fn emit_register_with_emits_the_full_components_and_seed_row() {
+        // The `register_component!`-with-args emit path: a COMPONENTS row AND the
+        // SEED_PAIRINGS force-link (so the bean's seed auto-collects like any user
+        // bean — the JOIN leaf-boot's from_slices completes from the slice).
+        let ty: Type = syn::parse_str("TokioExecutionFacility").expect("type");
+        let ts = emit_register_with(
+            &ty,
+            Some("applicationTaskExecutor".into()),
+            Some(Role::Infrastructure),
+        )
+        .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s: String = ts.to_string().split_whitespace().collect();
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
             "got: {s}"
         );
     }
@@ -723,6 +902,7 @@ mod tests {
         let input = struct_input(
             &item("struct Repo<T> { inner: T }"),
             Stereotype::Component,
+            None,
             None,
             Scope::Singleton,
         )

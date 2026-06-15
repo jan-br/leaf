@@ -210,6 +210,7 @@ pub fn runner_input(item: &syn::ItemStruct) -> Result<crate::descriptor::BeanInp
         item,
         crate::stereotype::Stereotype::Component,
         None,
+        None,
         crate::descriptor::Scope::Singleton,
     )?;
     // Declare the Runner upcast view so the run pipeline finds it by the `dyn Runner`

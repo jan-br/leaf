@@ -738,6 +738,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "leaf-core",
+ "leaf-macros",
  "leaf-resilience",
  "once_cell",
  "tokio",

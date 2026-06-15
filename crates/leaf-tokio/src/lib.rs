@@ -14,10 +14,13 @@
 //!   [`ExecutionFacility`](leaf_core::ExecutionFacility): [`Spawner`](leaf_core::Spawner)
 //!   via [`tokio::spawn`], [`BlockingOffload`](leaf_core::BlockingOffload) via
 //!   `spawn_blocking`, [`ConcurrencyGate`](leaf_core::ConcurrencyGate) via a
-//!   [`Semaphore`](tokio::sync::Semaphore). Submitted into
-//!   [`COMPONENTS`](leaf_core::COMPONENTS) as a const `Role::Infrastructure`
-//!   [`Descriptor`](leaf_core::Descriptor) via the same link-time channel the
-//!   macros emit into (see [`exec::APPLICATION_TASK_EXECUTOR_DESCRIPTOR`]).
+//!   [`Semaphore`](tokio::sync::Semaphore). Registered through the THIN
+//!   `register_component!(.., role = "infrastructure", name = "applicationTaskExecutor")`
+//!   macro — the same maximal-magic channel a user bean uses: a const
+//!   `Role::Infrastructure` [`Descriptor`](leaf_core::Descriptor) in
+//!   [`COMPONENTS`](leaf_core::COMPONENTS) + a force-linked
+//!   [`ProviderSeed`](leaf_core::ProviderSeed) in [`SEED_PAIRINGS`](leaf_core::SEED_PAIRINGS)
+//!   (see [`exec`]).
 //! - [`TokioAmbient`] — the [`AmbientStore`](leaf_core::AmbientStore) backing the
 //!   ambient [`Cx`](leaf_core::Cx) over `tokio::task_local!` (the per-poll
 //!   re-install that rides a work-stealing hop, where the core thread-local
@@ -68,8 +71,7 @@ pub use ambient::TokioAmbient;
 pub use availability::availability;
 pub use dispatch::{detached_dispatch, AsyncDispatchInterceptor, CaptureCurrentCx};
 pub use exec::{
-    TokioExecutionFacility, TokioExecutionFacilityProvider, APPLICATION_TASK_EXECUTOR,
-    APPLICATION_TASK_EXECUTOR_CONTRACT, APPLICATION_TASK_EXECUTOR_DESCRIPTOR,
+    TokioExecutionFacility, APPLICATION_TASK_EXECUTOR, APPLICATION_TASK_EXECUTOR_CONTRACT,
     APPLICATION_TASK_EXECUTOR_SEED,
 };
 pub use resource::{FileResource, FileResourceProvider};

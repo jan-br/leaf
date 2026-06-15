@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+# The thin stereotype macros: `TokioExecutionFacility` is registered as the primary
+# `applicationTaskExecutor` via `#[component(role = "infrastructure", name = "..")]`
+# — the macro emits the Descriptor (-> COMPONENTS) + ProviderSeed (-> SEED_PAIRINGS)
+# the same maximal-magic way a user bean is registered (no hand-written const block).
+leaf-macros.workspace = true
 # The timer-backed `Sleeper` impl (`TokioSleeper`) implements leaf-resilience's
 # runtime-agnostic `Sleeper` seam over `tokio::time::sleep`. The dependency
 # direction is leaf-tokio -> leaf-resilience (the runtime crate implements the

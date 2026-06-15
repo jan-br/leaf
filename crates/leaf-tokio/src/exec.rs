@@ -14,13 +14,16 @@
 //! RAII [`Permit`] is likewise runtime-agnostic (`Drop` releases the slot even on
 //! cancel).
 //!
-//! This crate also exposes the primary `applicationTaskExecutor`
-//! [`Descriptor`](leaf_core::Descriptor) const (the `Role::Infrastructure` bean),
-//! submitted into the [`COMPONENTS`](leaf_core::COMPONENTS) slice the same way the
-//! thin macros emit a const row — so `Context::refresh()` auto-detects and
-//! installs it before any application bean.
+//! This module registers the primary `applicationTaskExecutor` bean (the
+//! `Role::Infrastructure` facility) through the THIN
+//! `register_component!(TokioExecutionFacility, role = "infrastructure", name = "..")`
+//! macro — the SAME maximal-magic channel a user bean uses: the macro emits the const
+//! [`Descriptor`](leaf_core::Descriptor) into [`COMPONENTS`](leaf_core::COMPONENTS) +
+//! force-links its [`ProviderSeed`](leaf_core::ProviderSeed) into
+//! [`SEED_PAIRINGS`](leaf_core::SEED_PAIRINGS), so `Context::refresh()` auto-detects
+//! and installs it before any application bean, and leaf-boot's `from_slices` JOINs it
+//! with NO hand-written builtin pairing.
 
-use std::any::TypeId;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -108,13 +111,29 @@ impl PermitSeam for TokioPermit {}
 
 // ───────────────────────────── the facility ─────────────────────────────────
 
-/// The DEFAULT [`ExecutionFacility`](leaf_core::ExecutionFacility) over tokio.
+/// The DEFAULT [`ExecutionFacility`](leaf_core::ExecutionFacility) over tokio — the
+/// primary `applicationTaskExecutor` bean.
 ///
 /// Implements all three capabilities, so it IS an `ExecutionFacility` via the
 /// core blanket impl. The [`ConcurrencyGate`] is bounded by a
 /// [`Semaphore`]; [`with_limit`](TokioExecutionFacility::with_limit) sets the
 /// permit count (limit-1 = an instance lock; the default is effectively
 /// unbounded for `spawn`/`run_blocking`, the gate only caps `acquire`).
+///
+/// Registered through the THIN stereotype macro exactly like a user bean: the
+/// `register_component!` form (the construct-via-`new()` shape — the facility holds no
+/// injected collaborators, its runtime is the ambient tokio runtime, so its `gate`
+/// field is internal state, NOT an injection point) carrying the
+/// `role = "infrastructure", name = "applicationTaskExecutor"` provenance + Spring
+/// bean-name. The macro emits the const `Role::Infrastructure`
+/// [`Descriptor`](leaf_core::Descriptor) into [`COMPONENTS`](leaf_core::COMPONENTS),
+/// the generated [`Provider`](leaf_core::Provider) (construct-and-publish via
+/// `TokioExecutionFacility::new()`), and force-links the
+/// [`ProviderSeed`](leaf_core::ProviderSeed) into
+/// [`SEED_PAIRINGS`](leaf_core::SEED_PAIRINGS) — so leaf-boot's `from_slices` JOINs it
+/// the same maximal-magic way as any annotated bean (NO hand-written const block, NO
+/// hardcoded leaf-boot builtin pairing). See the `register_component!` invocation
+/// below the impls.
 #[derive(Clone)]
 pub struct TokioExecutionFacility {
     gate: Arc<Semaphore>,
@@ -182,104 +201,50 @@ impl ConcurrencyGate for TokioExecutionFacility {
 
 // ───────────────────── the applicationTaskExecutor bean ──────────────────────
 
-/// The stable contract name of the primary execution-facility bean (Spring's
-/// `applicationTaskExecutor` identity preserved as a single named bean).
+// Register the facility as the primary `applicationTaskExecutor` through the THIN
+// macro — the SAME maximal-magic channel a user bean uses. `register_component!` is
+// the construct-via-`new()` form (the facility's `gate` field is internal state, NOT
+// an injection point, so the `#[component]` struct-field path does not fit); the
+// `role`/`name` args carry the `Role::Infrastructure` provenance + Spring bean-name.
+//
+// This single line emits everything the hand-written block used to: the const
+// `Role::Infrastructure` `Descriptor` (-> COMPONENTS), the generated `Provider`
+// (construct-and-publish via `TokioExecutionFacility::new()`), the `ProviderSeed`
+// (force-linked into SEED_PAIRINGS — so leaf-boot's `from_slices` JOINs it with NO
+// hand-written builtin pairing), the per-bean `InjectionPlan` (empty), and the
+// `impl leaf_core::Bean for TokioExecutionFacility {}` engine-resolvability marker.
+leaf_macros::register_component!(
+    TokioExecutionFacility,
+    role = "infrastructure",
+    name = "applicationTaskExecutor"
+);
+
+/// The stable contract NAME of the primary execution-facility bean (Spring's
+/// `applicationTaskExecutor` identity, the macro-emitted `declared_name`).
 pub const APPLICATION_TASK_EXECUTOR: &str = "applicationTaskExecutor";
 
-/// The stable contract path of the primary execution-facility bean.
-pub const APPLICATION_TASK_EXECUTOR_CONTRACT: &str = "leaf_tokio::applicationTaskExecutor";
+/// The stable cross-build contract PATH of the primary execution-facility bean — the
+/// macro-derived `module_path!()::Ident` identity the `Descriptor.contract` carries
+/// (the JOIN key leaf-boot's `from_slices` matches against). Kept as a pub const so
+/// leaf-boot (and tests) name the facility's stable identity without hardcoding the
+/// string.
+pub const APPLICATION_TASK_EXECUTOR_CONTRACT: &str = "leaf_tokio::exec::TokioExecutionFacility";
 
-/// The const `Role::Infrastructure` [`Descriptor`](leaf_core::Descriptor) for the
-/// primary `applicationTaskExecutor` bean — the auto-detect target at
-/// `Context::refresh()` R2.
-///
-/// This is the EXACT shape the thin stereotype macro emits: a flat const row over
-/// `::leaf_core` paths. It is submitted into the [`COMPONENTS`](leaf_core::COMPONENTS)
-/// distributed-slice (see [`APPLICATION_TASK_EXECUTOR_ELEMENT`]) so a force-linking
-/// binary picks it up through the same link-time channel; a missing facility
-/// HARD-FAILS the refresh self-check (an async-first framework cannot run without
-/// it).
-pub const APPLICATION_TASK_EXECUTOR_DESCRIPTOR: leaf_core::Descriptor = leaf_core::Descriptor {
-    contract: leaf_core::ContractId::of(APPLICATION_TASK_EXECUTOR_CONTRACT),
-    self_type: TypeId::of::<TokioExecutionFacility>(),
-    provides: &[],
-    declared_name: Some(APPLICATION_TASK_EXECUTOR),
-    aliases: &[],
-    scope: leaf_core::ScopeDef::SINGLETON,
-    role: leaf_core::Role::Infrastructure,
-    meta: &leaf_core::AnnotationMetadata::EMPTY,
-    parent: None,
-    origin: leaf_core::Origin::Native {
-        crate_name: Some("leaf-tokio"),
-    },
-};
-
-// The link-time element: place the const Descriptor into the frozen COMPONENTS
-// slice via the SAME `::leaf_core::linkme` path the macros emit. A `#[used]`
-// `#[link_section]` static under the hood (hence the scoped allow — there is no
-// hand-written `unsafe` block; only the macro-generated section attribute).
-#[allow(unsafe_code)]
-#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]
-#[linkme(crate = ::leaf_core::linkme)]
-#[doc(hidden)]
-pub static APPLICATION_TASK_EXECUTOR_ELEMENT: leaf_core::Descriptor =
-    APPLICATION_TASK_EXECUTOR_DESCRIPTOR;
-
-/// The [`Provider`](leaf_core::Provider) that constructs the
-/// `applicationTaskExecutor` facility — what leaf-boot drives to publish the
-/// shared bean.
-///
-/// The facility holds no injected collaborators (its runtime is the ambient tokio
-/// runtime), so `provide` is a pure construct-and-publish; the published handle is
-/// the SHARED `Arc`-shaped value consumers receive as `Ref<dyn Spawner>` etc.
-pub struct TokioExecutionFacilityProvider {
-    descriptor: leaf_core::Descriptor,
-}
-
-impl TokioExecutionFacilityProvider {
-    /// Construct the provider over the const descriptor.
-    #[must_use]
-    pub fn new() -> Self {
-        TokioExecutionFacilityProvider {
-            descriptor: APPLICATION_TASK_EXECUTOR_DESCRIPTOR,
-        }
-    }
-}
-
-impl Default for TokioExecutionFacilityProvider {
-    fn default() -> Self {
-        TokioExecutionFacilityProvider::new()
-    }
-}
-
-impl leaf_core::Provider for TokioExecutionFacilityProvider {
-    fn descriptor(&self) -> &leaf_core::Descriptor {
-        &self.descriptor
-    }
-
-    fn provide<'a>(
-        &'a self,
-        _cx: &'a leaf_core::ResolveCtx<'a>,
-    ) -> BoxFuture<'a, Result<leaf_core::Published, leaf_core::LeafError>> {
-        Box::pin(async {
-            Ok(leaf_core::Published::shared_value(
-                TokioExecutionFacility::new(),
-            ))
-        })
-    }
-}
-
-/// The const [`ProviderSeed`](leaf_core::ProviderSeed) leaf-boot binds to the
-/// `applicationTaskExecutor` [`Descriptor`] when lifting the
-/// [`COMPONENTS`](leaf_core::COMPONENTS) slice (the construction recipe on the
-/// const row path; mints the `Arc<dyn Provider>` once at register/freeze).
-pub const APPLICATION_TASK_EXECUTOR_SEED: leaf_core::ProviderSeed =
-    || std::sync::Arc::new(TokioExecutionFacilityProvider::new());
+/// The macro-emitted [`ProviderSeed`](leaf_core::ProviderSeed) for the
+/// `applicationTaskExecutor` facility — a thin alias over the deterministic public
+/// `__leaf_seed_TokioExecutionFacility` const the `register_component!` expansion
+/// exposes (the construction recipe; mints the `Arc<dyn Provider>` once at
+/// register/freeze). It force-links itself into
+/// [`SEED_PAIRINGS`](leaf_core::SEED_PAIRINGS), so this alias exists only as a named
+/// handle for the escape-hatch `.with_seeds` path / diagnostics.
+#[allow(non_upper_case_globals)]
+pub const APPLICATION_TASK_EXECUTOR_SEED: leaf_core::ProviderSeed = __leaf_seed_TokioExecutionFacility;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use leaf_core::{DropPolicy, ExecutionFacility};
+    use std::any::TypeId;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -429,25 +394,44 @@ mod tests {
 
     #[test]
     fn application_task_executor_descriptor_is_infrastructure() {
-        let d = &APPLICATION_TASK_EXECUTOR_DESCRIPTOR;
+        // The macro-emitted const Descriptor row lands in COMPONENTS carrying the
+        // `Role::Infrastructure` provenance + the Spring `applicationTaskExecutor`
+        // declared_name — the EXACT shape the old hand-written block carried, now
+        // emitted by `register_component!(.., role = "infrastructure", name = "..")`.
+        let contract = leaf_core::ContractId::of(APPLICATION_TASK_EXECUTOR_CONTRACT);
+        let rows = leaf_core::collect_slice(&leaf_core::COMPONENTS);
+        let d = rows
+            .iter()
+            .find(|r| r.contract == contract)
+            .expect("the applicationTaskExecutor Descriptor is in COMPONENTS");
         assert_eq!(d.declared_name, Some(APPLICATION_TASK_EXECUTOR));
         assert_eq!(d.role, leaf_core::Role::Infrastructure);
         assert_eq!(d.self_type, TypeId::of::<TokioExecutionFacility>());
-        assert_eq!(
-            d.contract,
-            leaf_core::ContractId::of("leaf_tokio::applicationTaskExecutor")
-        );
     }
 
     #[test]
     fn application_task_executor_is_discoverable_in_components() {
-        // The descriptor is link-submitted into COMPONENTS (the same channel the
-        // macros emit into), so a self-check / refresh auto-detect finds it.
+        // The descriptor is link-submitted into COMPONENTS by the macro (the same
+        // channel a user bean emits into), so a self-check / refresh auto-detect
+        // finds it.
         let rows = leaf_core::collect_slice(&leaf_core::COMPONENTS);
         assert!(
             rows.iter().any(|r| r.contract
-                == leaf_core::ContractId::of("leaf_tokio::applicationTaskExecutor")),
+                == leaf_core::ContractId::of(APPLICATION_TASK_EXECUTOR_CONTRACT)),
             "applicationTaskExecutor must be discoverable in COMPONENTS"
+        );
+    }
+
+    #[test]
+    fn application_task_executor_seed_force_links_into_seed_pairings() {
+        // The proof the special case is GONE: the facility's seed force-links into the
+        // SEED_PAIRINGS slice via the macro (NOT a hand-written const + a leaf-boot
+        // builtin pairing), so leaf-boot's `from_slices` JOINs it like any user bean.
+        let contract = leaf_core::ContractId::of(APPLICATION_TASK_EXECUTOR_CONTRACT);
+        let seeds = leaf_core::collect_slice(&leaf_core::SEED_PAIRINGS);
+        assert!(
+            seeds.iter().any(|r| r.contract == contract),
+            "the applicationTaskExecutor ProviderSeed must force-link into SEED_PAIRINGS"
         );
     }
 }

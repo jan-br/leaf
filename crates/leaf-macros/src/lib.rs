@@ -36,7 +36,7 @@ use leaf_codegen::descriptor::EmitError;
 use leaf_codegen::holder;
 use leaf_codegen::listener;
 use leaf_codegen::scheduling;
-use leaf_codegen::stereotype::{self, Stereotype};
+use leaf_codegen::stereotype::{self, Stereotype, StereotypeArgs};
 use leaf_codegen::validate;
 
 /// Turn an [`EmitError`] into a `compile_error!` token stream (the one
@@ -180,12 +180,43 @@ pub fn bean(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Emits the same const `::leaf_core::Descriptor` row as a no-dependency
 /// `#[component]` constructed via `Concrete::new()`. This is the `compile_error!`
 /// remediation a generic `#[component]`/`#[bean]` points at.
+///
+/// Optional trailing `key = "value"` args (the SAME vocabulary as `#[component]`):
+/// `register_component!(Concrete, role = "infrastructure", name = "applicationTaskExecutor")`
+/// carries a provenance [`leaf_core::Role`] override + a Spring bean-name. This lets a
+/// FRAMEWORK construct-via-`new()` bean (whose fields are internal state, NOT injection
+/// points — so the `#[component]` struct-field path does not fit) register through the
+/// same maximal-magic channel, e.g. leaf-tokio's primary execution facility.
 #[proc_macro]
 pub fn register_component(item: TokenStream) -> TokenStream {
-    let ty = parse_macro_input!(item as Type);
-    match stereotype::emit_register(&ty) {
+    let RegisterComponent { ty, args } = parse_macro_input!(item as RegisterComponent);
+    match stereotype::emit_register_with(&ty, args.name, args.role) {
         Ok(rows) => rows.into(),
         Err(EmitError { message }) => quote! { ::core::compile_error!(#message); }.into(),
+    }
+}
+
+/// A `register_component!(Concrete [, key = "value"]*)` invocation: the concrete type
+/// followed by the SAME optional `name`/`scope`/`role` args `#[component]` accepts
+/// (parsed by the shared `leaf_codegen::stereotype::parse_args`).
+struct RegisterComponent {
+    ty: Type,
+    args: StereotypeArgs,
+}
+
+impl syn::parse::Parse for RegisterComponent {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let ty: Type = input.parse()?;
+        // Optional trailing `, key = "value"` pairs — hand the remainder to the shared
+        // stereotype arg parser so the vocabulary stays in ONE place (leaf-codegen).
+        let args = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let rest: proc_macro2::TokenStream = input.parse()?;
+            stereotype::parse_args(rest).map_err(|e| syn::Error::new(input.span(), e.message))?
+        } else {
+            StereotypeArgs::default()
+        };
+        Ok(RegisterComponent { ty, args })
     }
 }
 

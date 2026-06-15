@@ -92,16 +92,19 @@ fn the_joined_provider_resolves_a_dependent_beans_collaborator() {
 }
 
 #[test]
-fn a_component_with_no_pairing_is_a_loud_missing_seed_error() {
-    // A COMPONENTS row whose seed is NOT in the pairing table cannot be
-    // constructed — that is a loud error, never a silent skip.
-    let err = App::from_slices(&[]).expect_err("an empty pairing table leaves Widget unpaired");
-    // The diagnostic names the unpaired contract.
-    assert!(
-        err.to_string().to_lowercase().contains("seed")
-            || err.to_string().to_lowercase().contains("pairing"),
-        "got: {err}"
-    );
+fn the_macro_emitted_seeds_auto_collect_so_an_empty_pairing_table_still_lifts() {
+    // The macro emits each `#[component]`'s `ProviderSeed` into the link-collected
+    // SEED_PAIRINGS slice (Widget + Gadget here), and `from_slices` folds that slice
+    // as its JOIN base — so a binary that supplies NO explicit `pairings` still lifts
+    // every COMPONENTS row through its auto-collected seed (the maximal-magic channel).
+    // This is the behavior that lets leaf-boot drop the hand-written builtin pairing
+    // for the framework's own force-linked beans (e.g. the tokio executor).
+    let app = App::from_slices(&[]).expect("the auto-collected SEED_PAIRINGS base lifts every row");
+    let registry = app.into_builder().freeze().expect("freeze");
+    let engine = leaf_core::Engine::new(registry);
+    let widget = futures::executor::block_on(engine.get::<Widget>())
+        .expect("the slice-collected seed produces Widget with NO explicit pairing");
+    assert_eq!(widget.tag(), "widget");
 }
 
 #[test]

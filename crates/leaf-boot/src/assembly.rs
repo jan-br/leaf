@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use leaf_core::{
     collect_slice, CandidateRole, Cause, CondExpr, ContractId, Descriptor, ErrorKind, LeafError,
-    ProviderSeed, RegistryBuilder, AUTO_CONFIGS, COMPONENTS, GUARD_PAIRINGS,
+    ProviderSeed, RegistryBuilder, AUTO_CONFIGS, COMPONENTS, GUARD_PAIRINGS, SEED_PAIRINGS,
 };
 
 use crate::autoconfig::AutoConfigCandidate;
@@ -76,52 +76,56 @@ impl std::fmt::Debug for SeedPairing {
     }
 }
 
-/// The built-in framework pairings leaf-boot ALWAYS knows about — the seeds for
-/// the beans leaf-boot itself force-links.
+/// The link-collected base seed layer: every macro-emitted `__leaf_seed_<Ident>`
+/// auto-collected into the [`SEED_PAIRINGS`] distributed slice.
 ///
-/// leaf-boot force-links leaf-tokio by default (per TOPOLOGY), so leaf-tokio's
-/// `applicationTaskExecutor` `Descriptor` lands in [`COMPONENTS`]; leaf-boot owns
-/// the JOIN to leaf-tokio's [`ProviderSeed`] (`APPLICATION_TASK_EXECUTOR_SEED`) so
-/// the binary author never hand-writes the framework's own seed. Empty when the
-/// `tokio` feature is off (the embedder brings its own runtime + pairings).
-#[must_use]
-fn builtin_pairings() -> Vec<SeedPairing> {
-    #[cfg(feature = "tokio")]
-    {
-        vec![SeedPairing::new(
-            ContractId::of(leaf_tokio::APPLICATION_TASK_EXECUTOR_CONTRACT),
-            leaf_tokio::APPLICATION_TASK_EXECUTOR_SEED,
-        )]
-    }
-    #[cfg(not(feature = "tokio"))]
-    {
-        Vec::new()
-    }
-}
-
-/// Build the `ContractId → ProviderSeed` JOIN index from leaf-boot's built-in
-/// framework pairings (force-linked beans) + the binary's `pairings` (which win on a
-/// collision). A duplicate WITHIN the binary's own table is a loud build-seam error
-/// (a double-emitted `__leaf_seed_*`).
+/// This is the SAME maximal-magic channel a user `#[component]` force-links its seed
+/// through — including the framework's own force-linked beans (e.g. leaf-tokio's
+/// `applicationTaskExecutor`, a `#[component(role = "infrastructure")]` whose seed
+/// force-links here like any other bean). leaf-boot no longer hand-writes a special
+/// `builtin_pairings` JOIN for the runtime facility: the facility's seed rides this
+/// slice, so `from_slices` discovers it generically. The binary's explicit `pairings`
+/// arg OVERRIDES this base on a `ContractId` collision (the escape hatch).
+///
+/// A genuine double-emitted `__leaf_seed_*` (the SAME contract twice WITHIN the
+/// slice) is a loud build-seam error here.
 ///
 /// # Errors
-/// A [`LeafError`] (`ErrorKind::AntiDce`) if one contract has more than one
-/// non-built-in pairing.
+/// A [`LeafError`] (`ErrorKind::AntiDce`) if one contract appears more than once in
+/// the link-collected `SEED_PAIRINGS` slice (a double-emitted seed).
+fn slice_seed_index() -> Result<HashMap<ContractId, ProviderSeed>, LeafError> {
+    let rows = collect_slice(&SEED_PAIRINGS);
+    let mut seed_of: HashMap<ContractId, ProviderSeed> = HashMap::with_capacity(rows.len());
+    for row in rows {
+        if seed_of.insert(row.contract, row.seed).is_some() {
+            return Err(duplicate_pairing(row.contract));
+        }
+    }
+    Ok(seed_of)
+}
+
+/// Build the `ContractId → ProviderSeed` JOIN index from the link-collected
+/// [`SEED_PAIRINGS`] base layer (every force-linked bean's macro-emitted seed) +
+/// the binary's `pairings` (which win on a collision). A duplicate WITHIN the
+/// binary's own `pairings` table for a contract NOT already force-linked is a loud
+/// build-seam error (a double-emitted `__leaf_seed_*`).
+///
+/// # Errors
+/// A [`LeafError`] (`ErrorKind::AntiDce`) if a contract is double-emitted into
+/// `SEED_PAIRINGS`, or one contract has more than one non-base pairing in `pairings`.
 fn build_seed_index(
     pairings: &[SeedPairing],
 ) -> Result<HashMap<ContractId, ProviderSeed>, LeafError> {
-    let builtins = builtin_pairings();
-    let mut seed_of: HashMap<ContractId, ProviderSeed> =
-        HashMap::with_capacity(pairings.len() + builtins.len());
-    for p in &builtins {
-        seed_of.insert(p.contract, p.seed);
-    }
+    // The force-linked base: every `SEED_PAIRINGS` row (the auto-collect channel the
+    // run pipeline ALSO folds into its `self.seeds`, so an identical row here is an
+    // override, never a self-dup).
+    let mut seed_of = slice_seed_index()?;
     for p in pairings {
         // A duplicate pairing for one contract WITHIN the binary's own table is a
-        // loud build-seam error (a built-in is silently overridable, a self-dup is
-        // not — it signals a double-emitted `__leaf_seed_*`).
+        // loud build-seam error (a force-linked base row is silently overridable, a
+        // self-dup is not — it signals a double-emitted `__leaf_seed_*`).
         if seed_of.insert(p.contract, p.seed).is_some()
-            && !builtins.iter().any(|b| b.contract == p.contract)
+            && !slice_has_contract(p.contract)
         {
             return Err(duplicate_pairing(p.contract));
         }
@@ -129,11 +133,19 @@ fn build_seed_index(
     Ok(seed_of)
 }
 
+/// Whether the link-collected [`SEED_PAIRINGS`] base layer already carries a seed for
+/// `contract` (so an explicit `pairings` entry for it is an OVERRIDE, not a self-dup).
+fn slice_has_contract(contract: ContractId) -> bool {
+    collect_slice(&SEED_PAIRINGS)
+        .iter()
+        .any(|r| r.contract == contract)
+}
+
 /// Lift the link-collected [`COMPONENTS`] channel and JOIN each `Descriptor` to its
-/// [`ProviderSeed`] via `pairings` (plus leaf-boot's `builtin_pairings` for the
-/// framework beans it force-links), building the append-only [`RegistryBuilder`]
-/// (NOT yet frozen — the `App<Resolve>` assembly fixpoint runs
-/// conditions/exclusions/auto-config before `seal()`).
+/// [`ProviderSeed`] via `pairings` (plus the link-collected [`SEED_PAIRINGS`] base
+/// for every force-linked bean — including the framework's own runtime facility),
+/// building the append-only [`RegistryBuilder`] (NOT yet frozen — the `App<Resolve>`
+/// assembly fixpoint runs conditions/exclusions/auto-config before `seal()`).
 ///
 /// The [`AUTO_CONFIGS`] channel is deliberately NOT registered here: an auto-config
 /// is gated by the `exclude > back-off > default` ladder
@@ -185,7 +197,7 @@ pub fn from_slices(pairings: &[SeedPairing]) -> Result<RegistryBuilder, LeafErro
 
 /// Build the auto-config candidate set from the link-collected [`AUTO_CONFIGS`]
 /// channel, JOINing each `Descriptor` to its [`ProviderSeed`] (by `ContractId`, via
-/// `pairings` + leaf-boot's built-in framework pairings) and its back-off guard (by
+/// `pairings` + the link-collected [`SEED_PAIRINGS`] base) and its back-off guard (by
 /// `ContractId`, from the link-collected [`GUARD_PAIRINGS`]; `None` when the auto-config
 /// declares no `#[conditional]`).
 ///
@@ -335,38 +347,54 @@ mod tests {
     fn lifting_registers_only_the_components_channel() {
         // The lift registers ONLY the COMPONENTS channel through the one collect_slice
         // idiom (the AUTO_CONFIGS channel is held back for the ladder to gate); with
-        // leaf-boot's built-in pairings covering the framework beans it force-links
-        // (leaf-tokio's applicationTaskExecutor under the default `tokio` feature), the
-        // bare lift succeeds and the builder holds exactly one row per COMPONENTS
-        // descriptor — NOT the auto-configs.
-        let builder = from_slices(&[]).expect("the bare lift succeeds via built-in pairings");
+        // the link-collected SEED_PAIRINGS base covering every force-linked bean's seed
+        // (including leaf-tokio's applicationTaskExecutor under the default `tokio`
+        // feature), the bare lift succeeds and the builder holds exactly one row per
+        // COMPONENTS descriptor — NOT the auto-configs.
+        let builder = from_slices(&[]).expect("the bare lift succeeds via the SEED_PAIRINGS base");
         assert_eq!(builder.len(), COMPONENTS.len());
     }
 
     #[test]
     fn collect_candidates_is_total_over_the_auto_configs_channel() {
         // The run path builds one AutoConfigCandidate per AUTO_CONFIGS row (held back
-        // from from_slices); with the built-in pairings covering the force-linked
+        // from from_slices); with the SEED_PAIRINGS base covering the force-linked
         // framework beans, the bare collect succeeds and yields one candidate per row.
         let cands =
-            collect_autoconfig_candidates(&[]).expect("collect succeeds via built-in pairings");
+            collect_autoconfig_candidates(&[]).expect("collect succeeds via the SEED_PAIRINGS base");
         assert_eq!(cands.len(), AUTO_CONFIGS.len());
     }
 
     #[cfg(feature = "tokio")]
     #[test]
-    fn the_builtin_pairing_joins_leaf_tokios_force_linked_executor() {
+    fn the_force_linked_seed_joins_leaf_tokios_executor() {
         // leaf-boot force-links leaf-tokio by default, so its applicationTaskExecutor
-        // Descriptor is link-collected; leaf-boot's built-in pairing JOINs it to
-        // leaf-tokio's ProviderSeed with no binary-supplied entry. The lifted
-        // builder freezes + the executor resolves by its stable contract.
+        // `#[component(role = "infrastructure")]` Descriptor is link-collected into
+        // COMPONENTS AND its macro-emitted seed force-links into SEED_PAIRINGS — the
+        // SAME maximal-magic channel a user component uses. from_slices JOINs it from
+        // the slice with NO binary-supplied entry + NO hand-written builtin pairing.
+        // The lifted builder freezes + the executor resolves by its stable contract.
         let registry = from_slices(&[]).expect("lift").freeze().expect("freeze");
         let id = registry
             .by_contract(ContractId::of(leaf_tokio::APPLICATION_TASK_EXECUTOR_CONTRACT))
-            .expect("the force-linked executor is registered + JOINed to its seed");
+            .expect("the force-linked executor is registered + JOINed to its slice seed");
         assert_eq!(
             registry.descriptor(id).declared_name,
             Some("applicationTaskExecutor")
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn leaf_tokios_executor_seed_force_links_into_seed_pairings() {
+        // The proof the special case is GONE: the facility's seed is now in the
+        // link-collected SEED_PAIRINGS slice (force-linked by the macro), not a
+        // hand-written leaf-boot builtin pairing. So from_slices JOINs it like any
+        // user bean.
+        let contract = ContractId::of(leaf_tokio::APPLICATION_TASK_EXECUTOR_CONTRACT);
+        assert!(
+            collect_slice(&SEED_PAIRINGS).iter().any(|r| r.contract == contract),
+            "the applicationTaskExecutor seed must force-link into SEED_PAIRINGS"
         );
     }
 
