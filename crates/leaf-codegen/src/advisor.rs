@@ -237,6 +237,7 @@ pub fn emit_advisor(
         // (a dropped advisor is silently un-applied — the expected-vs-found
         // self-check catches it). The chain SORT is cmp_chain over the composite
         // ChainKey, never this slice's link order.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISORS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorRow = ::leaf_core::AdvisorRow {
@@ -292,6 +293,7 @@ pub fn emit_advisor_pairing(ident: &str, self_ty: &syn::Type, args: &AdvisorArgs
         // substrate) keyed by ContractId, so the run pipeline reifies it into an
         // AdvisorDescriptor with no hand-assembled `.with_advisors`. Same re-export
         // pattern as COMPONENTS.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #pairing_row_ident: ::leaf_core::AdvisorPairingRow =
@@ -425,6 +427,7 @@ pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]
         // Submit the spec into JOINPOINT_PAIRINGS (the auto-collect substrate) keyed
         // by ContractId, so the proxy-assembly pass finds it with no hand-assembled
         // `.with_join_points`. Same re-export pattern as COMPONENTS.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::JOINPOINT_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #spec_row_ident: ::leaf_core::JoinPointPairingRow =
@@ -563,6 +566,7 @@ pub fn emit_method_table(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec
         // Submit the table into METHOD_TABLE_PAIRINGS (the auto-collect substrate)
         // keyed by ContractId, so the auto-proxy install finds it with no
         // hand-assembled `.with_method_tables`. Same re-export pattern as COMPONENTS.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::METHOD_TABLE_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #table_row_ident: ::leaf_core::MethodTablePairingRow =

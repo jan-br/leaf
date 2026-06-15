@@ -520,6 +520,7 @@ fn emit_transactional(
         // classifier (the business `Err` → rollback decision), keyed by the bean's
         // concrete TypeId, at the pinned TX_ORDER (INSIDE cache). The contract is
         // per-method-unique (the row index merges by ContractId).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorPairingRow = ::leaf_core::AdvisorPairingRow {
@@ -618,6 +619,7 @@ fn emit_cache(
         // single-rule CacheInterceptor over the method's return `T` + the key fn,
         // keyed by the bean's TypeId at CACHE_ORDER (OUTSIDE tx). The contract is
         // per-method-unique so two cache methods on one bean do not collide.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorPairingRow = ::leaf_core::AdvisorPairingRow {
@@ -669,6 +671,7 @@ fn emit_validated(
         // The validation advisor auto-wire row: validate the single `@Valid` arg `A`
         // before the body (a bad arg short-circuits), keyed by the bean's TypeId at
         // VALIDATE_ORDER (OUTERMOST). The contract is per-method-unique.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorPairingRow = ::leaf_core::AdvisorPairingRow {
@@ -710,6 +713,7 @@ fn emit_retryable(
         // `max` attempts on a retryable error, with the `Result<T,_>` classifier so a
         // business `Err` drives the retry, keyed by the bean's TypeId at RETRY_ORDER.
         // The contract is per-method-unique.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorPairingRow = ::leaf_core::AdvisorPairingRow {
@@ -777,6 +781,7 @@ fn emit_concurrency_limit(
         // wrap it in a ConcurrencyLimitInterceptor, keyed by the bean's TypeId at
         // CONCURRENCY_ORDER (INSIDE tx — the permit is held only for the actual work).
         // The contract is per-method-unique.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorPairingRow = ::leaf_core::AdvisorPairingRow {

@@ -706,6 +706,7 @@ pub fn emit_guard(ident: &str, expr: &CondExpr) -> TokenStream {
         let row_ident = format_ident!("__LEAF_COND_{}_{}", mangled, i);
         let id = lower_condition_id(kind);
         anchors.push(quote! {
+            #[allow(non_upper_case_globals)]
             #[::leaf_core::linkme::distributed_slice(::leaf_core::CONDITIONS)]
             #[linkme(crate = ::leaf_core::linkme)]
             static #row_ident: ::leaf_core::ConditionRow = ::leaf_core::ConditionRow {
@@ -728,6 +729,7 @@ pub fn emit_guard(ident: &str, expr: &CondExpr) -> TokenStream {
         // Submit the guard into GUARD_PAIRINGS (the auto-collect substrate) keyed by
         // the gated element's ContractId — so leaf-boot's condition routing finds it
         // with no hand-assembled `.with_guards`. Same re-export pattern as COMPONENTS.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #guard_row_ident: ::leaf_core::GuardPairingRow = ::leaf_core::GuardPairingRow {
@@ -868,6 +870,7 @@ pub fn emit_import(ident: &str, imports: &[syn::Path]) -> TokenStream {
             ),
             to: &[ #(#to_contracts),* ],
         };
+        #[allow(non_snake_case)]
         #[allow(dead_code, clippy::let_unit_value)]
         fn #refs_ident() {
             #(#refs)*

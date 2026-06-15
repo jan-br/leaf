@@ -1,4 +1,6 @@
-/// A placed order. A plain domain value, not a bean.
+pub mod repository;
+pub mod service;
+
 #[derive(Debug, Clone)]
 pub struct Order {
     pub id: i64,

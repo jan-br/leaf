@@ -193,6 +193,7 @@ pub fn emit_scheduled(ident: &str, method: &str, spec: &ScheduleSpec) -> TokenSt
         // The cheap anti-DCE identity row in the frozen SCHEDULED slice via the
         // re-exported ::leaf_core::linkme attr path + crate override (so a
         // contributing crate needs no direct linkme dep).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SCHEDULED)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::ScheduledRow = #desc_ident.to_row();
@@ -308,6 +309,7 @@ pub fn emit_cacheable(ident: &str, method: &str, args: &CacheArgs) -> TokenStrea
         };
         // The cache advisor IDENTITY row in the frozen ADVISORS slice, pinned to the
         // CACHE_ORDER chain const (the cache interceptor is infrastructure advice).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISORS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorRow = ::leaf_core::AdvisorRow {
@@ -348,6 +350,7 @@ pub fn emit_resource(ident: &str, path: &str) -> TokenStream {
             bytes_fn: || ::core::include_bytes!(#path),
         };
         // The anti-DCE RESOURCES identity row (a dropped resource is silently absent).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::RESOURCES)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::ResourceRow = ::leaf_core::ResourceRow {
@@ -444,6 +447,7 @@ pub fn emit_catalog(ident: &str, args: &CatalogArgs) -> TokenStream {
             locales: &[ #(#locales),* ],
         };
         // The anti-DCE CATALOGS identity row.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::CATALOGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::CatalogRow = ::leaf_core::CatalogRow {

@@ -2,7 +2,7 @@ use leaf::prelude::*;
 
 use crate::catalog::catalog_service::CatalogService;
 use crate::orders::order::Order;
-use crate::orders::order_repository::OrderRepository;
+use crate::orders::repository::OrderRepository;
 use crate::platform::transaction_manager::LocalTransactionManager;
 
 /// A `@Component` injecting [`CatalogService`] + [`OrderRepository`] whose `place_order`

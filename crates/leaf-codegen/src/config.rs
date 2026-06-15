@@ -176,7 +176,9 @@ fn emit_schema(ident: &syn::Ident, fields: &[BindField]) -> TokenStream {
     });
 
     quote! {
+        #[allow(non_upper_case_globals)]
         static #fields_ident: &[::leaf_core::Field] = &[ #(#field_rows),* ];
+        #[allow(non_upper_case_globals)]
         static #schema_ident: ::leaf_core::NodeSchema = ::leaf_core::NodeSchema::Object {
             method: ::leaf_core::BindMethod::JavaBean,
             fields: #fields_ident,
@@ -408,6 +410,7 @@ pub fn emit_config_properties(
         #bind_thunk
 
         // ── the rich const ConfigGroup documenting the bound keys (leaf metadata) ──
+        #[allow(non_upper_case_globals)]
         static #props_ident: &[::leaf_core::Property] = &[ #(#property_rows),* ];
         #[allow(non_upper_case_globals)]
         pub const #group_ident: ::leaf_core::ConfigGroup = ::leaf_core::ConfigGroup {
@@ -424,6 +427,7 @@ pub fn emit_config_properties(
         // `#[linkme(crate = ::leaf_core::linkme)]` redirects linkme's runtime path,
         // so a contributing crate needs NO direct `linkme` dep (same pattern as
         // COMPONENTS).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::CONFIG_METADATA)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::ConfigMetadataRow = ::leaf_core::ConfigMetadataRow {
@@ -434,6 +438,7 @@ pub fn emit_config_properties(
         // ── the bind-thunk pairing on CONFIG_BIND_PAIRINGS (auto-collect substrate) ──
         // Submit the `__leaf_config_bind_<Ident>` thunk keyed by ContractId so the C2
         // validate sub-pass finds it with no hand-assembled `.with_config_properties`.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::CONFIG_BIND_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #bind_row_ident: ::leaf_core::ConfigBindPairingRow =
@@ -476,6 +481,7 @@ fn emit_config_bean_registration(
     quote! {
         // The config bean's flat AnnotationMetadata at CandidateRole::FALLBACK (the
         // auto-config soft override — a user bean of the same type wins).
+        #[allow(non_upper_case_globals)]
         static #meta_ident: ::leaf_core::AnnotationMetadata = ::leaf_core::AnnotationMetadata {
             qualifiers: &[],
             markers: &[],
@@ -525,6 +531,7 @@ fn emit_config_bean_registration(
 
         // The const Descriptor into the SEPARATE AUTO_CONFIGS slice (the config-properties
         // default lane — never COMPONENTS, so component-scanning never picks it up).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #desc_ident: ::leaf_core::Descriptor = ::leaf_core::Descriptor {
@@ -544,6 +551,7 @@ fn emit_config_bean_registration(
 
         // The seed pairing so from_slices JOINs the AUTO_CONFIGS row to its seed (the
         // anti-DCE per-bean JOIN — an unconstructible bean must never silently vanish).
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
@@ -677,6 +685,7 @@ pub fn emit_converter(ident: &str) -> TokenStream {
     let mangled = mangle(ident);
     let row_ident = format_ident!("__LEAF_CATALOG_{}", mangled);
     quote! {
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::CATALOGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::CatalogRow = ::leaf_core::CatalogRow {

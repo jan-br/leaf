@@ -207,6 +207,7 @@ pub fn emit_listener(ident: &str, args: &ListenerArgs) -> TokenStream {
         // slice (a dropped listener silently never fires — the expected-vs-found
         // self-check catches it). Dispatch ORDER is read via the one cmp_order,
         // never this slice's link order.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::EVENT_LISTENERS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::EventListenerRow = ::leaf_core::EventListenerRow {

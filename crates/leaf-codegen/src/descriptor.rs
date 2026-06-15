@@ -336,11 +336,14 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
 
     Ok(quote! {
         // ── the per-bean InjectionPlan (one const InjectionPoint per dependency) ──
+        #[allow(non_upper_case_globals)]
         const #points_ident: &[::leaf_core::InjectionPoint] = &[ #(#points),* ];
+        #[allow(non_upper_case_globals)]
         const #plan_ident: ::leaf_core::InjectionPlan =
             ::leaf_core::InjectionPlan { points: #points_ident };
 
         // ── the flattened const AnnotationMetadata (annotation-model owns this) ──
+        #[allow(non_upper_case_globals)]
         static #meta_ident: ::leaf_core::AnnotationMetadata = #meta;
 
         // ── the engine-resolvability marker: `Engine::get::<T>` requires
@@ -377,6 +380,7 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         // Descriptor→ProviderSeed/InjectionPlan pairing is completed by the
         // leaf-boot assembly pass; this unit emits the seed under the deterministic
         // public `__leaf_seed_<Ident>` name beside the row so that pass can pair them.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(#slice)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #desc_ident: ::leaf_core::Descriptor = ::leaf_core::Descriptor {
@@ -401,12 +405,14 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         // hand-assembled `.with_seeds`/`.with_injection_plans` required. Binding the
         // plan const through the row also keeps it from being DCE'd before the
         // assembly pass can read it.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
             contract: #contract,
             seed: #seed_ident,
         };
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
@@ -552,6 +558,7 @@ fn emit_provider(
     };
 
     quote! {
+        #[allow(non_camel_case_types)]
         struct #provider_ident;
         impl ::leaf_core::Provider for #provider_ident {
             fn descriptor(&self) -> &::leaf_core::Descriptor {

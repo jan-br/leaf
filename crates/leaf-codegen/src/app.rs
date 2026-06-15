@@ -292,6 +292,7 @@ pub fn emit_runner_upcast(ident: &str) -> TokenStream {
         // ContractId, so the run pipeline auto-collects the runner with no
         // hand-assembled `.with_runner_beans`. The order defaults to implicit
         // (declaration order); same re-export pattern as COMPONENTS.
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::RUNNER_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #upcast_row_ident: ::leaf_core::RunnerPairingRow = ::leaf_core::RunnerPairingRow {
@@ -324,6 +325,7 @@ pub fn emit_failure_analyzer(ident: &str) -> TokenStream {
         // silently never runs).
         #[allow(non_upper_case_globals)]
         static #instance_ident: #ty = #ty;
+        #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::FAILURE_ANALYZERS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: &dyn ::leaf_core::FailureAnalyzer = &#instance_ident;
