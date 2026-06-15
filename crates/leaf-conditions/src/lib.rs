@@ -15,9 +15,9 @@
 //! | member | tier | sub-phase | verdict source |
 //! |---|---|---|---|
 //! | [`OnProperty`](kinds::OnProperty) / [`OnBooleanProperty`](kinds::OnBooleanProperty) | Runtime | Parse | sealed `Env` |
-//! | [`OnExpression`](kinds::OnExpression) | Runtime | Parse | `Env` placeholder eval |
-//! | [`OnResource`](kinds::OnResource) | Runtime | Parse | filesystem / loader |
-//! | [`OnProfile`](kinds::OnProfile) (`ON_PROFILE`) | Runtime | Parse | sealed `ActiveProfiles` |
+//! | [`OnExpression`](kinds::OnExpression) | Runtime | Parse | `Env` `${}` / `ctx.expr` `#{}` |
+//! | [`OnResource`](kinds::OnResource) | Runtime | Parse | filesystem / `ctx.loader` |
+//! | [`OnProfile`](kinds::OnProfile) (`ON_PROFILE`) | Runtime | Parse | `ctx.profiles` |
 //! | [`OnBean`](kinds::OnBean) / [`OnMissingBean`](kinds::OnMissingBean) / [`OnSingleCandidate`](kinds::OnSingleCandidate) | Runtime | Register | [`DefinitionProbe`] |
 //! | [`OnRustVersion`](kinds::OnRustVersion) | ConstFold | (folded) | toolchain version |
 //!
@@ -31,15 +31,24 @@
 //! sub-passes. `OnClass`/`OnCapability` (Cfg tier) are compile-pruned `#[cfg]`
 //! leaves emitted by the macro, not runtime impls — out of this crate's scope.
 //!
-//! ## Probe + profile scopes (the honest leaf-boot bridge)
+//! ## The ctx fields + the residual leaf-boot probe bridge
 //!
-//! The frozen [`ConditionCtx`](leaf_core::ConditionCtx) carries only the sealed
-//! `&Env` + `&dyn ReportSink`; the `DefinitionProbe`/`ActiveProfiles` borrows are
-//! documented in leaf-core as deferred to later units. leaf-boot installs the
-//! per-assembly probe ([`probe::with_probe`]) and active set
-//! ([`profiles::with_active_profiles`]) into thin ambient scopes the OnBean /
-//! OnProfile impls read; both collapse to direct `ctx` field reads once the
-//! kernel ABI grows those fields. No global lock, single-threaded, cold.
+//! The [`ConditionCtx`](leaf_core::ConditionCtx) now carries the sealed
+//! `&ActiveProfiles` (`ctx.profiles`) plus the optional
+//! [`ExpressionEvaluator`](leaf_core::ExpressionEvaluator) (`ctx.expr`) and
+//! [`ResourceLoader`](leaf_core::ResourceLoader) (`ctx.loader`) borrows, in
+//! addition to the always-present `&Env` + `&dyn ReportSink`. `OnProfile` is
+//! fully live off `ctx.profiles` (no ambient thread-local). `OnExpression`'s
+//! `#{...}` form and `OnResource`'s `classpath:`/`url:` schemes read `ctx.expr` /
+//! `ctx.loader`: the scaffolding + the `None`-degradation are in place, but they
+//! only become USEFUL once leaf-boot installs a concrete evaluator / scheme-aware
+//! loader (a later ecosystem step).
+//!
+//! The `OnBean` family still reads the per-assembly probe
+//! ([`probe::with_probe`]) leaf-boot installs in a thin ambient scope (its
+//! `DefinitionProbe` borrow is the one ctx field not yet grown). No global lock,
+//! single-threaded, cold. `OnProfile` no longer needs an ambient scope — it reads
+//! the sealed active set straight off [`ConditionCtx::profiles`](leaf_core::ConditionCtx).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -62,10 +71,7 @@ mod test_support;
 
 pub use kinds::{catalog, resolve, OnBean, OnBooleanProperty, OnExpression, OnMissingBean, OnProfile, OnProperty, OnResource, OnRustVersion, OnSingleCandidate};
 pub use probe::{current_probe_query, has_probe, install_probe, with_probe, DefinitionProbe, ProbeScope};
-pub use profiles::{
-    accepts_profiles, current_active_profiles, install_active_profiles, matches, resolve_active,
-    with_active_profiles, ActiveProfilesScope,
-};
+pub use profiles::{accepts_profiles, matches, resolve_active};
 
 // Re-export the leaf-core verdict/profile types so downstream crates have one
 // import path for the family (they remain leaf-core's frozen definitions).

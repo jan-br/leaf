@@ -48,9 +48,10 @@
 //!   `leaf.enable-autoconfiguration` kill-switch.
 //!
 //! These wire up the cross-crate NOTEs the lower crates left: leaf-config's
-//! config-data load (driven in `seal_environment`), leaf-conditions'
-//! `with_probe`/`with_active_profiles` ambient bridges (driven in the Register
-//! sub-pass), and the macro-emitted `__leaf_guard_<Ident>` guard JOIN.
+//! config-data load (driven in `seal_environment`), leaf-conditions' `with_probe`
+//! ambient bridge for the `OnBean` family (driven in the Register sub-pass; the
+//! active profiles now ride `ConditionCtx::profiles` directly), and the
+//! macro-emitted `__leaf_guard_<Ident>` guard JOIN.
 //!
 //! ## Unit 3 — `seal()` + `App<Wired>::validate()` + the `WiringPlan`
 //!

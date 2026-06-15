@@ -37,8 +37,8 @@ use leaf_core::{
 };
 
 use leaf_conditions::{
-    resolve as resolve_condition, with_active_profiles, with_probe, ConditionKind, DefinitionProbe,
-    OnBean, OnMissingBean, OnSingleCandidate,
+    resolve as resolve_condition, with_probe, ConditionKind, DefinitionProbe, OnBean, OnMissingBean,
+    OnSingleCandidate,
 };
 
 /// The Register-phase kind ids (the `OnBean` family). A bare
@@ -149,10 +149,11 @@ fn is_unconditional(guard: &CondExpr) -> bool {
 /// recording the verdict class into `sink`.
 ///
 /// The resolver is leaf-conditions' catalog (the production path force-links the
-/// `CONDITIONS` channel; this drives the same impls). An `OnBean`-family leaf
-/// reads the ambient [`DefinitionProbe`](leaf_conditions::DefinitionProbe) /
-/// [`ActiveProfiles`] the caller installs
-/// for the Register sub-pass.
+/// `CONDITIONS` channel; this drives the same impls). `OnProfile` reads the
+/// sealed [`ActiveProfiles`] threaded onto the [`ConditionCtx`] via
+/// [`ConditionCtx::with_profiles`]; an `OnBean`-family leaf still reads the
+/// ambient [`DefinitionProbe`](leaf_conditions::DefinitionProbe) the caller
+/// installs for the Register sub-pass.
 ///
 /// # Errors
 /// A [`LeafError`] (`ConditionError`) iff a leaf's [`ConditionId`] is unresolved
@@ -163,6 +164,7 @@ fn evaluate_guard(
     pairing: &GuardPairing,
     env: &Env,
     sink: &dyn ReportSink,
+    profiles: &ActiveProfiles,
 ) -> Result<bool, LeafError> {
     let guard = pairing.guard;
 
@@ -176,7 +178,7 @@ fn evaluate_guard(
         return Ok(true);
     }
 
-    let ctx = ConditionCtx::new(env, sink);
+    let ctx = ConditionCtx::new(env, sink).with_profiles(profiles);
     let outcome = evaluate(guard, &ctx, &|id: ConditionId| resolve_condition(id))?;
 
     let class = if outcome.matched {
@@ -198,10 +200,11 @@ fn evaluate_guard(
     Ok(outcome.matched)
 }
 
-/// Evaluate ONE guard in the Register sub-pass with `probe` + `profiles`
-/// installed in the ambient scopes the `OnBean`-family / `OnProfile` impls read,
-/// recording the verdict into `sink`. The incremental [`run_autoconfig`] pass
-/// calls this per candidate so each guard sees the growing definition set.
+/// Evaluate ONE guard in the Register sub-pass with `probe` installed in the
+/// ambient scope the `OnBean`-family impls read and `profiles` threaded onto the
+/// [`ConditionCtx`] for `OnProfile`, recording the verdict into `sink`. The
+/// incremental [`run_autoconfig`] pass calls this per candidate so each guard
+/// sees the growing definition set.
 ///
 /// [`run_autoconfig`]: crate::run_autoconfig
 ///
@@ -214,9 +217,7 @@ pub(crate) fn evaluate_guard_in_register(
     profiles: &ActiveProfiles,
     probe: Arc<dyn DefinitionProbe>,
 ) -> Result<bool, LeafError> {
-    with_active_profiles(profiles.clone(), || {
-        with_probe(probe, || evaluate_guard(pairing, env, sink))
-    })
+    with_probe(probe, || evaluate_guard(pairing, env, sink, profiles))
 }
 
 /// A best-effort top-level leaf breakdown for the report (the full per-leaf
@@ -262,12 +263,23 @@ pub fn route_conditions(
     let mut matched: Vec<ContractId> = Vec::new();
 
     // ── Parse sub-pass: guards with no OnBean leaf (decide over the sealed Env) ─
-    // OnProfile leaves are Parse-phase too, so the active set must be installed
-    // for the whole route.
-    let parse_result = with_active_profiles(profiles.clone(), || {
+    // OnProfile leaves are Parse-phase too; they read the active set straight off
+    // the `ConditionCtx` (`evaluate_guard` threads `profiles` in).
+    for p in guards {
+        if guard_phase(p.guard) == SubPhase::Parse {
+            match evaluate_guard(p, env, &sink, profiles) {
+                Ok(true) => matched.push(p.contract),
+                Ok(false) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    // ── Register sub-pass: OnBean-family guards over the growing definition set ─
+    let register_result = with_probe(probe, || {
         for p in guards {
-            if guard_phase(p.guard) == SubPhase::Parse {
-                match evaluate_guard(p, env, &sink) {
+            if guard_phase(p.guard) == SubPhase::Register {
+                match evaluate_guard(p, env, &sink, profiles) {
                     Ok(true) => matched.push(p.contract),
                     Ok(false) => {}
                     Err(e) => return Err(e),
@@ -275,23 +287,6 @@ pub fn route_conditions(
             }
         }
         Ok(())
-    });
-    parse_result?;
-
-    // ── Register sub-pass: OnBean-family guards over the growing definition set ─
-    let register_result = with_active_profiles(profiles.clone(), || {
-        with_probe(probe, || {
-            for p in guards {
-                if guard_phase(p.guard) == SubPhase::Register {
-                    match evaluate_guard(p, env, &sink) {
-                        Ok(true) => matched.push(p.contract),
-                        Ok(false) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-            Ok(())
-        })
     });
     register_result?;
 

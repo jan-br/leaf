@@ -6,15 +6,16 @@
 //! kernel's pure `accepts_profiles` evaluator over the sealed `ActiveProfiles`.
 //!
 //! The sealed `ActiveProfiles` is produced by `resolve_active` inside
-//! `seal_environment` and lives on the `Env`. The frozen `ConditionCtx` does not
-//! yet expose it (deferred to the env/profiles seam), so the active set is read
-//! from the ambient profile scope leaf-boot installs alongside the probe scope.
-//! See [`crate::profiles`] for the install helpers.
+//! `seal_environment` and rides the `ConditionCtx` directly (`ctx.profiles`):
+//! leaf-boot threads the real active set in via
+//! [`ConditionCtx::with_profiles`](leaf_core::ConditionCtx::with_profiles). A ctx
+//! built with the 2-arg `new` carries the shared empty set
+//! ([`ActiveProfiles::empty`](leaf_core::ActiveProfiles::empty)) — the no-scope
+//! `{}` fallback. This impl no longer depends on any ambient thread-local.
 
 use leaf_core::{AttrSlice, Condition, ConditionCtx, ConditionOutcome, ReasonMsg};
 
 use crate::attrs;
-use crate::profiles::current_active_profiles;
 
 const EXPR: &str = "expr";
 
@@ -25,13 +26,13 @@ pub struct OnProfileCondition;
 pub static ON_PROFILE_COND: OnProfileCondition = OnProfileCondition;
 
 impl Condition for OnProfileCondition {
-    fn matches(&self, _ctx: &ConditionCtx<'_>, attrs: &AttrSlice) -> ConditionOutcome {
+    fn matches(&self, ctx: &ConditionCtx<'_>, attrs: &AttrSlice) -> ConditionOutcome {
         let Some(expr) = attrs::str_of(attrs, EXPR) else {
             // No expression: vacuously active (matches Spring's empty-@Profile).
             return ConditionOutcome::new(true, ReasonMsg::of("OnProfile"));
         };
-        let active = current_active_profiles();
-        match leaf_core::accepts_profiles(expr, &active) {
+        let active = ctx.profiles;
+        match leaf_core::accepts_profiles(expr, active) {
             Ok(matched) => ConditionOutcome::new(
                 matched,
                 ReasonMsg {
@@ -57,7 +58,7 @@ impl Condition for OnProfileCondition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::{resolve_active, with_active_profiles, ProfileLevers};
+    use crate::profiles::{resolve_active, ProfileLevers};
     use crate::test_support::{ctx_over, env_with};
     use leaf_core::Attr;
 
@@ -72,39 +73,58 @@ mod tests {
     #[test]
     fn matches_when_named_profile_is_active() {
         let env = env_with(&[]);
-        let (ctx, _s) = ctx_over(&env);
         let attrs: AttrSlice = &[Attr::Str(EXPR, "prod")];
-        with_active_profiles(active(&["prod"]), || {
-            assert!(ON_PROFILE_COND.matches(&ctx, &attrs).matched);
-        });
-        with_active_profiles(active(&["dev"]), || {
-            assert!(!ON_PROFILE_COND.matches(&ctx, &attrs).matched);
-        });
+
+        let (ctx, _s) = ctx_over(&env);
+        let on = active(&["prod"]);
+        assert!(ON_PROFILE_COND.matches(&ctx.with_profiles(&on), &attrs).matched);
+
+        let (ctx, _s) = ctx_over(&env);
+        let off = active(&["dev"]);
+        assert!(!ON_PROFILE_COND.matches(&ctx.with_profiles(&off), &attrs).matched);
     }
 
     #[test]
     fn evaluates_the_boolean_grammar() {
         let env = env_with(&[]);
-        let (ctx, _s) = ctx_over(&env);
         let attrs: AttrSlice = &[Attr::Str(EXPR, "prod & (eu | us)")];
-        with_active_profiles(active(&["prod", "eu"]), || {
-            assert!(ON_PROFILE_COND.matches(&ctx, &attrs).matched);
-        });
-        with_active_profiles(active(&["prod", "asia"]), || {
-            assert!(!ON_PROFILE_COND.matches(&ctx, &attrs).matched);
-        });
+
+        let (ctx, _s) = ctx_over(&env);
+        let on = active(&["prod", "eu"]);
+        assert!(ON_PROFILE_COND.matches(&ctx.with_profiles(&on), &attrs).matched);
+
+        let (ctx, _s) = ctx_over(&env);
+        let off = active(&["prod", "asia"]);
+        assert!(!ON_PROFILE_COND.matches(&ctx.with_profiles(&off), &attrs).matched);
     }
 
     #[test]
     fn negation_matches_absence() {
         let env = env_with(&[]);
-        let (ctx, _s) = ctx_over(&env);
         let attrs: AttrSlice = &[Attr::Str(EXPR, "!prod")];
-        with_active_profiles(active(&["dev"]), || {
-            assert!(ON_PROFILE_COND.matches(&ctx, &attrs).matched);
-        });
-        with_active_profiles(active(&["prod"]), || {
-            assert!(!ON_PROFILE_COND.matches(&ctx, &attrs).matched);
-        });
+
+        let (ctx, _s) = ctx_over(&env);
+        let on = active(&["dev"]);
+        assert!(ON_PROFILE_COND.matches(&ctx.with_profiles(&on), &attrs).matched);
+
+        let (ctx, _s) = ctx_over(&env);
+        let off = active(&["prod"]);
+        assert!(!ON_PROFILE_COND.matches(&ctx.with_profiles(&off), &attrs).matched);
+    }
+
+    #[test]
+    fn empty_default_profiles_make_a_named_profile_back_off() {
+        // The 2-arg ctx (no `.with_profiles`) carries the empty active set, so a
+        // named-profile guard backs off and a negation matches (the no-scope
+        // `{}` fallback, now read off the ctx instead of an ambient default).
+        let env = env_with(&[]);
+
+        let (ctx, _s) = ctx_over(&env);
+        let named: AttrSlice = &[Attr::Str(EXPR, "prod")];
+        assert!(!ON_PROFILE_COND.matches(&ctx, &named).matched);
+
+        let (ctx, _s) = ctx_over(&env);
+        let negated: AttrSlice = &[Attr::Str(EXPR, "!prod")];
+        assert!(ON_PROFILE_COND.matches(&ctx, &negated).matched);
     }
 }

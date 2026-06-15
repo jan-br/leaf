@@ -53,6 +53,7 @@ use std::sync::Arc;
 use crate::definition::CandidateRole;
 use crate::env::Env;
 use crate::error::{Cause, ErrorKind, LeafError};
+use crate::expr::{ExpressionEvaluator, ResourceLoader};
 use crate::identity::ContractId;
 
 // ─────────────────────────── tier-map kernel ABI ────────────────────────────
@@ -419,25 +420,72 @@ impl Resolvability {
 /// (conditional-strategy). A cheap borrow — NO `Arc`-per-condition, NO global
 /// lock.
 ///
-/// Scope note (this unit): the rich fields (`defs: &DefinitionView`,
+/// Carried borrows (all `'a`, all read-only):
+/// - `env` — the sealed environment snapshot (always present).
+/// - `report` — the passive accounting sink (always present).
+/// - `profiles` — the sealed [`ActiveProfiles`] (`OnProfile` reads it directly).
+///   Defaults to the shared empty set ([`ActiveProfiles::empty`]) when the 2-arg
+///   [`new`](ConditionCtx::new) is used, reproducing the no-scope `{}` semantics.
+/// - `expr` — an optional [`ExpressionEvaluator`] borrow (`OnExpression` routes a
+///   `#{...}` body through it; `None` degrades to an honest non-match).
+/// - `loader` — an optional [`ResourceLoader`] borrow (`OnResource` resolves
+///   `classpath:`/`url:` through it; `None` degrades to an honest miss).
+///
+/// Scope note (this unit): the remaining rich fields (`defs: &DefinitionView`,
 /// `probe: &DefinitionProbe`, `caps: &CapabilitySnapshot`) reference types owned
-/// by later registry/injection/discovery units. This is the minimal
-/// forward-compatible placeholder carrying the always-available sealed `&Env`
-/// and the `&dyn ReportSink`; it is `#[non_exhaustive]` so adding those borrows
-/// later is not a breaking change.
+/// by later registry/injection/discovery units. It stays `#[non_exhaustive]` so
+/// adding those borrows later is not a breaking change; the `expr`/`loader`
+/// optionals are scaffolding that only become USEFUL once leaf-boot installs a
+/// concrete evaluator / scheme-aware loader (a later ecosystem step).
 #[non_exhaustive]
 pub struct ConditionCtx<'a> {
     /// The sealed environment snapshot (Parse-tier leaves read it).
     pub env: &'a Env,
     /// The passive accounting sink the one eval path writes through.
     pub report: &'a dyn ReportSink,
+    /// The sealed active-profile set (`OnProfile` reads it directly).
+    pub profiles: &'a ActiveProfiles,
+    /// An optional expression evaluator (`OnExpression`'s `#{...}` form).
+    pub expr: Option<&'a dyn ExpressionEvaluator>,
+    /// An optional resource loader (`OnResource`'s `classpath:`/`url:` schemes).
+    pub loader: Option<&'a dyn ResourceLoader>,
 }
 
 impl<'a> ConditionCtx<'a> {
-    /// Build a context over a sealed `Env` and a report sink.
+    /// Build a context over a sealed `Env` and a report sink. `profiles` defaults
+    /// to the shared empty set; `expr`/`loader` default to `None` — together
+    /// reproducing today's no-scope behaviour for every existing call site.
     #[must_use]
     pub fn new(env: &'a Env, report: &'a dyn ReportSink) -> Self {
-        ConditionCtx { env, report }
+        ConditionCtx {
+            env,
+            report,
+            profiles: ActiveProfiles::empty(),
+            expr: None,
+            loader: None,
+        }
+    }
+
+    /// Attach the sealed [`ActiveProfiles`] (the builder leaf-boot threads the
+    /// real active set through).
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: &'a ActiveProfiles) -> Self {
+        self.profiles = profiles;
+        self
+    }
+
+    /// Attach an [`ExpressionEvaluator`] borrow for `#{...}` evaluation.
+    #[must_use]
+    pub fn with_expr(mut self, expr: &'a dyn ExpressionEvaluator) -> Self {
+        self.expr = Some(expr);
+        self
+    }
+
+    /// Attach a [`ResourceLoader`] borrow for `classpath:`/`url:` resolution.
+    #[must_use]
+    pub fn with_loader(mut self, loader: &'a dyn ResourceLoader) -> Self {
+        self.loader = Some(loader);
+        self
     }
 }
 
@@ -723,6 +771,16 @@ pub struct ActiveProfiles {
 }
 
 impl ActiveProfiles {
+    /// A borrow of the shared empty active set (nothing active). The default
+    /// [`ConditionCtx::new`] borrows this so a context built without explicit
+    /// profiles reproduces the no-scope `{}` semantics.
+    #[must_use]
+    pub fn empty() -> &'static ActiveProfiles {
+        static EMPTY: std::sync::LazyLock<ActiveProfiles> =
+            std::sync::LazyLock::new(ActiveProfiles::default);
+        &EMPTY
+    }
+
     /// `true` iff `name` is in the active set.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
@@ -1373,6 +1431,33 @@ mod tests {
             leaves: Box::new([]),
         });
         assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    // ── ConditionCtx grown fields (profiles / expr / loader) ─────────────────
+
+    #[test]
+    fn ctx_new_defaults_profiles_to_empty_and_optionals_to_none() {
+        // The 2-arg `new` still compiles and yields an empty active set + no
+        // optional borrows (reproduces today's behaviour for every call site).
+        let env = empty_env();
+        let sink = NoopReportSink;
+        let ctx = ConditionCtx::new(&env, &sink);
+        assert!(ctx.profiles.is_empty(), "default profiles are empty");
+        assert!(ctx.expr.is_none(), "no evaluator by default");
+        assert!(ctx.loader.is_none(), "no loader by default");
+    }
+
+    #[test]
+    fn ctx_with_profiles_exposes_the_active_set() {
+        // The grown ctx carries the sealed ActiveProfiles for OnProfile to read
+        // directly (no ambient thread-local).
+        let env = empty_env();
+        let sink = NoopReportSink;
+        let active = active(&["prod", "eu"]);
+        let ctx = ConditionCtx::new(&env, &sink).with_profiles(&active);
+        assert!(ctx.profiles.contains("prod"));
+        assert!(ctx.profiles.contains("eu"));
+        assert!(!ctx.profiles.contains("dev"));
     }
 
     // ── auto-config metamodel additions ──────────────────────────────────────

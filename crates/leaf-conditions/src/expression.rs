@@ -8,11 +8,13 @@
 //! `"${some.flag}"` — the overwhelmingly common `@ConditionalOnExpression` shape
 //! — by resolving `${...}` against the `Env` and reading the result's truthiness.
 //!
-//! NOTE: the full SpEL-analogue arbitrary-expression engine is leaf-aop-expr's
-//! `ExpressionEvaluator`; wiring a `CondExprFn` through the `ConditionCtx` is
-//! deferred to leaf-boot (the ctx does not yet carry an evaluator borrow). The
-//! placeholder form covers the property-driven gating this crate is responsible
-//! for without pulling the expression engine into the conditions DAG layer.
+//! The full SpEL-analogue `#{...}` form rides the optional
+//! [`ExpressionEvaluator`](leaf_core::ExpressionEvaluator) borrow now carried on
+//! the `ConditionCtx` (`ctx.expr`): a whole-string `#{...}` body is evaluated
+//! through it and its result coerced to truthiness. The scaffolding + the
+//! `None`-degradation are in place; it only becomes USEFUL once leaf-boot
+//! installs a concrete evaluator (a later ecosystem step). Until then a `#{...}`
+//! body with no evaluator degrades to an honest non-match — never a false pass.
 
 use leaf_core::{AttrSlice, Condition, ConditionCtx, ConditionOutcome, PropertyResolver, ReasonMsg};
 
@@ -31,7 +33,46 @@ impl Condition for OnExpressionCondition {
         let Some(raw) = attrs::str_of(attrs, EXPR) else {
             return ConditionOutcome::new(false, ReasonMsg::of("OnExpression"));
         };
-        // Resolve any `${...}` placeholders against the sealed Env (lenient).
+        let trimmed = raw.trim();
+
+        // `#{...}` form: full expression evaluation rides `ctx.expr`. When an
+        // evaluator is installed, evaluate the inner body and coerce truthiness;
+        // when it is absent, degrade to an honest non-match (never a false pass).
+        if let Some(body) = hash_body(trimmed) {
+            let Some(evaluator) = ctx.expr else {
+                return ConditionOutcome::new(
+                    false,
+                    ReasonMsg {
+                        kind: "OnExpression",
+                        expected: Some("truthy".to_string()),
+                        found: Some("no expression evaluator installed".to_string()),
+                        gate: None,
+                    },
+                );
+            };
+            return match evaluator.eval(body) {
+                Ok(value) => ConditionOutcome::new(
+                    is_truthy(value.trim()),
+                    ReasonMsg {
+                        kind: "OnExpression",
+                        expected: Some("truthy".to_string()),
+                        found: Some(value),
+                        gate: None,
+                    },
+                ),
+                Err(e) => ConditionOutcome::new(
+                    false,
+                    ReasonMsg {
+                        kind: "OnExpression",
+                        expected: Some("truthy".to_string()),
+                        found: Some(format!("eval error: {e}")),
+                        gate: None,
+                    },
+                ),
+            };
+        }
+
+        // `${...}` placeholder fast-path: resolve against the sealed Env (lenient).
         let resolved = ctx.env.resolve_placeholders(raw);
         let matched = is_truthy(resolved.trim());
         ConditionOutcome::new(
@@ -44,6 +85,13 @@ impl Condition for OnExpressionCondition {
             },
         )
     }
+}
+
+/// The inner body of a whole-string `#{...}` expression, or `None` if `s` is not
+/// exactly one `#{...}` form (a placeholder `${...}` / bare literal stays on the
+/// `Env` fast-path).
+fn hash_body(s: &str) -> Option<&str> {
+    s.strip_prefix("#{").and_then(|rest| rest.strip_suffix('}'))
 }
 
 /// Boolean coercion: `true`/`1`/`yes`/`on` (case-insensitive) are truthy; an
@@ -59,7 +107,17 @@ fn is_truthy(s: &str) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::{ctx_over, env_with};
-    use leaf_core::Attr;
+    use leaf_core::{Attr, ExpressionEvaluator, LeafError};
+
+    // A toy evaluator: it returns the body verbatim, so `#{true}` evaluates to
+    // "true" (truthy) and `#{false}` to "false" (falsy). Mirrors the cfg(test)
+    // `UpcaseEval` seam-prover in leaf-core's placeholder module.
+    struct EchoEval;
+    impl ExpressionEvaluator for EchoEval {
+        fn eval(&self, body: &str) -> Result<String, LeafError> {
+            Ok(body.to_string())
+        }
+    }
 
     #[test]
     fn truthy_literal_matches() {
@@ -84,6 +142,31 @@ mod tests {
         let env = env_with(&[]);
         let (ctx, _s) = ctx_over(&env);
         let attrs: AttrSlice = &[Attr::Str(EXPR, "${missing.flag}")];
+        assert!(!ON_EXPRESSION.matches(&ctx, &attrs).matched);
+    }
+
+    #[test]
+    fn hash_expression_evaluates_through_the_evaluator_when_present() {
+        let env = env_with(&[]);
+        let eval = EchoEval;
+        let (ctx, _s) = ctx_over(&env);
+        let ctx = ctx.with_expr(&eval);
+        let truthy: AttrSlice = &[Attr::Str(EXPR, "#{true}")];
+        assert!(ON_EXPRESSION.matches(&ctx, &truthy).matched);
+
+        let (ctx, _s) = ctx_over(&env);
+        let ctx = ctx.with_expr(&eval);
+        let falsy: AttrSlice = &[Attr::Str(EXPR, "#{false}")];
+        assert!(!ON_EXPRESSION.matches(&ctx, &falsy).matched);
+    }
+
+    #[test]
+    fn hash_expression_without_an_evaluator_is_an_honest_non_match() {
+        // No `ctx.expr` installed: a `#{...}` body cannot be decided, so it
+        // degrades to a non-match (never a false positive).
+        let env = env_with(&[]);
+        let (ctx, _s) = ctx_over(&env);
+        let attrs: AttrSlice = &[Attr::Str(EXPR, "#{true}")];
         assert!(!ON_EXPRESSION.matches(&ctx, &attrs).matched);
     }
 }

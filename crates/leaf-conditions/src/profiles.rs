@@ -5,10 +5,9 @@
 //! activation algebra ([`resolve_active`]), the pure evaluator ([`matches`] over
 //! `& | !`), and the runtime-string escape hatch ([`accepts_profiles`]) all live
 //! in leaf-core (frozen ABI); this module RE-EXPORTS them as the leaf-conditions
-//! surface and adds the ambient `ActiveProfiles` scope the `OnProfile` runtime
-//! impl reads (until the kernel `ConditionCtx` exposes the sealed set directly).
-
-use std::cell::RefCell;
+//! surface. The `OnProfile` runtime impl reads the sealed active set directly off
+//! [`ConditionCtx::profiles`](leaf_core::ConditionCtx) (leaf-boot threads it in),
+//! so no ambient `ActiveProfiles` thread-local scope is needed.
 
 pub use leaf_core::{
     accepts_profiles, resolve_active, ActivationReason, ActiveProfiles, ProfileError, ProfileExpr,
@@ -18,42 +17,6 @@ pub use leaf_core::{
 // root (the bare name `matches` collides with `Condition::matches`); we surface
 // it under the conventional `matches` name for the profiles module.
 pub use leaf_core::profile_matches as matches;
-
-thread_local! {
-    static ACTIVE: RefCell<Option<ActiveProfiles>> = const { RefCell::new(None) };
-}
-
-/// A scope guard restoring the previous ambient `ActiveProfiles` on drop.
-#[must_use = "dropping the guard immediately uninstalls the active set"]
-pub struct ActiveProfilesScope {
-    prev: Option<ActiveProfiles>,
-}
-
-impl Drop for ActiveProfilesScope {
-    fn drop(&mut self) {
-        ACTIVE.with(|c| *c.borrow_mut() = self.prev.take());
-    }
-}
-
-/// Install the sealed `ActiveProfiles` for the `OnProfile` evaluations inside the
-/// scope (leaf-boot installs it alongside the probe scope in App<Resolve>).
-pub fn install_active_profiles(active: ActiveProfiles) -> ActiveProfilesScope {
-    let prev = ACTIVE.with(|c| c.borrow_mut().replace(active));
-    ActiveProfilesScope { prev }
-}
-
-/// Run `f` with `active` installed as the ambient active-profile set.
-pub fn with_active_profiles<R>(active: ActiveProfiles, f: impl FnOnce() -> R) -> R {
-    let _scope = install_active_profiles(active);
-    f()
-}
-
-/// The ambient active-profile set, or the empty set (no scope installed →
-/// `{default}` semantics resolve to "nothing active").
-#[must_use]
-pub fn current_active_profiles() -> ActiveProfiles {
-    ACTIVE.with(|c| c.borrow().clone().unwrap_or_default())
-}
 
 #[cfg(test)]
 mod tests {
@@ -97,16 +60,6 @@ mod tests {
         assert!(matches(&or, &resolved));
         assert!(matches(&not, &resolved));
         assert!(!matches(&ProfileExpr::Name("z"), &resolved));
-    }
-
-    #[test]
-    fn ambient_scope_installs_and_restores() {
-        assert!(current_active_profiles().is_empty());
-        let resolved = resolve_active(levers(&["prod"]), false).unwrap();
-        with_active_profiles(resolved, || {
-            assert!(current_active_profiles().contains("prod"));
-        });
-        assert!(current_active_profiles().is_empty());
     }
 
     #[test]
