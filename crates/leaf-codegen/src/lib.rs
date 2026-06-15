@@ -17,6 +17,11 @@
 //! - [`stereotype`] — the `@component`/`@service`/… vocabulary as DATA + the
 //!   `syn::ItemStruct` → `descriptor::BeanInput` lowering the thin stereotype
 //!   macros call (component-stereotypes).
+//! - [`config_impl`] — the IMPL-BLOCK lowering for `#[configuration] impl Cfg {
+//!   #[bean] fn .. }` (one Descriptor per `@bean` method, config-receiver-threaded)
+//!   and `#[aspect] impl A { #[advice] fn .. }` (one AdvisorRow per advice method),
+//!   the design's Rust-idiomatic answer to "an attr-on-method can't emit sibling
+//!   rows" (configuration-classes phase3/05; aspect-model phase3/08+09).
 //! - [`forcelink`] — the build.rs anti-DCE emitters: the Layer-0 force-link shim
 //!   (`use <crate> as _;`) + the const `ExpectedManifest` self-check anchor.
 //! - [`constfold`] — the build-time `CondExpr` ConstFold folder + the deferred
@@ -43,6 +48,7 @@ pub mod app;
 pub mod cargo_leaf;
 pub mod conditional;
 pub mod config;
+pub mod config_impl;
 pub mod constfold;
 pub mod descriptor;
 pub mod forcelink;

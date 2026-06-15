@@ -13,8 +13,13 @@ fn ui() {
     t.compile_fail("tests/ui/generic_component_is_a_hard_error.rs");
     // A generic @bean factory has no single concrete product type — same hard error.
     t.compile_fail("tests/ui/generic_bean_factory_is_a_hard_error.rs");
-    // The @bean-on-a-method (`self` receiver) form is deferred in v1 — a loud error.
+    // A BARE @bean with a `self` receiver (outside a `#[configuration] impl`) is a
+    // loud error steering to the impl-block form (an attr on a single method cannot
+    // emit the sibling row). The WORKING impl-block form is in `config_impl_app.rs`.
     t.compile_fail("tests/ui/bean_with_self_receiver_is_deferred.rs");
+    // An intra-config #[bean]->#[bean] self-call is the lite-mode footgun — a loud
+    // compile_error! with a `take it as a parameter instead` rewrite hint.
+    t.compile_fail("tests/ui/config_bean_self_call_is_a_hard_error.rs");
     // The stereotype attribute schema is closed (`name`/`scope` only).
     t.compile_fail("tests/ui/unknown_stereotype_arg_is_a_hard_error.rs");
     // The condition DSL vocabulary is closed — an unknown leaf kind hard-errors.

@@ -373,11 +373,13 @@ pub fn emit_config_properties(
         };
 
         // ── the minimal ConfigMetadataRow anti-DCE anchor on CONFIG_METADATA ──
-        // NOTE (cross-crate, frozen leaf-core): the `#[distributed_slice]` ATTRIBUTE
-        // resolves the bare `linkme` crate at the contributing crate's root, so the
-        // attr uses `::linkme::distributed_slice` while the SLICE stays the absolute
-        // `::leaf_core::CONFIG_METADATA` (same hard linkme constraint as COMPONENTS).
-        #[::linkme::distributed_slice(::leaf_core::CONFIG_METADATA)]
+        // CROSS-CRATE re-export: the attr is named through leaf-core's
+        // `pub use linkme;` as `::leaf_core::linkme::distributed_slice` and
+        // `#[linkme(crate = ::leaf_core::linkme)]` redirects linkme's runtime path,
+        // so a contributing crate needs NO direct `linkme` dep (same pattern as
+        // COMPONENTS).
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::CONFIG_METADATA)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::ConfigMetadataRow = ::leaf_core::ConfigMetadataRow {
             contract: #contract,
             prefix: #prefix,
@@ -417,7 +419,8 @@ pub fn emit_converter(ident: &str) -> TokenStream {
     let mangled = mangle(ident);
     let row_ident = format_ident!("__LEAF_CATALOG_{}", mangled);
     quote! {
-        #[::linkme::distributed_slice(::leaf_core::CATALOGS)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::CATALOGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::CatalogRow = ::leaf_core::CatalogRow {
             contract: ::leaf_core::ContractId::of(
                 ::core::concat!(::core::module_path!(), "::", #ident)
@@ -562,7 +565,7 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::CONFIG_METADATA)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::CONFIG_METADATA)]"),
             "got: {s}"
         );
         assert!(s.contains("::leaf_core::ConfigMetadataRow"), "got: {s}");
@@ -628,7 +631,7 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::CATALOGS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::CATALOGS)]"),
             "got: {s}"
         );
         assert!(s.contains("::leaf_core::CatalogRow"), "got: {s}");

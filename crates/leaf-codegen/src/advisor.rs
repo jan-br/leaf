@@ -237,7 +237,8 @@ pub fn emit_advisor(
         // (a dropped advisor is silently un-applied — the expected-vs-found
         // self-check catches it). The chain SORT is cmp_chain over the composite
         // ChainKey, never this slice's link order.
-        #[::linkme::distributed_slice(::leaf_core::ADVISORS)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISORS)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorRow = ::leaf_core::AdvisorRow {
             contract: #contract,
             order: #order_ident,
@@ -319,16 +320,18 @@ mod tests {
     #[test]
     fn emits_an_absolute_core_advisor_row_into_the_advisors_slice() {
         // The headline: an aspect lowers to one const ::leaf_core::AdvisorRow
-        // submitted into the frozen ADVISORS slice via the bare ::linkme attr path
-        // (the only form that resolves), the SLICE absolute ::leaf_core::ADVISORS.
+        // submitted into the frozen ADVISORS slice via the re-exported
+        // ::leaf_core::linkme attr path + crate override, the SLICE absolute
+        // ::leaf_core::ADVISORS.
         let ts = emit_advisor("TxAspect", AdviceKind::Around, &AdvisorArgs::default(), false)
             .expect("a concrete aspect emits");
         syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::ADVISORS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISORS)]"),
             "got: {s}"
         );
+        assert!(s.contains("#[linkme(crate=::leaf_core::linkme)]"), "got: {s}");
         assert!(s.contains("::leaf_core::AdvisorRow{"), "got: {s}");
     }
 

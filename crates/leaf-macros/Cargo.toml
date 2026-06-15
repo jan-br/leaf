@@ -17,12 +17,14 @@ quote.workspace = true
 proc-macro2.workspace = true
 
 # dev-deps: the integration tests are real crates that put the macros on sample
-# types and assert the macro->leaf_core roundtrip through the frozen ABI. `linkme`
-# is a direct dep because the `#[distributed_slice]` ATTRIBUTE macro resolves the
-# bare `linkme` crate at the contributing crate's root (a hard linkme constraint —
-# see the roundtrip test NOTE); `futures` drives the cold async resolution.
+# types and assert the macro->leaf_core roundtrip through the frozen ABI. NOTE the
+# DELIBERATE ABSENCE of a `linkme` dep here — that is the proof gate: a crate using
+# `#[component]`/`#[bean]`/... needs ONLY leaf-core + leaf-macros. The macros emit
+# `#[::leaf_core::linkme::distributed_slice(SLICE)]` + `#[linkme(crate =
+# ::leaf_core::linkme)]` so both the attribute macro AND linkme's runtime types
+# resolve through leaf-core's `pub use linkme;` re-export. `futures` drives the
+# cold async resolution.
 [dev-dependencies]
 leaf-core.workspace = true
-linkme.workspace = true
 futures.workspace = true
 trybuild.workspace = true

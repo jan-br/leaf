@@ -18,11 +18,14 @@
 //! the thin [`crate::descriptor::BeanInput`] model the macro parses with `syn`.
 //!
 //! The `Descriptor`/`ProviderSeed`/`InjectionPlan`/`AnnotationMetadata`/`Provider`
-//! values are all absolute-`::leaf_core`-pathed const data; the only NON-leaf_core
-//! path the emitted artifact contains is the bare `::linkme::distributed_slice`
-//! ATTRIBUTE (the slice it targets is still `::leaf_core::COMPONENTS`) — a hard
-//! linkme constraint documented at the emission site. The bean is also opted into
-//! the engine-resolution seam via an emitted `impl ::leaf_core::Bean for Ty {}`.
+//! values are ALL absolute-`::leaf_core`-pathed const data — including the
+//! distributed-slice attribute, which is named through leaf-core's `pub use linkme;`
+//! re-export as `::leaf_core::linkme::distributed_slice` plus a `#[linkme(crate =
+//! ::leaf_core::linkme)]` override so linkme's runtime types resolve there too.
+//! The emitted artifact therefore contains ZERO non-`::leaf_core` paths, so a
+//! contributing crate needs only a `leaf-core` dep (no direct `linkme`). The bean
+//! is also opted into the engine-resolution seam via an emitted
+//! `impl ::leaf_core::Bean for Ty {}`.
 //!
 //! ## The seams the emitted const row crosses
 //!
@@ -202,6 +205,14 @@ pub struct BeanInput {
     /// `#path(args)` — the SAME const row shape, one seed type, just a different
     /// construction recipe.
     pub ctor: Option<syn::Path>,
+    /// The CONFIGURATION-CLASS receiver type a `@bean` METHOD is called on. When
+    /// `Some(Cfg)`, the generated provider resolves the config bean `Cfg` first
+    /// (through the one `Engine::get` seam, so a `&self` method reads the managed
+    /// config singleton) and invokes [`ctor`](Self::ctor) as a METHOD on it
+    /// (`__recv.method(args)`) — the design's lite-only `#[configuration] impl Cfg {
+    /// #[bean] fn .. }` shape (configuration-classes, phase3/05). `None` is the
+    /// free-fn / inherent-`new` path. One Descriptor per method, no second seed type.
+    pub receiver_ty: Option<Type>,
     /// `true` iff the target is generic (a hard error — see [`EmitError`]).
     pub is_generic: bool,
     /// Which distributed slice the const `Descriptor` row is submitted into
@@ -226,6 +237,7 @@ impl BeanInput {
             provides: Vec::new(),
             meta: MergedAnnotation::default(),
             ctor: None,
+            receiver_ty: None,
             is_generic: false,
             slice: Slice::default(),
         }
@@ -305,8 +317,14 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
     let desc_ident = format_ident!("__LEAF_DESCRIPTOR_{}", mangled);
 
     let points = emit_injection_points(&input.deps);
-    let provider_impl =
-        emit_provider(self_ty, input.ctor.as_ref(), &input.deps, &provider_ident, &desc_ident);
+    let provider_impl = emit_provider(
+        self_ty,
+        input.ctor.as_ref(),
+        input.receiver_ty.as_ref(),
+        &input.deps,
+        &provider_ident,
+        &desc_ident,
+    );
     let slice = input.slice.tokens();
 
     Ok(quote! {
@@ -330,23 +348,26 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
             || ::std::sync::Arc::new(#provider_ident);
 
         // ── the const Descriptor row, submitted into the COMPONENTS slice ──
-        // NOTE (cross-crate, frozen leaf-core): the `#[distributed_slice]` ATTRIBUTE
-        // macro resolves the bare `linkme` crate at the CONTRIBUTING crate's root
-        // (a hard linkme constraint — verified empirically against real leaf-core:
-        // neither `::leaf_core::linkme::distributed_slice` nor a `use`-imported
-        // re-export resolves as an attribute path; only a bare `::linkme::…` does).
-        // So the attr uses `::linkme::distributed_slice` while the SLICE stays the
-        // absolute `::leaf_core::COMPONENTS`; a contributing crate carries its own
-        // `linkme` dep. Shipping `pub extern crate linkme;` from leaf-core (or
-        // re-exporting the attribute macro) would let the leaf-core-only path
-        // resolve; that is a one-line frozen-leaf-core change out of this unit's
-        // scope.
+        // CROSS-CRATE re-export (verified empirically against real leaf-core, NO
+        // direct linkme dep in the contributing crate): the row reaches the slice
+        // through leaf-core's `pub use linkme;` via TWO cooperating pieces —
+        //   1. the attribute macro is named by its fully-qualified re-export path
+        //      `#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]`
+        //      (a proc-macro attribute DOES resolve by absolute path on stable), and
+        //   2. `#[linkme(crate = ::leaf_core::linkme)]` overrides linkme's default
+        //      `::linkme` so its runtime types (`DistributedSlice`, the `__private`
+        //      module, `Void`) also resolve through the re-export.
+        // Piece 2 is load-bearing: without it the element expansion emits a bare
+        // `::linkme::…` runtime path → `E0433: cannot find linkme in the crate root`
+        // (the exact failure that made a prior pass believe the re-export "does not
+        // resolve"). With both, a contributing crate needs ONLY a `leaf-core` dep.
         // NOTE: the frozen `::leaf_core::COMPONENTS` slice carries a bare
         // `Descriptor` (no `seed`/`plan` link on the frozen row), so the
         // Descriptor→ProviderSeed/InjectionPlan pairing is completed by the
         // leaf-boot assembly pass; this unit emits the seed under the deterministic
         // public `__leaf_seed_<Ident>` name beside the row so that pass can pair them.
-        #[::linkme::distributed_slice(#slice)]
+        #[::leaf_core::linkme::distributed_slice(#slice)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #desc_ident: ::leaf_core::Descriptor = ::leaf_core::Descriptor {
             contract: #contract,
             self_type: #self_type,
@@ -397,6 +418,23 @@ fn type_id_of(ty: &Type) -> TokenStream {
     quote! { const { ::core::any::TypeId::of::<#ty>() } }
 }
 
+/// The bean type a field/param of type `ty` injects: `Ref<T>` → `T` (the field
+/// stores the shared handle; the provider resolves `T` and threads the `Ref<T>` in),
+/// any other type → itself. Shared by the struct-field, free-fn-param, and
+/// `#[configuration]`-method-param lowerings so the Ref-stripping rule is one place.
+#[must_use]
+pub fn produced_ty(ty: &Type) -> Type {
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Ref"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return inner.clone();
+    }
+    ty.clone()
+}
+
 /// Lower the constructor's dependencies to const `::leaf_core::InjectionPoint`
 /// rows (one per dependency — `single(produced, name)`, by-type by default).
 fn emit_injection_points(deps: &[Dependency]) -> Vec<TokenStream> {
@@ -442,6 +480,7 @@ fn emit_provides(provides: &[ServiceView]) -> TokenStream {
 fn emit_provider(
     self_ty: &Type,
     ctor: Option<&syn::Path>,
+    receiver_ty: Option<&Type>,
     deps: &[Dependency],
     provider_ident: &syn::Ident,
     desc_ident: &syn::Ident,
@@ -459,14 +498,28 @@ fn emit_provider(
         let local = format_ident!("__dep_{}", dep.name);
         quote! { #local }
     });
-    // The construction recipe: a free factory-fn path (`#[bean]`) or the inherent
-    // associated `new`. The latter uses the ANGLE-BRACKET-QUALIFIED `<Ty>::new(...)`
-    // form so it is valid in expression position for ANY type — including a generic
-    // concrete `register_component!(Repo<u32>)`, where a bare `Repo<u32>::new()`
-    // would mis-parse as a chained comparison.
-    let construct = match ctor {
-        Some(path) => quote! { #path( #(#args),* ) },
-        None => quote! { <#self_ty>::new( #(#args),* ) },
+    // The construction recipe, one of three shapes (all ONE Descriptor row / one
+    // seed type — only the recipe differs):
+    //   * a CONFIGURATION-CLASS `@bean` METHOD (`receiver_ty = Some(Cfg)`): resolve
+    //     the config bean `Cfg` through the same `Engine::get` seam (so a `&self`
+    //     method reads the MANAGED config singleton — singleton-correct by
+    //     construction) and call `__recv.method(args)` (a `Ref<Cfg>` derefs to
+    //     `Cfg`, so an `&self` method binds directly). This is the design's lite-only
+    //     `#[configuration] impl Cfg { #[bean] fn .. }` lowering;
+    //   * a free factory-fn path (`#[bean] fn`): `#path(args)`;
+    //   * the inherent associated `new`, ANGLE-BRACKET-QUALIFIED `<Ty>::new(...)` so
+    //     it is valid in expression position for ANY type — including a generic
+    //     concrete `register_component!(Repo<u32>)`, where a bare `Repo<u32>::new()`
+    //     would mis-parse as a chained comparison.
+    let (receiver_resolve, construct) = match (receiver_ty, ctor) {
+        (Some(recv), Some(method)) => (
+            quote! {
+                let __recv: ::leaf_core::Ref<#recv> = __engine.get::<#recv>().await?;
+            },
+            quote! { __recv.#method( #(#args),* ) },
+        ),
+        (_, Some(path)) => (TokenStream::new(), quote! { #path( #(#args),* ) }),
+        (_, None) => (TokenStream::new(), quote! { <#self_ty>::new( #(#args),* ) }),
     };
 
     quote! {
@@ -486,6 +539,7 @@ fn emit_provider(
                     let __engine = __cx.engine().ok_or_else(|| {
                         ::leaf_core::LeafError::new(::leaf_core::ErrorKind::ConstructionFailed)
                     })?;
+                    #receiver_resolve
                     #(#resolves)*
                     let __instance = #construct;
                     ::core::result::Result::Ok(::leaf_core::Published::shared_value(__instance))
@@ -642,17 +696,19 @@ mod tests {
     #[test]
     fn descriptor_is_submitted_into_the_components_linkme_slice() {
         // The row is contributed via the linkme distributed-slice attr so link-time
-        // collection picks it up cross-crate with zero life-before-main. The attr
-        // uses the BARE `::linkme` path (the only form that resolves — the
-        // `distributed_slice` ATTRIBUTE macro looks up `linkme` at the contributing
-        // crate's root, so a re-export path like `::leaf_core::linkme::…` does NOT
-        // resolve; verified empirically against real leaf-core) while the SLICE is
-        // the absolute `::leaf_core::COMPONENTS`.
+        // collection picks it up cross-crate with zero life-before-main. Both the
+        // attribute macro AND linkme's runtime types are reached through leaf-core's
+        // `pub use linkme;` re-export: the attr is named by its fully-qualified
+        // `::leaf_core::linkme::distributed_slice` path, and `#[linkme(crate =
+        // ::leaf_core::linkme)]` redirects linkme's own runtime path so a
+        // contributing crate needs NO direct `linkme` dep (proven by the
+        // leaf-macros integration tests, which have no linkme dev-dep).
         let s = flat(&emit(&foo_with_bar()).expect("emits"));
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "got: {s}"
         );
+        assert!(s.contains("#[linkme(crate=::leaf_core::linkme)]"), "got: {s}");
     }
 
     #[test]
@@ -664,12 +720,12 @@ mod tests {
         input.slice = Slice::AutoConfigs;
         let s = flat(&emit(&input).expect("emits"));
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
             "got: {s}"
         );
         // It must NOT also land in COMPONENTS.
         assert!(
-            !s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            !s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "an auto-config must not be in COMPONENTS: {s}"
         );
     }
@@ -679,7 +735,7 @@ mod tests {
         // A plain bean defaults to the COMPONENTS channel.
         let s = flat(&emit(&foo_with_bar()).expect("emits"));
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "got: {s}"
         );
     }
@@ -827,6 +883,30 @@ mod tests {
         assert!(!s.contains("Svc::new("), "the factory fn replaces ::new: {s}");
         // Still resolves the collaborator through the one engine seam.
         assert!(s.contains("__engine.get::<Dep>().await?"), "got: {s}");
+    }
+
+    #[test]
+    fn a_configuration_class_bean_method_resolves_the_config_receiver_and_calls_the_method() {
+        // The design's lite-only `#[configuration] impl AppConfig { #[bean] fn pool(&self,
+        // cfg: Ref<DbConfig>) -> Pool }` lowering: ONE Descriptor per method whose
+        // generated provider resolves the CONFIG bean (the receiver) AND each param
+        // through the one Engine::get seam, then calls the bean METHOD on the config —
+        // so a `&self` method reads the MANAGED config singleton (singleton-correct).
+        let mut input = BeanInput::new(ty("Pool"), "pool", "crate::AppConfig::pool");
+        input.deps.push(Dependency { name: "cfg".into(), ty: ty("DbConfig") });
+        input.ctor = Some(syn::parse_str("pool").expect("a method ident"));
+        input.receiver_ty = Some(ty("AppConfig"));
+        let ts = emit(&input).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The config receiver is resolved as a bean through the SAME engine seam.
+        assert!(s.contains("let__recv:::leaf_core::Ref<AppConfig>=__engine.get::<AppConfig>().await?"), "got: {s}");
+        // The param is resolved too.
+        assert!(s.contains("__engine.get::<DbConfig>().await?"), "got: {s}");
+        // The construct calls the METHOD on the resolved config instance.
+        assert!(s.contains("__recv.pool(__dep_cfg)"), "got: {s}");
+        // It must NOT call an inherent `Pool::new` or a free `pool(..)`.
+        assert!(!s.contains("<Pool>::new("), "a config-method bean is not a ::new ctor: {s}");
     }
 
     #[test]

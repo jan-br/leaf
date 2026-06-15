@@ -348,9 +348,13 @@ fn sig_to_deps(func: &ItemFn) -> Result<Vec<Dependency>, EmitError> {
             FnArg::Receiver(_) => {
                 return Err(EmitError {
                     message: format!(
-                        "`{}` is a @bean with a `self` receiver: the method-on-a-\
-                         @configuration form (threading the config instance) is not \
-                         supported yet — use a free `fn` factory.",
+                        "`{}` is a @bean with a `self` receiver: a config-class @bean \
+                         METHOD (threading the config instance) is lowered by the \
+                         IMPL-BLOCK macro, not the per-method attr. Put `#[bean]` on a \
+                         method inside a `#[configuration] impl Cfg {{ .. }}` block \
+                         (the impl-block macro iterates the methods and emits one \
+                         Descriptor per `#[bean]`), or use a free `fn` `#[bean]` \
+                         factory for a standalone factory.",
                         func.sig.ident
                     ),
                 });
@@ -395,18 +399,11 @@ fn fields_to_deps(fields: &Fields) -> Vec<Dependency> {
     }
 }
 
-/// The bean type a field of type `ty` injects: `Ref<T>` → `T` (the field stores the
-/// shared handle), any other type → itself.
+/// The bean type a field of type `ty` injects — delegates to the shared
+/// [`crate::descriptor::produced_ty`] so the `Ref<T>` → `T` handle-stripping rule
+/// lives in ONE place (shared with the free-fn-param + config-method-param paths).
 fn produced_ty(ty: &Type) -> Type {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "Ref"
-        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return inner.clone();
-    }
-    ty.clone()
+    crate::descriptor::produced_ty(ty)
 }
 
 #[cfg(test)]
@@ -597,7 +594,7 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s: String = ts.to_string().split_whitespace().collect();
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "got: {s}"
         );
         assert!(s.contains("impl::leaf_core::BeanforGreeter{}"), "got: {s}");
@@ -647,7 +644,7 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s: String = ts.to_string().split_whitespace().collect();
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "got: {s}"
         );
     }

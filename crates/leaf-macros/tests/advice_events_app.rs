@@ -6,10 +6,10 @@
 //! the right `ContractId`/order/metadata — the proof the thin-macro pipeline closes
 //! end-to-end (the macro is the only authorised producer of these rows).
 //!
-//! NOTE (cross-crate, frozen leaf-core): the `#[distributed_slice]` ATTRIBUTE macro
-//! resolves the bare `linkme` crate at the CONTRIBUTING crate's root (a hard linkme
-//! constraint), so the emitted rows use `#[::linkme::distributed_slice(...)]` and
-//! this crate carries its own `linkme` dev-dep. The richer runtime descriptors
+//! PROOF GATE (cross-crate, re-export): this crate has NO `linkme` dep — the
+//! emitted rows reach their frozen slices through leaf-core's `pub use linkme;` via
+//! `#[::leaf_core::linkme::distributed_slice(...)]` + `#[linkme(crate =
+//! ::leaf_core::linkme)]` (see `roundtrip.rs`). The richer runtime descriptors
 //! (`ListenerDescriptor.adapter`/`event_type`, the live `AdvisorDescriptor`) bind to
 //! resolved host beans at refresh — leaf-boot's concern; this unit emits the
 //! anti-DCE identity rows + the const pairing metadata.

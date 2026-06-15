@@ -51,9 +51,11 @@
 //! ## Macros reference `linkme` THROUGH leaf-core
 //!
 //! [`linkme`](crate::linkme) is re-exported so emitted code writes
-//! `::leaf_core::linkme::distributed_slice`, never a bare `::linkme` (which would
-//! force every contributing crate to declare a `linkme` dependency). This is the
-//! single pinned linkme path the whole workspace shares.
+//! `::leaf_core::linkme::distributed_slice` (plus `#[linkme(crate =
+//! ::leaf_core::linkme)]` so linkme's runtime types resolve there too), never a
+//! bare `::linkme` (which would force every contributing crate to declare a
+//! `linkme` dependency). This is the single pinned linkme path the whole workspace
+//! shares.
 
 // `#[linkme::distributed_slice]` expands to a `#[used]` `#[link_section = "…"]`
 // static; the section override trips the crate-level `deny(unsafe_code)`. This
@@ -71,11 +73,23 @@ use crate::order::OrderKey;
 /// The pinned `linkme` re-export — emitted code references
 /// `::leaf_core::linkme`, never a bare `::linkme`.
 ///
-/// A `#[component]`/`#[bean]`/… macro hard-codes
-/// `#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]` so a
-/// contributing crate needs ONLY a `leaf-core` dependency, never its own pin on
-/// `linkme`. There is exactly one `linkme` version in the workspace (the BOM in
-/// `[workspace.dependencies]`), so all slices agree on the element layout.
+/// A `#[component]`/`#[bean]`/… macro hard-codes BOTH
+/// `#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]` (the
+/// attribute macro by its fully-qualified re-export path) AND
+/// `#[linkme(crate = ::leaf_core::linkme)]` (linkme's supported `crate =`
+/// override, so its runtime types — `DistributedSlice`, the `__private` module,
+/// `Void` — also resolve through this re-export instead of a bare `::linkme`).
+/// The override is load-bearing: without it the element expansion emits
+/// `::linkme::…` and fails with `E0433: cannot find linkme in the crate root`.
+/// With both, a contributing crate needs ONLY a `leaf-core` dependency, never its
+/// own pin on `linkme`. There is exactly one `linkme` version in the workspace
+/// (the BOM in `[workspace.dependencies]`), so all slices agree on the layout.
+///
+/// This re-export must stay `pub` (not `#[doc(hidden)] __rt`): the emitted
+/// attribute paths name it directly, and a `#[doc(hidden)] pub use` would resolve
+/// equally but is reserved for items users should never type — whereas this is
+/// the documented `::leaf_core::linkme` path the macro emits. Re-exporting it is a
+/// purely ADDITIVE, non-breaking change to the frozen leaf-core ABI.
 pub use linkme;
 
 // ─────────────────────── anti-DCE source identity ───────────────────────────

@@ -190,9 +190,11 @@ pub fn emit_scheduled(ident: &str, method: &str, spec: &ScheduleSpec) -> TokenSt
                 #method_key,
                 #spec_tokens,
             );
-        // The cheap anti-DCE identity row in the frozen SCHEDULED slice via the bare
-        // ::linkme attr path (the only form that resolves cross-crate).
-        #[::linkme::distributed_slice(::leaf_core::SCHEDULED)]
+        // The cheap anti-DCE identity row in the frozen SCHEDULED slice via the
+        // re-exported ::leaf_core::linkme attr path + crate override (so a
+        // contributing crate needs no direct linkme dep).
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::SCHEDULED)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::ScheduledRow = #desc_ident.to_row();
     }
 }
@@ -306,7 +308,8 @@ pub fn emit_cacheable(ident: &str, method: &str, args: &CacheArgs) -> TokenStrea
         };
         // The cache advisor IDENTITY row in the frozen ADVISORS slice, pinned to the
         // CACHE_ORDER chain const (the cache interceptor is infrastructure advice).
-        #[::linkme::distributed_slice(::leaf_core::ADVISORS)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISORS)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::AdvisorRow = ::leaf_core::AdvisorRow {
             contract: #contract,
             order: ::leaf_core::OrderKey {
@@ -345,7 +348,8 @@ pub fn emit_resource(ident: &str, path: &str) -> TokenStream {
             bytes_fn: || ::core::include_bytes!(#path),
         };
         // The anti-DCE RESOURCES identity row (a dropped resource is silently absent).
-        #[::linkme::distributed_slice(::leaf_core::RESOURCES)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::RESOURCES)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::ResourceRow = ::leaf_core::ResourceRow {
             contract: #contract,
             location: #path,
@@ -440,7 +444,8 @@ pub fn emit_catalog(ident: &str, args: &CatalogArgs) -> TokenStream {
             locales: &[ #(#locales),* ],
         };
         // The anti-DCE CATALOGS identity row.
-        #[::linkme::distributed_slice(::leaf_core::CATALOGS)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::CATALOGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::CatalogRow = ::leaf_core::CatalogRow {
             contract: #contract,
         };
@@ -550,7 +555,7 @@ mod tests {
         // parse2 above succeeding and `spec` equalling the spaced cron string).
         assert!(s.contains(r#"::leaf_core::TriggerSpec::Cron("00****")"#), "got: {s}");
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::SCHEDULED)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SCHEDULED)]"),
             "got: {s}"
         );
         // The slice row is the descriptor's .to_row() (the cheap identity row).
@@ -620,7 +625,7 @@ mod tests {
         assert!(s.contains("sync:true"), "got: {s}");
         // The cache advisor identity row rides ADVISORS, pinned to CACHE_ORDER.
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::ADVISORS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISORS)]"),
             "got: {s}"
         );
         assert!(s.contains("value:::leaf_core::CACHE_ORDER"), "got: {s}");
@@ -647,7 +652,7 @@ mod tests {
         // The bytes accessor is an include_bytes!-backed const fn pointer.
         assert!(s.contains(r#"bytes_fn:||::core::include_bytes!("config/app.yaml")"#), "got: {s}");
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::RESOURCES)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::RESOURCES)]"),
             "got: {s}"
         );
         assert!(s.contains(r#"location:"config/app.yaml""#), "got: {s}");
@@ -669,7 +674,7 @@ mod tests {
         assert!(s.contains(r#"basename:"messages""#), "got: {s}");
         assert!(s.contains(r#"locales:&["en","de"]"#), "got: {s}");
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::CATALOGS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::CATALOGS)]"),
             "got: {s}"
         );
         assert!(s.contains("::leaf_core::CatalogRow{"), "got: {s}");

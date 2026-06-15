@@ -9,15 +9,18 @@
 //! emitted by a macro" boundary (the macro is the only authorised producer of a
 //! `COMPONENTS` row).
 //!
-//! NOTE (cross-crate, frozen leaf-core): the `#[distributed_slice]` ATTRIBUTE macro
-//! resolves the bare `linkme` crate at the CONTRIBUTING crate's root (a hard linkme
-//! constraint — a re-export path like `::leaf_core::linkme::distributed_slice` does
-//! NOT resolve as an attribute path). So the emitted row uses the bare
-//! `#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]` and a contributing
-//! crate carries its own `linkme` dep (here a dev-dep). Shipping
-//! `pub extern crate linkme;` from leaf-core (or re-exporting the attribute macro)
-//! would let the leaf-core-only path resolve; that is a one-line frozen-leaf-core
-//! change out of this unit's scope.
+//! PROOF GATE (cross-crate, re-export): this test crate has NO `linkme` dependency
+//! — only `leaf-core` + `leaf-macros` (check the `[dev-dependencies]`). That it
+//! compiles and the roundtrip passes proves a `#[component]` user needs only
+//! leaf-core/leaf-macros. The `#[component]` macro emits
+//! `#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]` +
+//! `#[linkme(crate = ::leaf_core::linkme)]`, reaching the slice through leaf-core's
+//! `pub use linkme;`: the attribute macro DOES resolve by its fully-qualified
+//! re-export path on stable, and the `crate =` override redirects linkme's runtime
+//! types (`DistributedSlice`/`__private`/`Void`) there too. The override is the
+//! load-bearing piece — without it the element expansion emits a bare `::linkme::…`
+//! runtime path and fails with `E0433: cannot find linkme in the crate root` (the
+//! exact failure a prior pass mistook for "the re-export does not resolve").
 
 use leaf_macros::component;
 

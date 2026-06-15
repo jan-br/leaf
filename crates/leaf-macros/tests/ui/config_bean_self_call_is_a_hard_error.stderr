@@ -1,0 +1,7 @@
+error: `service` makes an intra-config `#[bean]`→`#[bean]` self-call to `self.repo()`: under leaf's lite-only `#[configuration]` model this returns a SECOND unmanaged instance (not the managed singleton). Take `repo: Ref<Repo>` as a parameter instead, so the container injects the managed bean.
+  --> tests/ui/config_bean_self_call_is_a_hard_error.rs:12:1
+   |
+12 | #[configuration]
+   | ^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `configuration` (in Nightly builds, run with -Z macro-backtrace for more info)

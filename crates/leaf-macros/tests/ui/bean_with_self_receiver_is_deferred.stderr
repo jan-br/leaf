@@ -1,7 +1,7 @@
-error: `data_source` is a @bean with a `self` receiver: the method-on-a-@configuration form (threading the config instance) is not supported yet — use a free `fn` factory.
-  --> tests/ui/bean_with_self_receiver_is_deferred.rs:11:5
+error: `data_source` is a @bean with a `self` receiver: a config-class @bean METHOD (threading the config instance) is lowered by the IMPL-BLOCK macro, not the per-method attr. Put `#[bean]` on a method inside a `#[configuration] impl Cfg { .. }` block (the impl-block macro iterates the methods and emits one Descriptor per `#[bean]`), or use a free `fn` `#[bean]` factory for a standalone factory.
+  --> tests/ui/bean_with_self_receiver_is_deferred.rs:14:5
    |
-11 |     #[bean]
+14 |     #[bean]
    |     ^^^^^^^
    |
    = note: this error originates in the attribute macro `bean` (in Nightly builds, run with -Z macro-backtrace for more info)

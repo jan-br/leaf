@@ -208,11 +208,13 @@ pub fn emit_failure_analyzer(ident: &str) -> TokenStream {
     let ty: syn::Ident = syn::Ident::new(ident, proc_macro2::Span::call_site());
     quote! {
         // The static analyzer instance (a unit struct, so const-constructible) + the
-        // anti-DCE row in the frozen FAILURE_ANALYZERS slice via the bare ::linkme
-        // attr path (a dropped analyzer silently never runs).
+        // anti-DCE row in the frozen FAILURE_ANALYZERS slice via the re-exported
+        // `::leaf_core::linkme` attr path + crate override (a dropped analyzer
+        // silently never runs).
         #[allow(non_upper_case_globals)]
         static #instance_ident: #ty = #ty;
-        #[::linkme::distributed_slice(::leaf_core::FAILURE_ANALYZERS)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::FAILURE_ANALYZERS)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: &dyn ::leaf_core::FailureAnalyzer = &#instance_ident;
     }
 }
@@ -333,7 +335,7 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "got: {s}"
         );
         // The Runner upcast view rides provides[].
@@ -361,9 +363,10 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::FAILURE_ANALYZERS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::FAILURE_ANALYZERS)]"),
             "got: {s}"
         );
+        assert!(s.contains("#[linkme(crate=::leaf_core::linkme)]"), "got: {s}");
         // The row is a reference to a static instance of the user's analyzer type.
         assert!(s.contains("&dyn::leaf_core::FailureAnalyzer=&__LEAF_ANALYZER_INSTANCE_PortInUseAnalyzer"), "got: {s}");
         assert!(s.contains("static__LEAF_ANALYZER_INSTANCE_PortInUseAnalyzer:PortInUseAnalyzer"), "got: {s}");

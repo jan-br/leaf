@@ -223,7 +223,6 @@ dependencies = [
  "futures",
  "leaf-codegen",
  "leaf-core",
- "linkme",
  "proc-macro2",
  "quote",
  "syn",

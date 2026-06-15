@@ -25,12 +25,13 @@
 
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, ItemFn, ItemStruct, Type};
+use syn::{parse_macro_input, DeriveInput, Item, ItemFn, ItemImpl, ItemStruct, Type};
 
 use leaf_codegen::advisor;
 use leaf_codegen::app;
 use leaf_codegen::conditional;
 use leaf_codegen::config;
+use leaf_codegen::config_impl;
 use leaf_codegen::descriptor::EmitError;
 use leaf_codegen::listener;
 use leaf_codegen::scheduling;
@@ -75,11 +76,53 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_stereotype(attr, item, Stereotype::Controller)
 }
 
-/// `#[configuration]` — a `@bean`-factory holder stereotype (`meta.markers` =
-/// `[Configuration, Component]`); otherwise identical to `#[component]`.
+/// `#[configuration]` — a `@bean`-factory holder. TWO forms:
+///
+/// - on a STRUCT: a `@bean`-factory holder stereotype (`meta.markers` =
+///   `[Configuration, Component]`); otherwise identical to `#[component]` (the config
+///   struct is itself a registered bean so its `@bean` methods read `&self` shared
+///   injected state).
+/// - on an inherent IMPL BLOCK (`#[configuration] impl AppConfig { #[bean] fn pool(
+///   &self, cfg: Ref<DbConfig>) -> Pool {..} .. }`): the design's lite-only
+///   configuration-class form. The macro reads each `#[bean]` METHOD and emits ONE
+///   const `::leaf_core::Descriptor` per method into `COMPONENTS` (configuration-classes
+///   phase3/05). This is the Rust-idiomatic answer to "an attr on a single method
+///   cannot emit sibling rows" — the impl-block macro CAN iterate the impl's methods.
+///   The inner `#[bean]` attrs are STRIPPED from the re-emitted impl (the impl-block
+///   macro, not the method attr, owns the lowering); an intra-config `#[bean]`→
+///   `#[bean]` self-call is a loud `compile_error!` with a rewrite hint.
 #[proc_macro_attribute]
 pub fn configuration(attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_stereotype(attr, item, Stereotype::Configuration)
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Impl(item_impl) => {
+            let cleaned = strip_inner_attrs(item_impl.clone(), &["bean"]);
+            match config_impl::emit_configuration_impl(&item_impl) {
+                Ok(rows) => quote! { #cleaned #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #cleaned #error }.into()
+                }
+            }
+        }
+        Item::Struct(item_struct) => {
+            match stereotype::emit_struct(&item_struct, Stereotype::Configuration, attr.into()) {
+                Ok(rows) => quote! { #item_struct #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #item_struct #error }.into()
+                }
+            }
+        }
+        other => quote! {
+            #other
+            ::core::compile_error!(
+                "#[configuration] applies to a `struct` (the config bean) or an \
+                 inherent `impl` block (its `#[bean]` methods)"
+            );
+        }
+        .into(),
+    }
 }
 
 /// `#[bean]` — a FACTORY-FUNCTION bean. Lowers a `fn make(deps…) -> Product` to the
@@ -88,9 +131,14 @@ pub fn configuration(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// Attribute args (all optional): `name = "…"`, `scope = "…"`.
 ///
-/// NOTE: the `#[bean]`-on-a-method form (a method of a `#[configuration]` struct,
-/// which threads the config instance as the receiver) is deferred — a `self`
-/// receiver is a `compile_error!` here. Use a free `fn` factory in v1.
+/// NOTE: a `#[bean]` on a config-class METHOD (a `&self` method of a config type,
+/// which threads the config instance as the receiver) is lowered by the IMPL-BLOCK
+/// macro, NOT this per-method attr — a proc-macro attribute on a single method cannot
+/// emit the sibling const `Descriptor` row. Put `#[bean]` on a method inside a
+/// `#[configuration] impl Cfg { .. }` block (the impl-block macro iterates the
+/// methods and emits one Descriptor per `#[bean]`). A bare `#[bean]` with a `self`
+/// receiver here is a `compile_error!` steering to that form. A free `fn` `#[bean]`
+/// factory is the standalone form this attr handles directly.
 #[proc_macro_attribute]
 pub fn bean(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(item as ItemFn);
@@ -127,6 +175,28 @@ pub fn register_component(item: TokenStream) -> TokenStream {
 /// `syn`, delegate to `leaf_codegen::stereotype::emit_struct`, and emit
 /// `<item> <const rows>` (or a `compile_error!` on a hard error). No logic lives
 /// here.
+/// Strip the named INNER method attributes (`#[bean]` / `#[advice]` / `#[pointcut]`)
+/// from an impl block before it is re-emitted, so the kept impl carries plain methods.
+///
+/// An impl-block macro (`#[configuration]`/`#[aspect]`) OWNS the lowering of its
+/// methods; if the inner `#[bean]`/`#[advice]`/`#[pointcut]` ATTR were left on the
+/// re-emitted method it would ALSO fire (a method-position attr macro), double-emitting
+/// or erroring. Matching is on the attribute path's LAST segment so `#[bean]` and a
+/// `#[leaf::bean]`-qualified form are both stripped.
+fn strip_inner_attrs(mut item: ItemImpl, names: &[&str]) -> ItemImpl {
+    for inner in &mut item.items {
+        if let syn::ImplItem::Fn(func) = inner {
+            func.attrs.retain(|a| {
+                !a.path()
+                    .segments
+                    .last()
+                    .is_some_and(|s| names.iter().any(|n| s.ident == n))
+            });
+        }
+    }
+    item
+}
+
 fn expand_stereotype(attr: TokenStream, item: TokenStream, stereotype: Stereotype) -> TokenStream {
     let parsed = parse_macro_input!(item as ItemStruct);
     match stereotype::emit_struct(&parsed, stereotype, attr.into()) {
@@ -363,15 +433,44 @@ pub fn register_proxy(item: TokenStream) -> TokenStream {
     }
 }
 
-/// `#[aspect(order = N)]` — an ASPECT bean carrying advice. Structurally a
-/// `#[component]` (so the aspect bean is registered + resolvable) that ALSO emits
-/// one const `::leaf_core::AdvisorRow` identity into the frozen `ADVISORS` slice +
-/// the public chain-order pairing const the leaf-boot proxy-assembly pass binds to
-/// the live `AdvisorDescriptor`. A generic aspect hard-errors with the
-/// `register_proxy!(Concrete)` hint.
+/// `#[aspect(order = N)]` — an ASPECT carrying advice. TWO forms:
+///
+/// - on a STRUCT: the aspect BEAN — structurally a `#[component]` (so the aspect is
+///   registered + resolvable, and its advice can inject collaborators) that ALSO
+///   emits one const `::leaf_core::AdvisorRow` identity into the frozen `ADVISORS`
+///   slice + the public chain-order pairing const the leaf-boot proxy-assembly pass
+///   binds to the live `AdvisorDescriptor`.
+/// - on an inherent IMPL BLOCK (`#[aspect] impl Audit { #[advice(around, order=N)]
+///   fn time(..) {..} #[pointcut] fn .. }`): the design's per-method advice form. The
+///   macro reads each `#[advice]`/`#[pointcut]` METHOD and emits ONE const
+///   `::leaf_core::AdvisorRow` per method into `ADVISORS` (aspect-model phase3/08+09)
+///   — the impl-block answer to "an attr on a single method cannot emit sibling rows".
+///   The inner `#[advice]`/`#[pointcut]` attrs are STRIPPED from the re-emitted impl.
+///
+/// A generic aspect hard-errors with the `register_proxy!(Concrete)` hint.
 #[proc_macro_attribute]
 pub fn aspect(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed = parse_macro_input!(item as ItemStruct);
+    let parsed_item = parse_macro_input!(item as Item);
+    if let Item::Impl(item_impl) = parsed_item {
+        let cleaned = strip_inner_attrs(item_impl.clone(), &["advice", "pointcut"]);
+        return match config_impl::emit_aspect_impl(&item_impl) {
+            Ok(rows) => quote! { #cleaned #rows }.into(),
+            Err(err) => {
+                let error = compile_error(&err);
+                quote! { #cleaned #error }.into()
+            }
+        };
+    }
+    let Item::Struct(parsed) = parsed_item else {
+        return quote! {
+            #parsed_item
+            ::core::compile_error!(
+                "#[aspect] applies to a `struct` (the aspect bean) or an inherent \
+                 `impl` block (its `#[advice]`/`#[pointcut]` methods)"
+            );
+        }
+        .into();
+    };
     let attr2: proc_macro2::TokenStream = attr.into();
     let args = match advisor::parse_advisor_args(attr2.clone()) {
         Ok(a) => a,
@@ -413,6 +512,13 @@ pub fn aspect(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// plus the public chain-order pairing const. The first bare ident is the advice
 /// kind (`before`/`after`/`after_returning`/`after_throwing`/`around`, default
 /// `around`).
+///
+/// NOTE: this per-fn attr is the FREE-FN form. For ADVICE METHODS on an aspect type
+/// (`fn time(&self) {..}`), put `#[advice(..)]` on the METHOD inside an `#[aspect]
+/// impl Aspect { .. }` block — the impl-block macro iterates the methods and emits
+/// one `AdvisorRow` per advice method (a per-method attr alone cannot emit the
+/// sibling row, so the impl-block form is the sanctioned method-level route,
+/// aspect-model phase3/08+09).
 #[proc_macro_attribute]
 pub fn advice(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(item as ItemFn);
@@ -436,6 +542,10 @@ pub fn advice(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// pointcut). Lowers to the SAME const `::leaf_core::AdvisorRow` identity shape as
 /// `#[advice]` (the pointcut predicate itself is the proxy substrate's typed-
 /// combinator model, bound at refresh); the row anchors its discovery + chain order.
+///
+/// NOTE: like `#[advice]`, the METHOD-on-an-aspect form is lowered by the IMPL-BLOCK
+/// `#[aspect] impl Aspect { #[pointcut] fn .. }` macro (one row per method); this
+/// per-fn attr is the free-fn form.
 #[proc_macro_attribute]
 pub fn pointcut(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(item as ItemFn);

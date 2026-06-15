@@ -207,7 +207,8 @@ pub fn emit_listener(ident: &str, args: &ListenerArgs) -> TokenStream {
         // slice (a dropped listener silently never fires — the expected-vs-found
         // self-check catches it). Dispatch ORDER is read via the one cmp_order,
         // never this slice's link order.
-        #[::linkme::distributed_slice(::leaf_core::EVENT_LISTENERS)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::EVENT_LISTENERS)]
+        #[linkme(crate = ::leaf_core::linkme)]
         static #row_ident: ::leaf_core::EventListenerRow = ::leaf_core::EventListenerRow {
             contract: #contract,
             order: #order_ident,
@@ -276,15 +277,17 @@ mod tests {
     #[test]
     fn emits_an_absolute_core_event_listener_row_into_the_slice() {
         // The headline: a listener lowers to one const ::leaf_core::EventListenerRow
-        // submitted into the frozen EVENT_LISTENERS slice via the bare ::linkme attr
-        // path, the SLICE absolute ::leaf_core::EVENT_LISTENERS.
+        // submitted into the frozen EVENT_LISTENERS slice via the re-exported
+        // ::leaf_core::linkme attr path + crate override, the SLICE absolute
+        // ::leaf_core::EVENT_LISTENERS.
         let ts = emit_listener("OnUserCreated", &ListenerArgs::default());
         syn::parse2::<syn::File>(ts.clone()).expect("valid Rust items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::EVENT_LISTENERS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::EVENT_LISTENERS)]"),
             "got: {s}"
         );
+        assert!(s.contains("#[linkme(crate=::leaf_core::linkme)]"), "got: {s}");
         assert!(s.contains("::leaf_core::EventListenerRow{"), "got: {s}");
     }
 

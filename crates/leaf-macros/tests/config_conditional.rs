@@ -8,9 +8,9 @@
 //! anchor + a Runtime-tier `CondExpr`, etc. This closes the macro→leaf_core
 //! boundary for the binding/conditional half of the pipeline.
 //!
-//! NOTE (cross-crate, frozen leaf-core): see `roundtrip.rs` — the contributing
-//! crate carries its own `linkme` dev-dep because the `#[distributed_slice]`
-//! attribute macro resolves `linkme` at the contributing crate's root.
+//! PROOF GATE (cross-crate, re-export): see `roundtrip.rs` — this crate has NO
+//! `linkme` dep; the rows reach their slices through leaf-core's `pub use linkme;`
+//! via `#[::leaf_core::linkme::distributed_slice(...)]` + `#[linkme(crate = ...)]`.
 
 use leaf_macros::{
     auto_config, conditional, config_properties, converter, import, profile, value, BindTarget,

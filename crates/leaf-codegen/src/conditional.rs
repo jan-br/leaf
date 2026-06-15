@@ -692,7 +692,8 @@ pub fn emit_guard(ident: &str, expr: &CondExpr) -> TokenStream {
         let row_ident = format_ident!("__LEAF_COND_{}_{}", mangled, i);
         let id = lower_condition_id(kind);
         anchors.push(quote! {
-            #[::linkme::distributed_slice(::leaf_core::CONDITIONS)]
+            #[::leaf_core::linkme::distributed_slice(::leaf_core::CONDITIONS)]
+            #[linkme(crate = ::leaf_core::linkme)]
             static #row_ident: ::leaf_core::ConditionRow = ::leaf_core::ConditionRow {
                 contract: ::leaf_core::ContractId::of(#kind),
                 marker: ::leaf_core::MarkerId::of(#kind),
@@ -987,9 +988,10 @@ mod tests {
             "got: {s}"
         );
         // One CONDITIONS anti-DCE anchor per referenced kind, submitted into the
-        // frozen ::leaf_core::CONDITIONS slice via the bare ::linkme attr path.
+        // frozen ::leaf_core::CONDITIONS slice via the re-exported ::leaf_core::linkme
+        // attr path + crate override.
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::CONDITIONS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::CONDITIONS)]"),
             "got: {s}"
         );
         assert!(s.contains("::leaf_core::ConditionRow"), "got: {s}");
@@ -1106,14 +1108,14 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
             "got: {s}"
         );
         // FALLBACK candidate role (the auto_config_role()) rides the meta.
         assert!(s.contains("::leaf_core::CandidateRole::FALLBACK"), "got: {s}");
         // It must NOT land in the COMPONENTS channel.
         assert!(
-            !s.contains("#[::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            !s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
             "an auto-config must not be a COMPONENTS row: {s}"
         );
     }
@@ -1127,11 +1129,11 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
             "got: {s}"
         );
         assert!(
-            s.contains("#[::linkme::distributed_slice(::leaf_core::CONDITIONS)]"),
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::CONDITIONS)]"),
             "got: {s}"
         );
         assert!(

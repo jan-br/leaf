@@ -4,9 +4,9 @@
 //! `meta.markers` closure, and (for `#[bean]`/`register_component!`) that the
 //! `ProviderSeed` builds a `Provider` the engine drives to the bean.
 //!
-//! NOTE (cross-crate, frozen leaf-core): see `roundtrip.rs` — the contributing
-//! crate carries its own `linkme` dev-dep because the `#[distributed_slice]`
-//! attribute macro resolves `linkme` at the contributing crate's root.
+//! PROOF GATE (cross-crate, re-export): see `roundtrip.rs` — this crate has NO
+//! `linkme` dep; the rows reach `COMPONENTS` through leaf-core's `pub use linkme;`
+//! via `#[::leaf_core::linkme::distributed_slice(...)]` + `#[linkme(crate = ...)]`.
 
 use leaf_macros::{bean, configuration, controller, register_component, repository, service};
 
