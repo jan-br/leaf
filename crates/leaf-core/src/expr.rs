@@ -153,6 +153,27 @@ pub type CondExprFn = fn(&EvalCx) -> Result<bool, ExprError>;
 /// method args (the typed cache-key path — no interpreter on the hot path).
 pub type KeyExprFn = fn(&EvalCx) -> Result<CacheKeyValue, ExprError>;
 
+/// The OPAQUE, `dyn`-safe expression seam the `${}`-vs-`#{}` dispatcher
+/// ([`interpret_with`](crate::placeholder::interpret_with)) routes every `#{...}`
+/// segment through (binding-conversion phase3/07, line 63: an
+/// "`Option<&dyn ExpressionEvaluator>`" the dispatcher treats as fully opaque +
+/// optional).
+///
+/// This is NOT a runtime interpreter (SEAMS: the closure-only backend stands).
+/// The live impl in leaf-codegen routes a `#{...}` body to its monomorphized
+/// [`ValueExpr`] const fn-pointer compiled from the frozen `#{...}` subgrammar;
+/// leaf-core only pins the `dyn` shape so the placeholder dispatcher can call it
+/// without depending on the codegen crate. SYNC-PURE by contract (the expr
+/// subsystem hard-errors on an async body), so dispatch never `.await`s.
+pub trait ExpressionEvaluator {
+    /// Evaluate the (phase-1-expanded) `#{...}` body to its rendered string.
+    ///
+    /// # Errors
+    /// A [`LeafError`] (lowered from the expression's [`ExprError`]) on an
+    /// evaluation fault — one node of the one diagnostic chain.
+    fn eval(&self, body: &str) -> Result<String, LeafError>;
+}
+
 /// The erased payload a [`KeyExprFn`] yields — a typed-hash cache key fragment.
 ///
 /// Kept a thin newtype here (the rich `CacheKey { method, payload }` lives in

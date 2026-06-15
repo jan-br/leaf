@@ -25,6 +25,7 @@
 use std::borrow::Cow;
 
 use crate::error::{Cause, ErrorKind, LeafError};
+use crate::expr::ExpressionEvaluator;
 
 /// The default recursion/visited depth cap (environment-config knob, default 64).
 pub const DEFAULT_DEPTH_CAP: usize = 64;
@@ -386,20 +387,48 @@ pub fn has_expr(segments: &[Segment]) -> bool {
     segments.iter().any(|s| matches!(s, Segment::Expr(_)))
 }
 
-/// The one ordering interpreter (extra-12): PHASE 1 expand `${}` over the env;
-/// PHASE 2 is NOT performed here (the expr engine is a later unit) — a template
-/// containing a [`Segment::Expr`] yields a canonical [`ErrorKind::UnresolvedValue`]
-/// error so the absent-engine case is loud, never a silent literal.
+/// The one ordering interpreter (extra-12) WITHOUT an expression engine: PHASE 1
+/// expands `${}` over the env; a template containing a [`Segment::Expr`] yields a
+/// canonical [`ErrorKind::UnresolvedValue`] error so the absent-engine case is
+/// loud, never a silent literal.
+///
+/// This is exactly [`interpret_with`] with no evaluator. The `#{}`-evaluating
+/// callers (`@Value`, the value dispatcher) call [`interpret_with`] threading the
+/// expr unit's `Option<&dyn ExpressionEvaluator>`.
 ///
 /// # Errors
 /// [`ErrorKind::UnresolvedValue`] for an unresolved strict placeholder or for a
-/// `#{}` segment when no expression evaluator is wired (the expr unit replaces
-/// this arm with the real evaluator call).
+/// `#{}` segment (no evaluator is wired through this entry point).
 pub fn interpret(
     segments: &[Segment],
     syntax: &PlaceholderSyntax,
     lookup: &dyn Fn(&str) -> Option<String>,
     strict: bool,
+) -> Result<String, LeafError> {
+    interpret_with(segments, syntax, lookup, strict, None)
+}
+
+/// The one ordering interpreter (extra-12) threading the OPTIONAL expression
+/// evaluator (binding-conversion phase3/07): PHASE 1 expands every `${}` over the
+/// env; PHASE 2 (only for [`Segment::Expr`]) hands the body to `expr`.
+///
+/// The two-phase law is encoded HERE in exactly one place: `${}` resolution
+/// (placeholder strict/lenient) runs first; a `#{...}` body is then evaluated by
+/// the threaded [`ExpressionEvaluator`]. When `expr` is `None`, a `#{}` segment is
+/// the canonical loud [`ErrorKind::UnresolvedValue`] — never a silent literal.
+/// Once phase 2 begins, its output is NOT re-scanned for `${}` (non-recursion
+/// across the seam — the evaluator owns its own `#root` context).
+///
+/// # Errors
+/// [`ErrorKind::UnresolvedValue`] for an unresolved strict placeholder or for a
+/// `#{}` segment when `expr` is `None`; the evaluator's own [`LeafError`] on an
+/// expression fault.
+pub fn interpret_with(
+    segments: &[Segment],
+    syntax: &PlaceholderSyntax,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    strict: bool,
+    expr: Option<&dyn ExpressionEvaluator>,
 ) -> Result<String, LeafError> {
     let mut out = String::new();
     for seg in segments {
@@ -435,15 +464,22 @@ pub fn interpret(
                     out.push_str(syntax.suffix.as_ref());
                 }
             }
-            Segment::Expr(body) => {
-                return Err(LeafError::new(ErrorKind::UnresolvedValue).caused_by(Cause::plain(
-                    "interpreting value template",
-                    format!(
-                        "expression segment `#{{{body}}}` requires an expression evaluator \
-                         (none wired in leaf-core)"
-                    ),
-                )));
-            }
+            Segment::Expr(body) => match expr {
+                // PHASE 2: hand the #{} body to the (opaque) expression engine.
+                Some(evaluator) => out.push_str(&evaluator.eval(body)?),
+                // No engine wired: the absent-engine case is loud, never silent.
+                None => {
+                    return Err(LeafError::new(ErrorKind::UnresolvedValue).caused_by(
+                        Cause::plain(
+                            "interpreting value template",
+                            format!(
+                                "expression segment `#{{{body}}}` requires an expression \
+                                 evaluator (none wired)"
+                            ),
+                        ),
+                    ));
+                }
+            },
         }
     }
     Ok(out)
@@ -610,6 +646,71 @@ mod tests {
         assert!(has_expr(&segs));
         let err = interpret(&segs, &syn, &l, true).unwrap_err();
         assert_eq!(err.kind, ErrorKind::UnresolvedValue);
+    }
+
+    // ── #{} expression evaluation via the threaded evaluator (closure 3) ──
+
+    // A toy evaluator that uppercases the body (proving the seam is wired —
+    // the real engine is leaf-codegen's #{...} lowerer, opaque here).
+    struct UpcaseEval;
+    impl crate::expr::ExpressionEvaluator for UpcaseEval {
+        fn eval(&self, body: &str) -> Result<String, LeafError> {
+            Ok(body.to_uppercase())
+        }
+    }
+
+    #[test]
+    fn interpret_with_evaluator_evaluates_an_expr_segment() {
+        let syn = PlaceholderSyntax::spring();
+        let l = map_lookup(&[]);
+        let segs = vec![
+            Segment::Literal("v=".into()),
+            Segment::Expr("hi".into()),
+        ];
+        let eval = UpcaseEval;
+        // Threading an evaluator turns the #{} segment from a loud error into
+        // the evaluated value.
+        let out = interpret_with(&segs, &syn, &l, true, Some(&eval)).unwrap();
+        assert_eq!(out, "v=HI");
+    }
+
+    #[test]
+    fn interpret_with_no_evaluator_still_errors_loudly_on_expr() {
+        let syn = PlaceholderSyntax::spring();
+        let l = map_lookup(&[]);
+        let segs = vec![Segment::Expr("1 + 1".into())];
+        let err = interpret_with(&segs, &syn, &l, true, None).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::UnresolvedValue);
+    }
+
+    #[test]
+    fn interpret_with_runs_phase1_placeholders_before_phase2_expr() {
+        // PHASE 1: ${} expands first; PHASE 2: the #{} body is handed to the
+        // evaluator (the body itself is NOT placeholder-expanded here — the
+        // evaluator owns its own #root context).
+        let syn = PlaceholderSyntax::spring();
+        let l = map_lookup(&[("host", "localhost")]);
+        let segs = vec![
+            Segment::Placeholder { key: "host".into(), default: None },
+            Segment::Literal("/".into()),
+            Segment::Expr("path".into()),
+        ];
+        let eval = UpcaseEval;
+        let out = interpret_with(&segs, &syn, &l, true, Some(&eval)).unwrap();
+        assert_eq!(out, "localhost/PATH");
+    }
+
+    #[test]
+    fn interpret_delegates_to_interpret_with_none_evaluator() {
+        // The original interpret() is exactly interpret_with(.., None): the
+        // #{} arm stays a loud error, preserving the prior contract.
+        let syn = PlaceholderSyntax::spring();
+        let l = map_lookup(&[("host", "h")]);
+        let segs = vec![Segment::Placeholder { key: "host".into(), default: None }];
+        assert_eq!(
+            interpret(&segs, &syn, &l, true).unwrap(),
+            interpret_with(&segs, &syn, &l, true, None).unwrap()
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@
 use std::any::TypeId;
 use std::sync::Arc;
 
-use crate::definition::{Descriptor, Multiplicity, ScopeDef, TeardownPolicy};
+use crate::definition::{Descriptor, Multiplicity, ScopeDef, StoreSource, TeardownPolicy};
 use crate::env::Env;
 use crate::error::{Cause, ErrorKind, LeafError};
 use crate::handle::{downcast_owned, downcast_ref, ErasedBean, Published, Ref};
@@ -175,7 +175,7 @@ impl Engine {
     /// construction fault, or a type mismatch.
     pub async fn get<T: crate::handle::Bean>(&self) -> Result<Ref<T>, LeafError> {
         let id = self.registry.resolve_id(&BeanKey::ByType(TypeId::of::<T>()))?;
-        let cx = ResolveCtx::root();
+        let cx = ResolveCtx::for_engine(self);
         let published = self.create(id, &cx).await?;
         match published.into_shared() {
             Some(bean) => downcast_ref::<T>(bean).map_err(|_| type_mismatch::<T>()),
@@ -191,7 +191,7 @@ impl Engine {
     /// owned (use [`get`](Engine::get)).
     pub async fn get_owned<T: 'static>(&self) -> Result<T, LeafError> {
         let id = self.registry.resolve_id(&BeanKey::ByType(TypeId::of::<T>()))?;
-        let cx = ResolveCtx::root();
+        let cx = ResolveCtx::for_engine(self);
         let published = self.create(id, &cx).await?;
         match published.into_owned() {
             Some(boxed) => downcast_owned::<T>(boxed).map_err(|_| type_mismatch::<T>()),
@@ -207,7 +207,7 @@ impl Engine {
     /// (owned-move), which has no shared handle.
     pub async fn get_erased(&self, key: BeanKey) -> Result<ErasedBean, LeafError> {
         let id = self.registry.resolve_id(&key)?;
-        let cx = ResolveCtx::root();
+        let cx = ResolveCtx::for_engine(self);
         let published = self.create(id, &cx).await?;
         published.into_shared().ok_or_else(|| {
             LeafError::new(ErrorKind::ConstructionFailed).caused_by(Cause::plain(
@@ -299,23 +299,41 @@ impl Engine {
 
     async fn create_scoped(
         &self,
-        _id: BeanId,
-        _scope: ScopeDef,
-        _cx: &ResolveCtx<'_>,
+        id: BeanId,
+        scope: ScopeDef,
+        cx: &ResolveCtx<'_>,
     ) -> Result<Published, LeafError> {
-        // The ambient store is reached through the Cx scope binding (a CxKey the
-        // web/request layer installs at the scope boundary). The ResolveCtx does
-        // not yet carry that accessor (a later leaf-boot wiring): the pipeline that
-        // memoizes a scoped bean (`InstanceStore::get_or_init` over the bare
-        // ErasedBean, identical to the singleton publish) is the same shape, but
-        // without an installed store there is nowhere to put it. So a scoped bean
-        // resolved on a bare engine is a loud ScopeMismatch, never a silent
-        // singleton. TODO(leaf-core): thread the `cx.scope_store(ScopeKind)`
-        // accessor through ResolveCtx so this lane memoizes via the InstanceStore.
-        Err(LeafError::new(ErrorKind::ScopeMismatch).caused_by(Cause::plain(
-            "creating context-scoped bean",
-            "no ambient InstanceStore is installed for this scope (install one via the request/session Cx binding)",
-        )))
+        // The ambient store is reached through the `cx.scope_store(ScopeKind)`
+        // accessor (a binding the web/request layer installs at the scope boundary
+        // via the async-context `Cx`). The scope kind comes from the AmbientStore
+        // store-source; a ContainerStore-backed PerContextKey row is a definition
+        // bug surfaced honestly.
+        let kind = match scope.store {
+            StoreSource::AmbientStore(kind) => kind,
+            StoreSource::ContainerStore => {
+                return Err(LeafError::new(ErrorKind::ScopeMismatch).caused_by(Cause::plain(
+                    "creating context-scoped bean",
+                    "a PerContextKey bean must declare an AmbientStore scope kind, not the container store",
+                )));
+            }
+        };
+
+        // No installed store for this scope kind => a loud ScopeMismatch, never a
+        // silent singleton (matches Spring's "No Scope registered for scope name").
+        let Some(store) = cx.scope_store(kind) else {
+            return Err(LeafError::new(ErrorKind::ScopeMismatch).caused_by(Cause::plain(
+                "creating context-scoped bean",
+                "no ambient InstanceStore is installed for this scope (install one via the request/session Cx binding)",
+            )));
+        };
+
+        // Memoize via the store's at-most-once `get_or_init` (mirrors the
+        // singleton OnceCell, but keyed inside the per-context map and dropped at
+        // scope end). The build future runs the SAME publish pipeline as a
+        // singleton — provide → run_init → publish — over the bare ErasedBean.
+        let build = self.publish_pipeline_shared(id, cx);
+        let bean = store.get_or_init(id, Box::pin(build)).await?;
+        Ok(Published::Shared(bean))
     }
 
     // ── the shared publish pipeline: provide → run_init → publish ──
@@ -765,7 +783,7 @@ mod tests {
             .register(a_desc, Arc::new(AProvider { descriptor: a_desc, resolve_b }))
             .unwrap();
         let engine = Arc::new(Engine::from_builder(builder).unwrap());
-        engine_slot.set(engine.clone()).ok().expect("install");
+        engine_slot.set(engine.clone()).expect("install");
 
         let a = block(engine.get::<A>()).expect("A resolves");
         assert_eq!(a.b.tag, "b");
@@ -1040,5 +1058,221 @@ mod tests {
         let engine = Engine::from_builder(builder).unwrap();
         let err = block(engine.get::<Scoped>()).expect_err("no store installed");
         assert_eq!(err.kind, ErrorKind::ScopeMismatch);
+    }
+
+    // ── scoped bean WITH an installed ambient store memoizes via get_or_init ──
+
+    #[derive(Debug)]
+    struct ReqBean {
+        n: u32,
+    }
+    impl Bean for ReqBean {}
+
+    struct ReqProvider {
+        descriptor: Descriptor,
+        builds: Arc<AtomicUsize>,
+    }
+    impl Provider for ReqProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async move {
+                let n = self.builds.fetch_add(1, Ordering::SeqCst) as u32;
+                Ok(Published::shared_value(ReqBean { n }))
+            })
+        }
+    }
+
+    // A minimal per-request InstanceStore: memoizes the bare ErasedBean per BeanId.
+    struct MapStore {
+        map: Mutex<std::collections::HashMap<crate::identity::BeanId, ErasedBean>>,
+        ledger: crate::lifecycle_engine::TeardownLedger,
+    }
+    impl MapStore {
+        fn new() -> Self {
+            MapStore {
+                map: Mutex::new(std::collections::HashMap::new()),
+                ledger: crate::lifecycle_engine::TeardownLedger::new(),
+            }
+        }
+    }
+    impl crate::lifecycle_engine::InstanceStore for MapStore {
+        fn get_or_init<'a>(
+            &'a self,
+            id: crate::identity::BeanId,
+            build: BoxFuture<'a, Result<ErasedBean, LeafError>>,
+        ) -> BoxFuture<'a, Result<ErasedBean, LeafError>> {
+            Box::pin(async move {
+                if let Some(existing) = self.map.lock().unwrap().get(&id) {
+                    return Ok(existing.clone());
+                }
+                let bean = build.await?;
+                let mut g = self.map.lock().unwrap();
+                Ok(g.entry(id).or_insert(bean).clone())
+            })
+        }
+        fn ledger(&self) -> &crate::lifecycle_engine::TeardownLedger {
+            &self.ledger
+        }
+    }
+
+    // A scope-store accessor binding ScopeKind::REQUEST to one MapStore.
+    struct RequestStores {
+        store: MapStore,
+    }
+    impl crate::provider::ScopeStores for RequestStores {
+        fn store_for(
+            &self,
+            kind: crate::definition::ScopeKind,
+        ) -> Option<&dyn crate::lifecycle_engine::InstanceStore> {
+            if kind == crate::definition::ScopeKind::REQUEST {
+                Some(&self.store)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn context_scoped_bean_with_store_memoizes_via_get_or_init() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let d = descriptor("req", "test::ReqBean", TypeId::of::<ReqBean>(), ScopeDef::REQUEST);
+        let mut builder = RegistryBuilder::new();
+        let id = builder
+            .register(d, Arc::new(ReqProvider { descriptor: d, builds: builds.clone() }))
+            .unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+
+        let stores = RequestStores { store: MapStore::new() };
+        let cx = ResolveCtx::for_engine(&engine).with_scope_stores(&stores);
+
+        // First resolve constructs through the provider and memoizes in the store.
+        let p1 = block(engine.create(id, &cx)).expect("scoped resolves");
+        let b1 = p1.into_shared().expect("scoped is shared");
+        // Second resolve hits the memo: NO second build, SAME Arc.
+        let p2 = block(engine.create(id, &cx)).expect("scoped resolves again");
+        let b2 = p2.into_shared().expect("scoped is shared");
+        assert!(std::ptr::eq(b1.as_ref(), b2.as_ref()), "memoized: same Arc");
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "built exactly once per scope");
+        let r = downcast_ref::<ReqBean>(b1).expect("downcast");
+        assert_eq!(r.n, 0);
+    }
+
+    // ── REAL nested resolution THROUGH the engine via the ResolveCtx back-ref ──
+    //
+    // A three-bean chain A→B→C where each provider resolves its dependency by
+    // reading the REAL engine back-reference off the ResolveCtx the engine threads
+    // into `provide` (no test-side async resolver mirror). C is a leaf singleton.
+
+    #[derive(Debug)]
+    struct C {
+        tag: &'static str,
+    }
+    impl Bean for C {}
+
+    #[derive(Debug)]
+    struct AB {
+        b: Ref<B>,
+        c: Ref<C>,
+    }
+    impl Bean for AB {}
+
+    struct CProvider {
+        descriptor: Descriptor,
+        builds: Arc<AtomicUsize>,
+    }
+    impl Provider for CProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async move {
+                self.builds.fetch_add(1, Ordering::SeqCst);
+                Ok(Published::shared_value(C { tag: "c" }))
+            })
+        }
+    }
+
+    // B depends on C — resolves C THROUGH the engine reached off `cx`.
+    struct BNeedsCProvider {
+        descriptor: Descriptor,
+        builds: Arc<AtomicUsize>,
+    }
+    impl Provider for BNeedsCProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async move {
+                self.builds.fetch_add(1, Ordering::SeqCst);
+                // Real nested resolution: read the engine back-reference off cx.
+                let engine = cx.engine().expect("engine back-reference is threaded");
+                let _c = engine.get::<C>().await?;
+                Ok(Published::shared_value(B { tag: "b" }))
+            })
+        }
+    }
+
+    // AB depends on BOTH B and C — both resolved THROUGH the engine off `cx`.
+    struct ABProvider {
+        descriptor: Descriptor,
+    }
+    impl Provider for ABProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async move {
+                let engine = cx.engine().expect("engine back-reference is threaded");
+                let b = engine.get::<B>().await?;
+                let c = engine.get::<C>().await?;
+                Ok(Published::shared_value(AB { b, c }))
+            })
+        }
+    }
+
+    #[test]
+    fn engine_resolves_a_to_b_to_c_through_the_real_engine_back_reference() {
+        let c_builds = Arc::new(AtomicUsize::new(0));
+        let b_builds = Arc::new(AtomicUsize::new(0));
+        let a_desc = descriptor("a", "test::AB", TypeId::of::<AB>(), ScopeDef::SINGLETON);
+        let b_desc = descriptor("b", "test::B", TypeId::of::<B>(), ScopeDef::SINGLETON);
+        let c_desc = descriptor("c", "test::C", TypeId::of::<C>(), ScopeDef::SINGLETON);
+
+        let mut builder = RegistryBuilder::new();
+        builder
+            .register(c_desc, Arc::new(CProvider { descriptor: c_desc, builds: c_builds.clone() }))
+            .unwrap();
+        builder
+            .register(b_desc, Arc::new(BNeedsCProvider { descriptor: b_desc, builds: b_builds.clone() }))
+            .unwrap();
+        builder.register(a_desc, Arc::new(ABProvider { descriptor: a_desc })).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+
+        // Resolving AB drives the whole chain THROUGH the engine.
+        let a = block(engine.get::<AB>()).expect("AB resolves end-to-end");
+        assert_eq!(a.b.tag, "b");
+        assert_eq!(a.c.tag, "c");
+
+        // Singletons: C and B each built exactly once, shared by identity.
+        assert_eq!(c_builds.load(Ordering::SeqCst), 1, "C built once (shared)");
+        assert_eq!(b_builds.load(Ordering::SeqCst), 1, "B built once (shared)");
+        let c = block(engine.get::<C>()).expect("C resolves");
+        assert!(std::ptr::eq(a.c.as_arc().as_ref(), c.as_arc().as_ref()));
+        let b = block(engine.get::<B>()).expect("B resolves");
+        assert!(std::ptr::eq(a.b.as_arc().as_ref(), b.as_arc().as_ref()));
     }
 }

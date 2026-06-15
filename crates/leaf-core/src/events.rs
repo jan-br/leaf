@@ -32,6 +32,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::error::LeafError;
+use crate::expr::CondExprFn;
 use crate::future::BoxFuture;
 use crate::handle::{Bean, ErasedBean};
 use crate::identity::ContractId;
@@ -184,6 +185,11 @@ pub struct ListenerDescriptor {
     pub supports: Option<SupportsFn>,
     /// Dispatch order WITHIN the event type — the pure [`cmp_order`].
     pub order: OrderKey,
+    /// The `#[event_listener(condition = "…")]` guard, if declared: the
+    /// expr-i18n [`CondExprFn`] (SYNC-PURE; reads the ambient `Cx` via `EvalCx`),
+    /// evaluated AT DISPATCH on the hot path (re-evaluated at fire-time for a
+    /// deferred/transactional listener). `None` => the listener always fires.
+    pub condition: Option<CondExprFn>,
     /// `false` for async/spawn-dispatched listeners (the macro hard-errors if
     /// such a listener also declares a chaining return).
     pub chains: bool,
@@ -197,6 +203,7 @@ impl std::fmt::Debug for ListenerDescriptor {
             .field("host", &self.host)
             .field("event_type", &self.event_type)
             .field("order", &self.order)
+            .field("condition", &self.condition.is_some())
             .field("chains", &self.chains)
             .finish_non_exhaustive()
     }
@@ -213,15 +220,28 @@ pub struct ListenerEntry {
     pub adapter: ErasedAdapterFn,
     /// Dispatch order WITHIN the event type.
     pub order: OrderKey,
+    /// The `#[event_listener(condition = "…")]` guard lifted from the descriptor,
+    /// if any: the expr-i18n [`CondExprFn`] evaluated at dispatch over `EvalCx`.
+    /// `None` => the listener always fires.
+    pub condition: Option<CondExprFn>,
     /// Whether this listener's chaining return is honored (false for async).
     pub chains: bool,
 }
 
 impl ListenerEntry {
-    /// Build an entry from a resolved host + a descriptor's adapter/flags.
+    /// Build an entry from a resolved host + a descriptor's adapter/flags
+    /// (no condition — the common always-fire case).
     #[must_use]
     pub fn new(host: ErasedBean, adapter: ErasedAdapterFn, order: OrderKey, chains: bool) -> Self {
-        ListenerEntry { host, adapter, order, chains }
+        ListenerEntry { host, adapter, order, condition: None, chains }
+    }
+
+    /// Attach (or clear) the dispatch-time condition guard (builder style) — the
+    /// expr-i18n [`CondExprFn`] lifted from the [`ListenerDescriptor`].
+    #[must_use]
+    pub fn with_condition(mut self, condition: Option<CondExprFn>) -> Self {
+        self.condition = condition;
+        self
     }
 
     /// Invoke this listener over the erased event payload.
@@ -766,6 +786,66 @@ mod tests {
             *log.lock().unwrap(),
             vec!["first:5".to_string(), "second:5".to_string(), "third:5".to_string()]
         );
+    }
+
+    // ── condition slot (closure 4): ListenerDescriptor + ListenerEntry ──
+
+    #[test]
+    fn listener_descriptor_carries_an_optional_condition_slot() {
+        use crate::expr::{CondExprFn, EvalCx};
+        const ALWAYS: CondExprFn = |_cx: &EvalCx| Ok(true);
+        let d = ListenerDescriptor {
+            host: ContractId::of("app::OrderListener"),
+            event_type: TypeId::of::<OrderPlaced>(),
+            supports: None,
+            order: OrderKey::implicit(),
+            condition: Some(ALWAYS),
+            chains: true,
+            adapter: log_adapter,
+        };
+        assert!(d.condition.is_some());
+        // The slot is the expr-i18n CondExprFn (a sync-pure fn pointer).
+        let env = crate::env::EnvBuilder::new().seal_env();
+        struct NoBeans;
+        impl crate::expr::BeanResolver for NoBeans {
+            fn bean(&self, _n: &str) -> Result<ErasedBean, crate::proxy::ResolveError> {
+                Err(LeafError::new(crate::ErrorKind::NoSuchBean))
+            }
+            fn factory(&self, _n: &str) -> Result<ErasedBean, crate::proxy::ResolveError> {
+                Err(LeafError::new(crate::ErrorKind::NoSuchBean))
+            }
+        }
+        let beans = NoBeans;
+        let cx = EvalCx::new(&env, &beans);
+        assert!((d.condition.unwrap())(&cx).unwrap());
+    }
+
+    #[test]
+    fn listener_descriptor_condition_defaults_to_none_when_absent() {
+        let d = ListenerDescriptor {
+            host: ContractId::of("app::PlainListener"),
+            event_type: TypeId::of::<OrderPlaced>(),
+            supports: None,
+            order: OrderKey::implicit(),
+            condition: None,
+            chains: false,
+            adapter: log_adapter,
+        };
+        assert!(d.condition.is_none());
+    }
+
+    #[test]
+    fn listener_entry_carries_a_condition_and_new_defaults_it_to_none() {
+        use crate::expr::{CondExprFn, EvalCx};
+        let host: Arc<LogHost> = Arc::new(LogHost { log: Arc::new(Mutex::new(Vec::new())), name: "h" });
+        // The plain constructor keeps the prior contract: no condition.
+        let plain = ListenerEntry::new(Arc::clone(&host) as ErasedBean, log_adapter, OrderKey::implicit(), true);
+        assert!(plain.condition.is_none());
+        // The condition-aware builder threads the CondExprFn.
+        const PRED: CondExprFn = |_cx: &EvalCx| Ok(false);
+        let conditioned = ListenerEntry::new(host as ErasedBean, log_adapter, OrderKey::implicit(), true)
+            .with_condition(Some(PRED));
+        assert!(conditioned.condition.is_some());
     }
 
     #[test]

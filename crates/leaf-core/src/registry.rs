@@ -453,10 +453,34 @@ impl RegistryBuilder {
         let mut aliases: HashMap<BeanName, BeanId> = HashMap::new();
         let mut by_contract: HashMap<ContractId, BeanId> = HashMap::new();
 
+        // Parent-template lookup for the freeze-time parent→merged collapse
+        // (order-independent: a child may register before its template). Built
+        // BEFORE the main pass so `merge_descriptor` can resolve any parent link.
+        let templates: HashMap<ContractId, Descriptor> = self
+            .beans
+            .iter()
+            .map(|b| (b.descriptor.contract, b.descriptor))
+            .collect();
+
         // First pass: dense rows/providers/singletons + type/name/contract indices.
         for (i, bean) in self.beans.into_iter().enumerate() {
             let id = BeanId(i as u32);
-            let d = bean.descriptor;
+            // The parent→merged template collapse (the freeze IS the merge moment):
+            // a child with a `parent` link is replaced by its merged form here, so
+            // no runtime MergedBeanDefinition type exists. A dangling parent is a
+            // loud NoSuchBean (never a silent unmerged child).
+            let d = match bean.descriptor.parent {
+                None => bean.descriptor,
+                Some(parent_contract) => {
+                    let parent = templates.get(&parent_contract).ok_or_else(|| {
+                        no_such_bean(&format!(
+                            "parent template {parent_contract:?} of {:?}",
+                            bean.descriptor.contract
+                        ))
+                    })?;
+                    crate::definition::merge_descriptor(&bean.descriptor, parent)
+                }
+            };
 
             // by_contract: a duplicate ContractId is a hard collision (two
             // distinct canonical paths hashed to one id, or a genuine dup row).
@@ -1034,5 +1058,87 @@ mod tests {
         assert_ne!(id0, id1);
         let reg = b.freeze().expect("freeze");
         assert_eq!(reg.len(), 2);
+    }
+
+    // ── parent → merged template collapse at freeze (closure 5) ───────────────
+
+    #[test]
+    fn freeze_collapses_a_child_descriptor_against_its_parent_template() {
+        use crate::definition::{CandidateRole, Role};
+        use crate::identity::MarkerId;
+
+        // A parent TEMPLATE carrying qualifiers + a PRIMARY candidate_role +
+        // an alias, registered as Infrastructure/PROTOTYPE.
+        static PARENT_META: AnnotationMetadata = AnnotationMetadata {
+            qualifiers: &[MarkerId::of("leaf::q::template")],
+            markers: &[],
+            depends_on: &[],
+            candidate_role: CandidateRole::PRIMARY,
+            autowire_candidate: true,
+        };
+        let parent = Descriptor {
+            contract: ContractId::of("crate::AbstractRepo"),
+            self_type: TypeId::of::<Beta>(),
+            provides: &[],
+            declared_name: Some("abstractRepo"),
+            aliases: &["repoTemplate"],
+            scope: ScopeDef::PROTOTYPE,
+            role: Role::Infrastructure,
+            meta: &PARENT_META,
+            parent: None,
+            origin: Origin::Native { crate_name: Some("tmpl") },
+        };
+        let p_parent: Arc<dyn Provider> = Arc::new(BetaProvider { descriptor: parent });
+
+        // The CHILD declares NO meta of its own + a SINGLETON/Application scope,
+        // and points at the parent template by ContractId.
+        let child = Descriptor {
+            contract: ContractId::of("crate::OrderRepo"),
+            self_type: TypeId::of::<Alpha>(),
+            provides: &[],
+            declared_name: Some("orderRepo"),
+            aliases: &[],
+            scope: ScopeDef::SINGLETON,
+            role: Role::Application,
+            meta: &AnnotationMetadata::EMPTY,
+            parent: Some(ContractId::of("crate::AbstractRepo")),
+            origin: Origin::Native { crate_name: Some("app") },
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p_child: Arc<dyn Provider> =
+            Arc::new(AlphaProvider { descriptor: child, n: 1, calls });
+
+        let mut b = RegistryBuilder::new();
+        b.register(parent, p_parent).expect("register parent");
+        let child_id = b.register(child, p_child).expect("register child");
+        let reg = b.freeze().expect("freeze");
+
+        let merged = reg.descriptor(child_id);
+        // Child kept its OWN scope + role.
+        assert_eq!(merged.scope, ScopeDef::SINGLETON);
+        assert_eq!(merged.role, Role::Application);
+        // Inherited the parent template's meta (qualifiers + candidate_role).
+        assert_eq!(merged.meta.qualifiers.len(), 1);
+        assert_eq!(merged.meta.candidate_role, CandidateRole::PRIMARY);
+        // Inherited the parent's alias (child declared none).
+        assert_eq!(merged.aliases, &["repoTemplate"]);
+        // The parent link is collapsed at freeze (no recompute later).
+        assert!(merged.parent.is_none());
+        // Identity stays the child's.
+        assert_eq!(merged.contract, ContractId::of("crate::OrderRepo"));
+    }
+
+    #[test]
+    fn freeze_with_a_dangling_parent_is_a_loud_error() {
+        // A child naming a parent template that was never registered must NOT
+        // silently keep the child unmerged — it is a loud NoSuchBean at freeze.
+        let child = descriptor("crate::Child", TypeId::of::<Alpha>(), Some("child"), &[], &[]);
+        let child = Descriptor { parent: Some(ContractId::of("crate::MissingParent")), ..child };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p: Arc<dyn Provider> = Arc::new(AlphaProvider { descriptor: child, n: 1, calls });
+        let mut b = RegistryBuilder::new();
+        b.register(child, p).expect("register child");
+        let err = b.freeze().expect_err("dangling parent");
+        assert_eq!(err.kind, ErrorKind::NoSuchBean);
     }
 }

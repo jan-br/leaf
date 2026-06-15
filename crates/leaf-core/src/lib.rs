@@ -117,16 +117,17 @@ pub use order::{
 };
 
 pub use error::{
-    analyze_first, AnalysisCtx, Cause, CauseDetail, Diagnostic, ErrorKind, FailureAnalysis,
-    FailureAnalyzer, LeafError, Origin, RenderStyle, Severity,
+    analyze_first, AnalysisCtx, CandidateInfo, Cause, CauseDetail, Diagnostic, ErrorKind,
+    FailureAnalysis, FailureAnalyzer, InjectionEdge, LeafError, NarrowStep, Origin, RenderStyle,
+    Severity,
 };
 
 pub use definition::{
-    AnnotationMetadata, CandidateRole, Descriptor, Multiplicity, Primacy, Role, ScopeDef, ScopeKind,
-    StoreSource, TeardownPolicy, TypeRow, UpcastFn,
+    merge_descriptor, AnnotationMetadata, CandidateRole, Descriptor, Multiplicity, Primacy, Role,
+    ScopeDef, ScopeKind, StoreSource, TeardownPolicy, TypeRow, UpcastFn,
 };
 
-pub use provider::{FactoryBean, Provider, ProviderSeed, ResolveCtx};
+pub use provider::{FactoryBean, Provider, ProviderSeed, ResolveCtx, ScopeStores};
 
 // ── UNIT 4 — link-time discovery slices + the programmatic Registrar SPI ──
 //
@@ -167,10 +168,11 @@ pub use registry::{is_null_bean, NullMarker, Registry, RegistryBuilder, NULL_BEA
 // `Container` back-ref — single-phase construction, deferral-only cycle break).
 
 pub use injection::{
-    collect_ordered, layers, reject_advised_concrete, resolved_to_result, Arity, Cand,
-    CandidateSet, Cardinality, CollectionShape, Container, ContainerRef, Inject, InjectionPlan,
+    collect_ordered, layers, no_unique_bean_traced, reject_advised_concrete, resolved_to_result,
+    resolved_to_result_traced, trace_to_steps, Arity, Cand, CandidateSet, Cardinality,
+    CollectionShape, Container, ContainerRef, DescriptorFilter, Inject, InjectionPlan,
     InjectionPoint, Layer, LazyRef, Lookup, PointKind, QualifierReq, Resolve, ResolveFn, Resolved,
-    Selector, SelfRef, Strictness, Trace, Verdict, LAYERS,
+    Selector, SelfRef, Strictness, StreamOrder, Trace, Verdict, ViewUpcast, LAYERS,
 };
 
 // ── UNIT 7 — environment + property binding + conversion ──
@@ -199,7 +201,7 @@ pub use relaxed::{
 };
 
 pub use placeholder::{
-    has_expr, interpret, resolve_lenient, resolve_strict, PlaceholderSyntax,
+    has_expr, interpret, interpret_with, resolve_lenient, resolve_strict, PlaceholderSyntax,
     Segment as ValueSegment, DEFAULT_DEPTH_CAP,
 };
 
@@ -387,8 +389,8 @@ pub use conditions::{
 
 pub use expr::{
     Arg, BeanResolver, CacheKeyValue, CatalogDescriptor, CondExprFn, EvalCx, Existence, ExprError,
-    KeyExprFn, Locale, Location, MessageCatalogProvider, MessagePattern, MessageResolvable,
-    MessageSource, Pattern, Resource, ResourceEntry, ResourceId, ResourceLoader,
+    ExpressionEvaluator, KeyExprFn, Locale, Location, MessageCatalogProvider, MessagePattern,
+    MessageResolvable, MessageSource, Pattern, Resource, ResourceEntry, ResourceId, ResourceLoader,
     ResourcePatternResolver, ResourceProvider, ResourceReader, Scheme, ValueExpr,
 };
 

@@ -55,10 +55,11 @@
 use std::any::TypeId;
 use std::sync::{Arc, Weak};
 
+use futures::StreamExt;
 use smallvec::SmallVec;
 
 use crate::definition::CandidateRole;
-use crate::error::{Cause, ErrorKind, LeafError};
+use crate::error::{CandidateInfo, Cause, CauseDetail, ErrorKind, LeafError, NarrowStep};
 use crate::future::BoxFuture;
 use crate::handle::{downcast_ref, Published, Ref};
 use crate::identity::{BeanId, BeanKey, MarkerId};
@@ -342,6 +343,13 @@ pub struct Cand<'a> {
     /// `true` iff this bean is advised (wrapped by an advisor chain), so a
     /// concrete-`TypeId` injection of it is the `AdvisedConcreteInjection` error.
     pub advised: bool,
+    /// `true` iff this is a SYNTHETIC `ResolvableDependency` candidate (a
+    /// by-type infra handle — `BeanFactory`/`Context`/`Environment` — that is NOT
+    /// a registered bean slot but is injectable by type). The terminal
+    /// [`resolvable_dep`](layers::resolvable_dep) layer folds it into the by-type
+    /// count at LOWEST precedence: it wins only when it is the sole candidate, and
+    /// is shadowed by any real registered bean of the same type.
+    pub resolvable: bool,
 }
 
 impl<'a> Cand<'a> {
@@ -360,6 +368,7 @@ impl<'a> Cand<'a> {
             autowire_candidate: true,
             concrete_match: false,
             advised: false,
+            resolvable: false,
         }
     }
 
@@ -522,7 +531,7 @@ impl Trace {
 /// none widens the set or invents a winner. The fold driver
 /// ([`Selector::resolve_one`]) owns short-circuiting and the SOLE len-rule.
 pub mod layers {
-    use super::{Cand, CandidateRole, InjectionPoint, Verdict};
+    use super::{Cand, InjectionPoint, Verdict};
     use smallvec::SmallVec;
 
     fn collect<'a>(it: impl Iterator<Item = Cand<'a>>) -> SmallVec<[Cand<'a>; 4]> {
@@ -688,14 +697,31 @@ pub mod layers {
         }
     }
 
-    /// `resolvable_dep` — the terminal layer (lowest precedence): a placeholder
-    /// for the `ResolvableDependency` (`HashMap<TypeId, ErasedBean>`) fold the
-    /// registry/engine units flesh out. It currently abstains (the synthetic
-    /// resolvable beans fold into the by-type count at the terminal len-rule).
+    /// `resolvable_dep` — the terminal layer (lowest precedence): the
+    /// `ResolvableDependency` fold (Spring's `registerResolvableDependency`). A
+    /// SYNTHETIC resolvable candidate (a by-type infra handle —
+    /// `BeanFactory`/`Context`/`Environment` — not a registered bean slot) is
+    /// folded into the by-type count at LOWEST precedence:
+    ///
+    /// - if any REAL (`!resolvable`) candidate coexists, DROP every synthetic
+    ///   resolvable (a real registered bean of the type SHADOWS the infra handle
+    ///   — the predictable-shadowing contract), narrowing to the reals;
+    /// - otherwise (all-synthetic, or nothing to demote) ABSTAIN, so the terminal
+    ///   len-rule folds the synthetic candidate(s) into the count — a lone
+    ///   resolvable wins as `One`, two ambiguous resolvables are a loud
+    ///   `NoUniqueBean`.
     #[must_use]
-    pub fn resolvable_dep<'a>(_ip: &InjectionPoint, _set: &[Cand<'a>]) -> Verdict<'a> {
-        let _ = CandidateRole::NORMAL; // keep the import meaningful for future use
-        Verdict::Abstain
+    pub fn resolvable_dep<'a>(_ip: &InjectionPoint, set: &[Cand<'a>]) -> Verdict<'a> {
+        let has_real = set.iter().any(|c| !c.resolvable);
+        let has_synthetic = set.iter().any(|c| c.resolvable);
+        if has_real && has_synthetic {
+            // A real registered bean shadows the synthetic resolvable handle.
+            Verdict::Narrowed(collect(set.iter().copied().filter(|c| !c.resolvable)))
+        } else {
+            // All-real (nothing to fold) or all-synthetic (let the len-rule count
+            // them): no opinion here.
+            Verdict::Abstain
+        }
     }
 }
 
@@ -813,19 +839,61 @@ pub fn no_such_bean(ip: &InjectionPoint) -> LeafError {
     ))
 }
 
-/// Build a `NoUniqueBean` naming the ambiguous candidates (the `>1` outcome).
+/// Project a [`Cand`] read-view into the owned [`CandidateInfo`] the diagnostic
+/// chain carries (the error node owns its narrative, never a borrow into the
+/// frozen registry). The rendered type-name is the injection point's `produced`
+/// type — every candidate matched that one point.
+fn candidate_info(ip: &InjectionPoint, c: &Cand<'_>) -> CandidateInfo {
+    CandidateInfo::new(c.name.to_string(), format!("{:?}", ip.produced))
+}
+
+/// Project a recorded [`Trace`] into the owned [`NarrowStep`] rows the
+/// `Candidates` diagnostic carries (so the error replays the failed fold).
+#[must_use]
+pub fn trace_to_steps(trace: &Trace) -> Box<[NarrowStep]> {
+    trace
+        .steps()
+        .iter()
+        .map(|(layer, in_len, out_len)| NarrowStep {
+            layer,
+            in_len: *in_len,
+            out_len: *out_len,
+        })
+        .collect()
+}
+
+/// Build a `NoUniqueBean` carrying the RICH [`CauseDetail::Candidates`] payload —
+/// every considered candidate (the §1.7 rich-context requirement). No fold trace
+/// is attached (use [`no_unique_bean_traced`] when the Selector recorded one).
 #[must_use]
 pub fn no_unique_bean(ip: &InjectionPoint, candidates: &[Cand<'_>]) -> LeafError {
-    let names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
-    LeafError::new(ErrorKind::NoUniqueBean).caused_by(Cause::plain(
-        "resolving injection point",
-        format!(
-            "{} candidates matched `{}`; expected exactly one — candidates: [{}]",
-            candidates.len(),
-            ip.name,
-            names.join(", ")
-        ),
-    ))
+    no_unique_bean_traced_inner(ip, candidates, None)
+}
+
+/// Build a `NoUniqueBean` carrying BOTH the considered candidate list AND the
+/// Selector's narrowing-fold [`Trace`] (the §1.7 rich context, fully populated).
+#[must_use]
+pub fn no_unique_bean_traced(
+    ip: &InjectionPoint,
+    candidates: &[Cand<'_>],
+    trace: Option<&Trace>,
+) -> LeafError {
+    no_unique_bean_traced_inner(ip, candidates, trace)
+}
+
+fn no_unique_bean_traced_inner(
+    ip: &InjectionPoint,
+    candidates: &[Cand<'_>],
+    trace: Option<&Trace>,
+) -> LeafError {
+    let considered: Box<[CandidateInfo]> =
+        candidates.iter().map(|c| candidate_info(ip, c)).collect();
+    let steps: Box<[NarrowStep]> = trace.map(trace_to_steps).unwrap_or_else(|| Box::new([]));
+    LeafError::new(ErrorKind::NoUniqueBean).caused_by(Cause {
+        what: "resolving injection point",
+        detail: CauseDetail::Candidates { considered, trace: steps },
+        origin: crate::error::Origin::Unknown,
+    })
 }
 
 /// Map a [`Resolved`] outcome to a `Result<Cand, LeafError>` honoring the
@@ -842,6 +910,24 @@ pub fn resolved_to_result<'a>(
     ip: &InjectionPoint,
     resolved: Resolved<'a>,
 ) -> Result<Option<Cand<'a>>, LeafError> {
+    resolved_to_result_traced(ip, resolved, None)
+}
+
+/// Map a [`Resolved`] outcome to a `Result<Cand, LeafError>` (as
+/// [`resolved_to_result`]) while threading the Selector's narrowing [`Trace`]
+/// into the `NoUniqueBean` error's rich [`CauseDetail::Candidates`] payload.
+///
+/// The traced fold feeds [`NarrowStep`] (the ADR-12 §1.7 rich-context
+/// requirement) — pass the `Trace` returned by [`Selector::resolve_one`].
+///
+/// # Errors
+/// [`ErrorKind::NoSuchBean`] for a mandatory absent point; [`ErrorKind::NoUniqueBean`]
+/// (carrying the considered list + the fold trace) for any ambiguous point.
+pub fn resolved_to_result_traced<'a>(
+    ip: &InjectionPoint,
+    resolved: Resolved<'a>,
+    trace: Option<&Trace>,
+) -> Result<Option<Cand<'a>>, LeafError> {
     match resolved {
         Resolved::One(c) => Ok(Some(c)),
         Resolved::None => {
@@ -851,7 +937,7 @@ pub fn resolved_to_result<'a>(
                 Err(no_such_bean(ip))
             }
         }
-        Resolved::Ambiguous(cands) => Err(no_unique_bean(ip, &cands)),
+        Resolved::Ambiguous(cands) => Err(no_unique_bean_traced(ip, &cands, trace)),
     }
 }
 
@@ -924,6 +1010,25 @@ pub type ResolveFn = dyn Fn(BeanKey, Strictness, Cardinality) -> BoxFuture<'stat
 /// The captured resolve closure, ref-counted so each handle clone is cheap.
 pub type Resolve = Arc<ResolveFn>;
 
+/// The ordering applied to a multi-candidate enumeration ([`Container::resolve_many`]).
+///
+/// `Registration` is the dense-`BeanId` registration order (`Lookup::stream`);
+/// `CmpOrder` applies the ONE [`cmp_order`](crate::cmp_order) over each
+/// candidate's `OrderKey` (`Lookup::ordered_stream`), so the lazy stream and the
+/// eager `Vec<T>` injection never diverge.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum StreamOrder {
+    /// Dense `BeanId` registration order (the `stream` default).
+    Registration,
+    /// The one [`cmp_order`](crate::cmp_order) over each candidate's `OrderKey`.
+    CmpOrder,
+}
+
+/// A descriptor predicate applied PRE-CONSTRUCTION by [`Container::resolve_many`]
+/// for [`Lookup::stream_filtered`] — candidates are filtered on their frozen
+/// [`Descriptor`](crate::Descriptor) before any are built.
+pub type DescriptorFilter<'a> = &'a (dyn Fn(&crate::definition::Descriptor) -> bool + Send + Sync);
+
 /// The minimal container back-reference trait a deferral handle's [`Weak`] points
 /// at. The engine/container unit implements it; the kernel only needs the
 /// `resolve` entry point so [`Lookup`]/[`LazyRef`]/[`Inject`]/[`SelfRef`] are
@@ -937,6 +1042,38 @@ pub trait Container: Send + Sync {
         strictness: Strictness,
         cardinality: Cardinality,
     ) -> BoxFuture<'_, Result<Published, LeafError>>;
+
+    /// Enumerate ALL candidate publications for `key` (the `Cardinality::Multiple`
+    /// path that backs [`Lookup::stream`]/[`ordered_stream`](Lookup::ordered_stream)/
+    /// [`stream_filtered`](Lookup::stream_filtered)).
+    ///
+    /// `mode` selects registration vs [`cmp_order`](crate::cmp_order) ordering;
+    /// `filter`, if present, drops candidates by their frozen
+    /// [`Descriptor`](crate::Descriptor) BEFORE any construction. An empty
+    /// candidate set is an empty `Vec`, never `NoSuchBean` (collection semantics).
+    ///
+    /// A PROVIDED method: the default falls back to a single [`resolve`](Container::resolve)
+    /// (absence-tolerant), yielding a 0-or-1 element set, so existing single-bean
+    /// `Container` impls keep working unchanged; the real engine overrides it with
+    /// true dense-`BeanId` candidate enumeration.
+    ///
+    /// # Errors
+    /// Propagates a [`LeafError`] from candidate construction (never absence).
+    fn resolve_many<'a>(
+        &'a self,
+        key: BeanKey,
+        mode: StreamOrder,
+        filter: Option<DescriptorFilter<'a>>,
+    ) -> BoxFuture<'a, Result<SmallVec<[Published; 4]>, LeafError>> {
+        let _ = (mode, filter);
+        Box::pin(async move {
+            match self.resolve(key, Strictness::AbsenceTolerant, Cardinality::Multiple).await {
+                Ok(p) => Ok(std::iter::once(p).collect()),
+                Err(e) if e.kind == ErrorKind::NoSuchBean => Ok(SmallVec::new()),
+                Err(e) => Err(e),
+            }
+        })
+    }
 }
 
 /// The shared back-reference a deferral handle holds: a [`Weak`] to the
@@ -956,14 +1093,26 @@ fn container_gone() -> LeafError {
     ))
 }
 
+/// The macro-emitted const upcast coercer for a `dyn Svc` (`?Sized`) injection
+/// target: maps a resolved [`Published`] handle to a typed [`Ref<T>`] over the
+/// `dyn Svc` view.
+///
+/// This is the [`Lookup::get_view`] counterpart of the kernel's concrete
+/// [`published_to_ref`] (which is `downcast_ref`-based and `Sized`-only). The
+/// macro emits — beside the bean's `provides[]`/[`TypeRow`](crate::TypeRow) row —
+/// a `fn(Published) -> Result<Ref<dyn Svc>, LeafError>` that downcasts to the
+/// concrete and unsizes the `Arc` to the `dyn Svc` view (trait upcasting).
+pub type ViewUpcast<T> = fn(Published) -> Result<Ref<T>, LeafError>;
+
 /// `Lookup<T>` (= Spring's `ObjectProvider`): the lazy 0..N re-resolving handle.
 ///
 /// The honest VISIBLE handle (not a `Deref`-to-`T`, not a transparent proxy):
 /// failure is honest at the call site. `get`/`get_if_available`/`get_if_unique`
 /// map the three [`Strictness`] tiers; `get_owned` is the prototype fresh-per-
 /// call path; the stream methods are the lazy collection counterpart (same
-/// [`cmp_order`] as the eager `Vec`, so ordering never diverges). Resolution
-/// runs on the CALLER's task through the captured [`Resolve`] closure.
+/// [`cmp_order`] as the eager `Vec`, so ordering never diverges); `get_view` is
+/// the `dyn Svc` (`?Sized`)-target variant over the `provides[]` upcast row.
+/// Resolution runs on the CALLER's task through the captured [`Resolve`] closure.
 pub struct Lookup<T: ?Sized> {
     key: BeanKey,
     container: ContainerRef,
@@ -1034,6 +1183,145 @@ impl<T: ?Sized + 'static> Lookup<T> {
         match self.resolve_with(Strictness::FullyTolerant).await {
             Ok(published) => published_to_ref::<T>(published).ok(),
             Err(_) => None,
+        }
+    }
+
+    /// `get` for a `dyn Svc` (`?Sized`) TARGET, resolved through the
+    /// `provides[]`/[`TypeRow`](crate::TypeRow) upcast row.
+    ///
+    /// A `Ref<dyn Svc>` cannot be produced by the kernel's `downcast_ref` (which
+    /// is `Sized`-only). The macro emits — beside the `provides[]` row — a const
+    /// [`ViewUpcast<T>`] coercer that downcasts the published handle to the bean's
+    /// CONCRETE type and unsizes the `Arc` to the `dyn Svc` view (trait upcasting,
+    /// stable since 1.86); this method drives a `Strict, Single` resolve and
+    /// applies that coercer, so `Lookup<dyn Svc>` resolves identically to a
+    /// concrete `Lookup<T>::get` but yields the trait-object handle.
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoSuchBean`]/[`ErrorKind::NoUniqueBean`] on absence/ambiguity,
+    /// or the coercer's error if the published bean does not carry the view.
+    pub async fn get_view(&self, upcast: ViewUpcast<T>) -> Result<Ref<T>, LeafError> {
+        let published = self.resolve_with(Strictness::Strict).await?;
+        upcast(published)
+    }
+
+    /// `get_if_available` for a `dyn Svc` (`?Sized`) target: `None` on absence,
+    /// error on ambiguity — the upcast-row counterpart of [`get_if_available`](Lookup::get_if_available).
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoUniqueBean`] on ambiguity (absence is `Ok(None)`).
+    pub async fn get_view_if_available(
+        &self,
+        upcast: ViewUpcast<T>,
+    ) -> Result<Option<Ref<T>>, LeafError> {
+        match self.resolve_with(Strictness::AbsenceTolerant).await {
+            Ok(published) => upcast(published).map(Some),
+            Err(e) if e.kind == ErrorKind::NoSuchBean => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `get_if_unique` for a `dyn Svc` (`?Sized`) target: `None` on BOTH absence
+    /// and ambiguity — the upcast-row counterpart of [`get_if_unique`](Lookup::get_if_unique).
+    pub async fn get_view_if_unique(&self, upcast: ViewUpcast<T>) -> Option<Ref<T>> {
+        match self.resolve_with(Strictness::FullyTolerant).await {
+            Ok(published) => upcast(published).ok(),
+            Err(_) => None,
+        }
+    }
+
+    /// Enumerate candidate publications in `mode`, optionally pre-filtered by
+    /// descriptor, mapping each to a typed `Ref<T>`. The shared driver behind
+    /// `stream`/`ordered_stream`/`stream_filtered`.
+    ///
+    /// Eager-collected on the caller's task then streamed (the lazy-collection
+    /// counterpart of the eager `Vec<T>`): a dead container is the honest
+    /// [`ErrorKind::Cancelled`], never a swallowed empty stream.
+    async fn resolve_stream(
+        &self,
+        mode: StreamOrder,
+        filter: Option<DescriptorFilter<'_>>,
+    ) -> Vec<Result<Ref<T>, LeafError>>
+    where
+        T: Sized + Send + Sync,
+    {
+        let Some(container) = self.container.upgrade() else {
+            return vec![Err(container_gone())];
+        };
+        match container.resolve_many(self.key.clone(), mode, filter).await {
+            Ok(published) => published.into_iter().map(published_to_ref::<T>).collect(),
+            Err(e) => vec![Err(e)],
+        }
+    }
+
+    /// `stream` — the lazy 0..N collection in dense `BeanId` REGISTRATION order
+    /// (`ObjectProvider::stream`). The eager `Vec<T>` injection-point counterpart.
+    pub fn stream(&self) -> impl futures::Stream<Item = Result<Ref<T>, LeafError>> + '_
+    where
+        T: Sized + Send + Sync,
+    {
+        futures::stream::once(async move { self.resolve_stream(StreamOrder::Registration, None).await })
+            .flat_map(futures::stream::iter)
+    }
+
+    /// `ordered_stream` — the lazy 0..N collection in the ONE
+    /// [`cmp_order`](crate::cmp_order) (`ObjectProvider::orderedStream`), so it
+    /// never diverges from the eager `Vec<T>`'s ordering.
+    pub fn ordered_stream(&self) -> impl futures::Stream<Item = Result<Ref<T>, LeafError>> + '_
+    where
+        T: Sized + Send + Sync,
+    {
+        futures::stream::once(async move { self.resolve_stream(StreamOrder::CmpOrder, None).await })
+            .flat_map(futures::stream::iter)
+    }
+
+    /// `stream_filtered` — the lazy collection with a descriptor predicate applied
+    /// PRE-CONSTRUCTION (candidates are dropped on their frozen `Descriptor`
+    /// before any are built), in registration order.
+    pub fn stream_filtered<'s, F>(
+        &'s self,
+        pred: F,
+    ) -> impl futures::Stream<Item = Result<Ref<T>, LeafError>> + 's
+    where
+        T: Sized + Send + Sync,
+        F: Fn(&crate::definition::Descriptor) -> bool + Send + Sync + 's,
+    {
+        futures::stream::once(async move {
+            self.resolve_stream(StreamOrder::Registration, Some(&pred)).await
+        })
+        .flat_map(futures::stream::iter)
+    }
+
+    /// `get_owned` — the PROTOTYPE fresh-per-call path: resolve a
+    /// `Published::Owned` move and hand back the owned `T` (never a `Ref`).
+    ///
+    /// The handle does NOT cache (the fresh-per-call contract for a prototype
+    /// target); each call drives a new construction.
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoSuchBean`] on absence/type-mismatch, or if the target is a
+    /// SHARED bean (use [`get`](Lookup::get)) rather than an owned prototype.
+    pub async fn get_owned(&self) -> Result<T, LeafError>
+    where
+        T: Sized + Send,
+    {
+        let Some(container) = self.container.upgrade() else {
+            return Err(container_gone());
+        };
+        let published = container
+            .resolve(self.key.clone(), Strictness::Strict, Cardinality::Single)
+            .await?;
+        match published.into_owned() {
+            Some(boxed) => crate::handle::downcast_owned::<T>(boxed).map_err(|_| {
+                LeafError::new(ErrorKind::NoSuchBean).caused_by(Cause::plain(
+                    "resolving owned deferral handle",
+                    "resolved prototype's concrete type did not match the handle's target type",
+                ))
+            }),
+            None => Err(LeafError::new(ErrorKind::NoSuchBean).caused_by(Cause::plain(
+                "resolving owned deferral handle",
+                "target is a shared bean, not a prototype owned move; use get(), not get_owned()",
+            ))),
         }
     }
 }
@@ -1278,6 +1566,44 @@ mod tests {
         assert!(err.to_string().contains('a'));
     }
 
+    // ── rich NoUniqueBean: the considered list + the traced fold (closure 1) ──
+
+    #[test]
+    fn no_unique_bean_carries_a_candidates_cause_detail() {
+        let cands = [cand(0, "a"), cand(1, "b")];
+        let err = no_unique_bean(&ip_single(), &cands);
+        // The chain's FIRST cause node now carries the rich Candidates payload.
+        let first = err.chain.first().expect("a cause node");
+        match &first.detail {
+            crate::error::CauseDetail::Candidates { considered, .. } => {
+                assert_eq!(considered.len(), 2);
+                assert!(considered.iter().any(|c| c.name == "a"));
+                assert!(considered.iter().any(|c| c.name == "b"));
+            }
+            other => panic!("expected Candidates detail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_to_result_traced_feeds_the_narrowing_trace() {
+        // Two distinct plain candidates with no tie-break -> Ambiguous + a trace.
+        let s = set([cand(0, "a"), cand(1, "b")]);
+        let (resolved, trace) = Selector::resolve_one(&ip_single(), &s);
+        let trace = trace.expect("the >1 path records a trace");
+        let err = resolved_to_result_traced(&ip_single(), resolved, Some(&trace))
+            .expect_err("ambiguous");
+        assert_eq!(err.kind, ErrorKind::NoUniqueBean);
+        match &err.chain.first().expect("a cause").detail {
+            crate::error::CauseDetail::Candidates { considered, trace } => {
+                assert_eq!(considered.len(), 2);
+                // The narrowing fold's steps are carried as NarrowStep rows.
+                assert!(!trace.is_empty(), "the traced fold steps are recorded");
+                assert!(trace.iter().any(|s| s.layer == "primary_promote"));
+            }
+            other => panic!("expected Candidates detail, got {other:?}"),
+        }
+    }
+
     // ── primary_promote: @Primary tie-break wins ────────────────────────────
 
     #[test]
@@ -1401,6 +1727,37 @@ mod tests {
         let s = set([strong, weak]);
         let (resolved, _) = Selector::resolve_one(&ip, &s);
         assert_eq!(resolved.winner().expect("strong wins").id, BeanId(0));
+    }
+
+    // ── resolvable_dep: synthetic infra-handle folds into the count ──────────
+
+    #[test]
+    fn resolvable_dep_synthetic_candidate_wins_alone() {
+        // A synthetic ResolvableDependency candidate (a by-type infra handle, e.g.
+        // the BeanFactory/Context handle) is the sole candidate: it resolves as the
+        // unique winner — the terminal layer folds it into the by-type count.
+        let mut synthetic = cand(0, "applicationContext");
+        synthetic.resolvable = true;
+        let s = set([synthetic]);
+        let (resolved, _) = Selector::resolve_one(&ip_single(), &s);
+        assert_eq!(resolved.winner().expect("resolvable infra handle wins alone").id, BeanId(0));
+    }
+
+    #[test]
+    fn resolvable_dep_is_shadowed_by_a_real_registered_bean() {
+        // An infra-handle type ALSO registered as a real bean: the real bean
+        // shadows the synthetic resolvable dependency (lowest precedence), so the
+        // ambiguity arithmetic stays correct (the resolvable never beats a real
+        // candidate, and never makes a unique real bean ambiguous).
+        let real = cand(0, "userContext"); // a real registered bean
+        let mut synthetic = cand(1, "applicationContext");
+        synthetic.resolvable = true;
+        let s = set([real, synthetic]);
+        let (resolved, _) = Selector::resolve_one(&ip_single(), &s);
+        assert_eq!(
+            resolved.winner().expect("the real bean shadows the synthetic resolvable").id,
+            BeanId(0)
+        );
     }
 
     // ── missing mandatory -> NoSuchBean; optional -> Ok(None) ───────────────
@@ -1701,6 +2058,167 @@ mod tests {
         let s: SelfRef<Svc> = SelfRef::new(BeanKey::ByName("self".into()), weak);
         let r = futures::executor::block_on(s.get()).expect("self resolves");
         assert_eq!(r.v, 5);
+    }
+
+    // ── Lookup<dyn Svc>: resolve a dyn-service view via the upcast row ────────
+
+    trait Greet: crate::handle::Bean {
+        fn greet(&self) -> &'static str;
+    }
+    struct Hello;
+    impl crate::handle::Bean for Hello {}
+    impl Greet for Hello {
+        fn greet(&self) -> &'static str {
+            "hi"
+        }
+    }
+
+    // A container that publishes a concrete `Hello` as a shared erased handle.
+    struct GreetContainer;
+    impl Container for GreetContainer {
+        fn resolve(
+            &self,
+            _key: BeanKey,
+            _strictness: Strictness,
+            _cardinality: Cardinality,
+        ) -> BoxFuture<'_, Result<Published, LeafError>> {
+            Box::pin(async { Ok(Published::Shared(Arc::new(Hello))) })
+        }
+    }
+
+    // The macro-shaped upcast row for `Hello as dyn Greet`: downcast to the
+    // concrete, then unsize the Arc to the `dyn Greet` view (trait upcasting).
+    fn hello_as_greet(bean: Published) -> Result<Ref<dyn Greet>, LeafError> {
+        match bean {
+            Published::Shared(erased) => {
+                let concrete = downcast_ref::<Hello>(erased)
+                    .map_err(|_| LeafError::new(ErrorKind::NoSuchBean))?;
+                Ok(Ref::from_arc(concrete.into_arc() as Arc<dyn Greet>))
+            }
+            Published::Owned(_) => Err(LeafError::new(ErrorKind::NoSuchBean)),
+        }
+    }
+
+    // ── Lookup::stream / ordered_stream / stream_filtered / get_owned ────────
+
+    // A container that enumerates several candidates with explicit order keys, so
+    // stream (registration order) and ordered_stream (cmp_order) can be compared.
+    struct MultiContainer;
+    impl Container for MultiContainer {
+        fn resolve(
+            &self,
+            _key: BeanKey,
+            _strictness: Strictness,
+            _cardinality: Cardinality,
+        ) -> BoxFuture<'_, Result<Published, LeafError>> {
+            // Single resolve picks the first registration-order candidate.
+            Box::pin(async { Ok(Published::shared_value(Svc { v: 10 })) })
+        }
+        fn resolve_many<'a>(
+            &'a self,
+            _key: BeanKey,
+            mode: StreamOrder,
+            _filter: Option<&'a (dyn Fn(&crate::definition::Descriptor) -> bool + Send + Sync)>,
+        ) -> BoxFuture<'a, Result<SmallVec<[Published; 4]>, LeafError>> {
+            Box::pin(async move {
+                // Three candidates, registration order = [10, 20, 30] with order
+                // keys [3, 1, 2]; cmp_order ascends by value so ordered = [20,30,10].
+                let reg: [(u32, i32); 3] = [(10, 3), (20, 1), (30, 2)];
+                let mut items: SmallVec<[(u32, i32); 4]> = reg.into_iter().collect();
+                if matches!(mode, StreamOrder::CmpOrder) {
+                    items.sort_by_key(|(_, ord)| *ord);
+                }
+                Ok(items.into_iter().map(|(v, _)| Published::shared_value(Svc { v })).collect())
+            })
+        }
+    }
+
+    #[test]
+    fn lookup_stream_yields_registration_order() {
+        let arc: Arc<dyn Container> = Arc::new(MultiContainer);
+        let weak = Arc::downgrade(&arc);
+        let l: Lookup<Svc> = Lookup::new(BeanKey::ByName("svc".into()), weak);
+        let items: Vec<u32> = futures::executor::block_on(async {
+            use futures::StreamExt;
+            l.stream()
+                .map(|r| r.expect("item").v)
+                .collect::<Vec<u32>>()
+                .await
+        });
+        assert_eq!(items, vec![10, 20, 30], "registration order");
+    }
+
+    #[test]
+    fn lookup_ordered_stream_yields_cmp_order() {
+        let arc: Arc<dyn Container> = Arc::new(MultiContainer);
+        let weak = Arc::downgrade(&arc);
+        let l: Lookup<Svc> = Lookup::new(BeanKey::ByName("svc".into()), weak);
+        let items: Vec<u32> = futures::executor::block_on(async {
+            use futures::StreamExt;
+            l.ordered_stream()
+                .map(|r| r.expect("item").v)
+                .collect::<Vec<u32>>()
+                .await
+        });
+        // cmp_order ascends by order-value: order keys [3,1,2] → [20,30,10].
+        assert_eq!(items, vec![20, 30, 10], "cmp_order");
+    }
+
+    #[test]
+    fn lookup_stream_filtered_filters_before_construction() {
+        let arc: Arc<dyn Container> = Arc::new(MultiContainer);
+        let weak = Arc::downgrade(&arc);
+        let l: Lookup<Svc> = Lookup::new(BeanKey::ByName("svc".into()), weak);
+        // The filter is threaded to the container (which applies it pre-construction);
+        // MultiContainer ignores it, so this just exercises the plumbing + ordering.
+        let items: Vec<u32> = futures::executor::block_on(async {
+            use futures::StreamExt;
+            l.stream_filtered(|_d: &crate::definition::Descriptor| true)
+                .map(|r| r.expect("item").v)
+                .collect::<Vec<u32>>()
+                .await
+        });
+        assert_eq!(items, vec![10, 20, 30]);
+    }
+
+    // get_owned: a prototype (owned-move) target yields an owned T fresh per call.
+    struct OwnedContainer {
+        next: std::sync::atomic::AtomicU32,
+    }
+    impl Container for OwnedContainer {
+        fn resolve(
+            &self,
+            _key: BeanKey,
+            _strictness: Strictness,
+            _cardinality: Cardinality,
+        ) -> BoxFuture<'_, Result<Published, LeafError>> {
+            let v = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(Published::owned(Svc { v })) })
+        }
+    }
+
+    #[test]
+    fn lookup_get_owned_yields_a_fresh_owned_prototype_each_call() {
+        let arc: Arc<dyn Container> = Arc::new(OwnedContainer { next: std::sync::atomic::AtomicU32::new(0) });
+        let weak = Arc::downgrade(&arc);
+        let l: Lookup<Svc> = Lookup::new(BeanKey::ByName("proto".into()), weak);
+        let a = futures::executor::block_on(l.get_owned()).expect("owned 0");
+        let b = futures::executor::block_on(l.get_owned()).expect("owned 1");
+        assert_eq!(a, Svc { v: 0 });
+        assert_eq!(b, Svc { v: 1 });
+    }
+
+    #[test]
+    fn lookup_resolves_a_dyn_service_view_via_the_upcast_row() {
+        // A `Lookup<dyn Greet>` (a ?Sized target) resolves the bean through the
+        // provides[]/TypeRow upcast row, yielding a `Ref<dyn Greet>` the caller
+        // can call methods on — the dyn-Svc injection-point variant.
+        let arc: Arc<dyn Container> = Arc::new(GreetContainer);
+        let weak = Arc::downgrade(&arc);
+        let l: Lookup<dyn Greet> = Lookup::new(BeanKey::ByName("hello".into()), weak);
+        let r: Ref<dyn Greet> =
+            futures::executor::block_on(l.get_view(hello_as_greet)).expect("dyn view resolves");
+        assert_eq!(r.greet(), "hi");
     }
 
     // ── LAYERS shape ────────────────────────────────────────────────────────

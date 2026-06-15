@@ -17,18 +17,21 @@
 //! [`FailureAnalyzer`] is NOT a parallel error system: it is the
 //! rendering-policy layer over [`LeafError`] (Spring's `FailureAnalysis` shape).
 //!
-//! Scope note (UNIT 1 — bedrock): the richest [`CauseDetail`] payloads in
-//! ADR-12 (`Candidates{considered, trace}`, `AssemblyAt{bean, edge}`) reference
-//! `BeanId`/`InjectionEdge`/`CandidateInfo`/`TypeKey` types owned by later
-//! registry/injection units. They are intentionally deferred here; this unit
-//! pins the spine shape (`LeafError`/`ErrorKind`/`Cause`/`CauseDetail::Plain`/
-//! `CauseDetail::Expected`/`Origin`/`Severity`/`Diagnostic`/`FailureAnalyzer`)
-//! that those units extend by adding `CauseDetail` variants (it is
-//! `#[non_exhaustive]`). See `TODO(leaf-core)` markers below.
+//! Scope note (UNIT 1 — bedrock): the spine shape
+//! (`LeafError`/`ErrorKind`/`Cause`/`CauseDetail`/`Origin`/`Severity`/
+//! `Diagnostic`/`FailureAnalyzer`) is complete, and the richest [`CauseDetail`]
+//! payloads from ADR-12 (`Candidates{considered, trace}`, `AssemblyAt{bean,
+//! edge}`) have LANDED here over real [`BeanId`]/[`InjectionEdge`]/
+//! [`CandidateInfo`]/[`NarrowStep`] types — the enum stays `#[non_exhaustive]`
+//! so later units may still extend it without an ABI break. leaf-core owes no
+//! open work-item in this module: the one remaining design boundary — a
+//! serde-DERIVED `RenderStyle::StructuredJson` schema as a stable tooling
+//! contract — is DELIBERATELY deferred (ADR-12; TOOLKIT.md) and kept out of the
+//! serde-free kernel by charter §6; see the `NOTE` at the `StructuredJson` arm.
 
 use std::fmt;
 
-use crate::identity::ContractId;
+use crate::identity::{BeanId, ContractId};
 
 /// Severity of a [`LeafError`] node.
 ///
@@ -48,10 +51,10 @@ pub enum Severity {
 
 /// The unified "where" of an error node — shared with the config/registry ADRs.
 ///
-/// Scope note (UNIT 1): the full ADR-12 shape carries `Span{file,line,col}`
-/// (compile-time, leaf-macros), `File{path,line}` (config provenance), and a
-/// richer source tag. Those reference macro/config types from later units; this
-/// unit pins the cheap, always-available arms and a `Crate` source-name string.
+/// The compile-time [`Origin::Span`] and config-provenance [`Origin::File`] arms
+/// are PLAIN DATA: leaf-core defines the shape (no `proc_macro` dependency); the
+/// `#[component]`/`#[value]` macros and the config-data loaders fill them later
+/// with `file!()`/`line!()`/`column!()` and the parsed file path+line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Origin {
     /// No location information available.
@@ -64,9 +67,24 @@ pub enum Origin {
     },
     /// A test double / programmatically-installed contribution.
     TestDouble,
-    // TODO(leaf-core): add `Span { file, line, col }` (compile-time, 1.88 APIs)
-    // and `File { path, line }` (config provenance) when the macro/config units
-    // land — they reference proc_macro::Span / interned OriginId types.
+    /// A compile-time source location (the macro fills this from
+    /// `file!()`/`line!()`/`column!()`). Plain data — no `proc_macro` dep.
+    Span {
+        /// The source file path (`file!()`).
+        file: &'static str,
+        /// The 1-based source line (`line!()`).
+        line: u32,
+        /// The 1-based source column (`column!()`).
+        col: u32,
+    },
+    /// A config-file provenance (the config-data loader fills this from the
+    /// parsed property's file path + line). Plain data — no interned id needed.
+    File {
+        /// The config file path (e.g. `application.yaml`).
+        path: &'static str,
+        /// The 1-based line within the config file.
+        line: u32,
+    },
 }
 
 /// The CLOSED core error taxonomy + ONE open data arm.
@@ -178,10 +196,69 @@ impl ErrorKind {
     }
 }
 
+/// One candidate that was CONSIDERED while resolving an ambiguous injection
+/// point (the `NoUniqueBean` rich-context payload, ADR-12 §1.7).
+///
+/// A small owned snapshot lifted off the injection `Cand` read-view at the
+/// failure point (the error node owns its narrative, never a borrow into a
+/// frozen registry that may outlive the diagnostic). `ty` is a human type-name.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CandidateInfo {
+    /// The candidate bean's canonical name.
+    pub name: String,
+    /// The candidate's rendered type-name.
+    pub ty: String,
+}
+
+impl CandidateInfo {
+    /// Build a candidate snapshot from its name + rendered type-name.
+    #[must_use]
+    pub fn new(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        CandidateInfo { name: name.into(), ty: ty.into() }
+    }
+}
+
+/// One recorded step of the Selector's narrowing fold (ADR-12 §1.7): a layer
+/// name + the working-set size before and after that layer ran.
+///
+/// This is the owned, diagnostic projection of the injection `Trace`'s
+/// `(layer, in_len, out_len)` tuples — so a `NoUniqueBean` error can replay
+/// "primary_promote: 3 → 2, name_match: 2 → 2" without re-running resolution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NarrowStep {
+    /// The narrowing layer's stable name.
+    pub layer: &'static str,
+    /// The working-set size entering the layer.
+    pub in_len: usize,
+    /// The working-set size leaving the layer.
+    pub out_len: usize,
+}
+
+/// The injection edge an assembly failure occurred at (the `AssemblyAt` payload):
+/// the declared injection-point name + the rendered required type-name.
+///
+/// Owned (a `String` type-name, not a `TypeId`) so the rendered diagnostic is
+/// self-contained and human-legible.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct InjectionEdge {
+    /// The declared param/field name of the injection point.
+    pub point: String,
+    /// The rendered required type-name at that point.
+    pub required_ty: String,
+}
+
+impl InjectionEdge {
+    /// Build an injection edge from a point name + the rendered required type.
+    #[must_use]
+    pub fn new(point: impl Into<String>, required_ty: impl Into<String>) -> Self {
+        InjectionEdge { point: point.into(), required_ty: required_ty.into() }
+    }
+}
+
 /// The "what was actually found" payload of one [`Cause`] node.
 ///
-/// `#[non_exhaustive]`: later units add the rich `Candidates`/`AssemblyAt`
-/// arms (they reference `BeanId`/`InjectionEdge`/`CandidateInfo`/`TypeKey`).
+/// `#[non_exhaustive]`: integration crates / later additive units may extend it.
+/// The `Candidates`/`AssemblyAt` arms carry the registry/injection rich context.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CauseDetail {
@@ -197,10 +274,22 @@ pub enum CauseDetail {
         /// The source crate expected to contribute it, if known.
         missing_source: Option<&'static str>,
     },
-    // TODO(leaf-core): add `Candidates { considered: Box<[CandidateInfo]>,
-    // trace: Box<[NarrowStep]> }` (NoUniqueBean / determine_winner trace) and
-    // `AssemblyAt { bean: BeanId, edge: InjectionEdge }` when the
-    // registry/injection units define those types.
+    /// The `NoUniqueBean` rich context (ADR-12 §1.7): every candidate that was
+    /// considered + the Selector's narrowing-fold trace that failed to choose.
+    Candidates {
+        /// The candidates considered at the ambiguous point.
+        considered: Box<[CandidateInfo]>,
+        /// The Selector's recorded narrowing steps (the traced fold).
+        trace: Box<[NarrowStep]>,
+    },
+    /// The assembly site of a wiring failure: which bean was being assembled and
+    /// across which injection edge.
+    AssemblyAt {
+        /// The dense slot id of the bean being assembled.
+        bean: BeanId,
+        /// The injection edge the failure occurred at.
+        edge: InjectionEdge,
+    },
 }
 
 impl fmt::Display for CauseDetail {
@@ -213,6 +302,33 @@ impl fmt::Display for CauseDetail {
                     write!(f, " (source crate `{src}`)")?;
                 }
                 Ok(())
+            }
+            CauseDetail::Candidates { considered, trace } => {
+                write!(f, "{} candidates considered: [", considered.len())?;
+                for (i, c) in considered.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{} (`{}`)", c.name, c.ty)?;
+                }
+                f.write_str("]")?;
+                if !trace.is_empty() {
+                    f.write_str("; narrowing: ")?;
+                    for (i, s) in trace.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{} ({}→{})", s.layer, s.in_len, s.out_len)?;
+                    }
+                }
+                Ok(())
+            }
+            CauseDetail::AssemblyAt { bean, edge } => {
+                write!(
+                    f,
+                    "assembling {bean:?} at injection point `{}` (required `{}`)",
+                    edge.point, edge.required_ty
+                )
             }
         }
     }
@@ -466,8 +582,13 @@ impl Diagnostic for LeafError {
             RenderStyle::StructuredJson => {
                 // A minimal, hand-rolled JSON object so the core stays
                 // serde-free (charter §6: core depends on no integration).
-                // TODO(leaf-core): a stable serde schema is a Phase-3/4 tooling
-                // contract decision; this is a best-effort human-debug JSON.
+                // NOTE: a serde-DERIVED stable schema is a deliberately-deferred
+                // tooling contract (ADR-12 §"deferred"; TOOLKIT.md DX line) —
+                // gated on measured `leaf doctor`/CI demand and kept OUT of the
+                // serde-free kernel by charter §6, not an open leaf-core task.
+                // What IS guaranteed here is a well-formed, escaped JSON object
+                // (a parseable boundary), pinned by
+                // `diagnostic_structured_json_escapes_significant_characters`.
                 write!(w, "{{\"kind\":\"{}\",", self.kind.slug())?;
                 write!(w, "\"severity\":\"{}\",", severity_label(self.mode))?;
                 write!(w, "\"causes\":[")?;
@@ -653,6 +774,37 @@ mod tests {
         assert!(out.contains("\"causes\":["), "got: {out}");
     }
 
+    // The hand-rolled, serde-free JSON is a documented BOUNDARY (see the
+    // module-level NOTE / ADR-12): it is deliberately not a serde-derived
+    // schema, but it MUST stay well-formed so downstream tooling can parse it.
+    // Pin the load-bearing invariant: detail text carrying JSON-significant
+    // characters (`"`, `\`, control bytes) is escaped, never emitted raw.
+    #[test]
+    fn diagnostic_structured_json_escapes_significant_characters() {
+        let e = LeafError::new(ErrorKind::ConfigIo).caused_by(Cause::plain(
+            "parsing",
+            "bad value \"x\" at path C:\\tmp\nline2",
+        ));
+        let out = e.render_to_string(RenderStyle::StructuredJson);
+        // The raw, UNescaped payload must NOT appear verbatim (that would break
+        // the surrounding JSON object the boundary promises).
+        assert!(
+            !out.contains("\"x\" at path C:\\tmp\nline2"),
+            "raw unescaped payload leaked into JSON: {out}"
+        );
+        // The escaped forms MUST be present: `\"`, `\\`, `\n`.
+        assert!(out.contains("\\\"x\\\""), "quote not escaped: {out}");
+        assert!(out.contains("C:\\\\tmp"), "backslash not escaped: {out}");
+        assert!(out.contains("\\n"), "newline not escaped: {out}");
+        // And the object braces stay balanced + intact at the boundary.
+        assert!(out.starts_with('{') && out.ends_with('}'), "got: {out}");
+        assert_eq!(
+            out.matches('{').count(),
+            out.matches('}').count(),
+            "unbalanced braces: {out}"
+        );
+    }
+
     #[test]
     fn expected_cause_detail_renders_type_and_source() {
         let cause = Cause {
@@ -713,5 +865,87 @@ mod tests {
     fn leaf_error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<LeafError>();
+    }
+
+    // ── Origin::Span / Origin::File plain-data variants (closure 2) ──
+
+    #[test]
+    fn origin_span_and_file_are_plain_data_variants() {
+        let span = Origin::Span { file: "src/app.rs", line: 12, col: 5 };
+        match span {
+            Origin::Span { file, line, col } => {
+                assert_eq!(file, "src/app.rs");
+                assert_eq!(line, 12);
+                assert_eq!(col, 5);
+            }
+            other => panic!("expected Span, got {other:?}"),
+        }
+        let file = Origin::File { path: "application.yaml", line: 7 };
+        match file {
+            Origin::File { path, line } => {
+                assert_eq!(path, "application.yaml");
+                assert_eq!(line, 7);
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+        // They are Copy (the whole Origin enum stays Copy).
+        let s2 = span;
+        assert_eq!(span, s2);
+    }
+
+    // ── CauseDetail::Candidates / AssemblyAt rich payloads (closure 1) ──
+
+    #[test]
+    fn candidates_cause_detail_carries_considered_and_trace() {
+        let considered = vec![
+            CandidateInfo::new("primaryDs", "DataSource"),
+            CandidateInfo::new("backupDs", "DataSource"),
+        ];
+        let trace = vec![
+            NarrowStep { layer: "primary_promote", in_len: 2, out_len: 2 },
+            NarrowStep { layer: "name_match", in_len: 2, out_len: 2 },
+        ];
+        let detail = CauseDetail::Candidates {
+            considered: considered.into_boxed_slice(),
+            trace: trace.into_boxed_slice(),
+        };
+        // Renders the considered candidate names (the §1.7 rich context).
+        let rendered = detail.to_string();
+        assert!(rendered.contains("primaryDs"), "got: {rendered}");
+        assert!(rendered.contains("backupDs"), "got: {rendered}");
+    }
+
+    #[test]
+    fn assembly_at_cause_detail_carries_bean_and_edge() {
+        use crate::identity::BeanId;
+        let detail = CauseDetail::AssemblyAt {
+            bean: BeanId(3),
+            edge: InjectionEdge::new("dataSource", "DataSource"),
+        };
+        let rendered = detail.to_string();
+        assert!(rendered.contains("dataSource"), "got: {rendered}");
+    }
+
+    #[test]
+    fn no_unique_bean_error_can_carry_the_considered_candidate_list() {
+        // The NoUniqueBean error should be expressible with the rich Candidates
+        // payload (the considered list + the narrowing trace).
+        let cause = Cause {
+            what: "resolving injection point",
+            detail: CauseDetail::Candidates {
+                considered: vec![
+                    CandidateInfo::new("a", "Svc"),
+                    CandidateInfo::new("b", "Svc"),
+                ]
+                .into_boxed_slice(),
+                trace: vec![NarrowStep { layer: "primary_promote", in_len: 2, out_len: 2 }]
+                    .into_boxed_slice(),
+            },
+            origin: Origin::Unknown,
+        };
+        let e = LeafError::new(ErrorKind::NoUniqueBean).caused_by(cause);
+        let out = e.render_to_string(RenderStyle::Human);
+        assert!(out.contains("no-unique-bean"), "got: {out}");
+        assert!(out.contains('a') && out.contains('b'), "got: {out}");
     }
 }

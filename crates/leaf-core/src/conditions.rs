@@ -1178,16 +1178,16 @@ mod tests {
 
     #[test]
     fn leaf_delegates_to_the_resolved_condition() {
-        assert_eq!(eval(&LEAF_TRUE).unwrap(), true);
-        assert_eq!(eval(&LEAF_FALSE).unwrap(), false);
+        assert!(eval(&LEAF_TRUE).unwrap());
+        assert!(!eval(&LEAF_FALSE).unwrap());
     }
 
     #[test]
     fn not_inverts_its_child() {
         const NOT_TRUE: CondExpr = CondExpr::Not(&LEAF_TRUE);
         const NOT_FALSE: CondExpr = CondExpr::Not(&LEAF_FALSE);
-        assert_eq!(eval(&NOT_TRUE).unwrap(), false);
-        assert_eq!(eval(&NOT_FALSE).unwrap(), true);
+        assert!(!eval(&NOT_TRUE).unwrap());
+        assert!(eval(&NOT_FALSE).unwrap());
     }
 
     #[test]
@@ -1195,9 +1195,9 @@ mod tests {
         const ALL_TT: CondExpr = CondExpr::All(&[LEAF_TRUE, LEAF_TRUE]);
         const ALL_TF: CondExpr = CondExpr::All(&[LEAF_TRUE, LEAF_FALSE]);
         const ALL_EMPTY: CondExpr = CondExpr::All(&[]);
-        assert_eq!(eval(&ALL_TT).unwrap(), true);
-        assert_eq!(eval(&ALL_TF).unwrap(), false);
-        assert_eq!(eval(&ALL_EMPTY).unwrap(), true, "empty All is vacuously true");
+        assert!(eval(&ALL_TT).unwrap());
+        assert!(!eval(&ALL_TF).unwrap());
+        assert!(eval(&ALL_EMPTY).unwrap(), "empty All is vacuously true");
     }
 
     #[test]
@@ -1205,15 +1205,15 @@ mod tests {
         const ANY_FT: CondExpr = CondExpr::Any(&[LEAF_FALSE, LEAF_TRUE]);
         const ANY_FF: CondExpr = CondExpr::Any(&[LEAF_FALSE, LEAF_FALSE]);
         const ANY_EMPTY: CondExpr = CondExpr::Any(&[]);
-        assert_eq!(eval(&ANY_FT).unwrap(), true);
-        assert_eq!(eval(&ANY_FF).unwrap(), false);
-        assert_eq!(eval(&ANY_EMPTY).unwrap(), false, "empty Any is vacuously false");
+        assert!(eval(&ANY_FT).unwrap());
+        assert!(!eval(&ANY_FF).unwrap());
+        assert!(!eval(&ANY_EMPTY).unwrap(), "empty Any is vacuously false");
     }
 
     #[test]
     fn const_leaf_needs_no_resolver() {
-        assert_eq!(eval(&CondExpr::Const(true)).unwrap(), true);
-        assert_eq!(eval(&CondExpr::Const(false)).unwrap(), false);
+        assert!(eval(&CondExpr::Const(true)).unwrap());
+        assert!(!eval(&CondExpr::Const(false)).unwrap());
     }
 
     #[test]
@@ -1221,7 +1221,7 @@ mod tests {
         // all(true, any(false, not(false)))  =>  true && (false || !false) => true
         const TREE: CondExpr =
             CondExpr::All(&[LEAF_TRUE, CondExpr::Any(&[LEAF_FALSE, CondExpr::Not(&LEAF_FALSE)])]);
-        assert_eq!(eval(&TREE).unwrap(), true);
+        assert!(eval(&TREE).unwrap());
     }
 
     #[test]
@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn unconditional_is_vacuously_true() {
-        assert_eq!(eval(&UNCONDITIONAL).unwrap(), true);
+        assert!(eval(&UNCONDITIONAL).unwrap());
         assert!(UNCONDITIONAL.tier() <= EarliestTier::Runtime);
     }
 

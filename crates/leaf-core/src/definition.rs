@@ -324,6 +324,22 @@ impl AnnotationMetadata {
         candidate_role: CandidateRole::NORMAL,
         autowire_candidate: true,
     };
+
+    /// `true` iff this table is the [`EMPTY`](AnnotationMetadata::EMPTY) default —
+    /// i.e. the bean declared NO annotation metadata of its own.
+    ///
+    /// The template-merge collapse ([`merge_descriptor`]) reads this to decide
+    /// whether a child inherits the parent's `meta` pointer wholesale: a child
+    /// that declares nothing inherits; a child that declares anything keeps its
+    /// own (the `&'static`, allocation-free whole-pointer merge).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.qualifiers.is_empty()
+            && self.markers.is_empty()
+            && self.depends_on.is_empty()
+            && self.candidate_role == CandidateRole::NORMAL
+            && self.autowire_candidate
+    }
 }
 
 impl Default for AnnotationMetadata {
@@ -372,6 +388,52 @@ pub struct Descriptor {
     pub parent: Option<ContractId>,
     /// Diagnostic-only provenance; NEVER read on a resolution path.
     pub origin: Origin,
+}
+
+/// The ASYMMETRIC template-merge collapse (the freeze-time parent→merged fold).
+///
+/// Computed ONCE at `freeze()` — the freeze IS the merge moment, so there is no
+/// runtime `MergedBeanDefinition` type and no stale/recompute machinery; the
+/// product is a plain frozen [`Descriptor`] whose `parent` link is collapsed to
+/// `None`.
+///
+/// The merge is asymmetric (Spring's template `parent`/`AbstractBeanDefinition`
+/// override-or-inherit), realized allocation-free at `&'static`-pointer
+/// granularity (the const `Descriptor` carries no owned bytes to deep-merge):
+///
+/// - **`scope` and `role`** are ALWAYS the child's (a child keeps its own
+///   lifecycle + provenance from itself);
+/// - **`contract` / `self_type` / `origin`** are ALWAYS the child's identity
+///   (a child is its own bean, not the template);
+/// - **`meta`** (carrying qualifiers / `candidate_role` / `depends_on` /
+///   `autowire_candidate`) is inherited from the parent template iff the child
+///   declares NONE ([`AnnotationMetadata::is_empty`]); otherwise the child's own
+///   `meta` wins wholesale (child overrides);
+/// - **`provides` / `aliases`** are the child's iff non-empty, else inherited
+///   from the parent;
+/// - **`declared_name`** is the child's iff `Some`, else inherited;
+/// - **`parent`** is collapsed to `None` on the merged row.
+///
+/// `parent` should reference `parent.contract`; the caller (the registry freeze)
+/// resolves the `ContractId` link and passes the resolved parent row here.
+#[must_use]
+pub fn merge_descriptor(child: &Descriptor, parent: &Descriptor) -> Descriptor {
+    Descriptor {
+        // Identity is always the child's.
+        contract: child.contract,
+        self_type: child.self_type,
+        origin: child.origin,
+        // Child keeps its OWN scope + role from itself.
+        scope: child.scope,
+        role: child.role,
+        // Inherit the parent's pointer only when the child declares none.
+        provides: if child.provides.is_empty() { parent.provides } else { child.provides },
+        aliases: if child.aliases.is_empty() { parent.aliases } else { child.aliases },
+        declared_name: child.declared_name.or(parent.declared_name),
+        meta: if child.meta.is_empty() { parent.meta } else { child.meta },
+        // The collapse consumes the parent link (no recompute later).
+        parent: None,
+    }
 }
 
 #[cfg(test)]
@@ -561,5 +623,97 @@ mod tests {
         assert_eq!(m.candidate_role, CandidateRole::NORMAL);
         assert!(m.autowire_candidate);
         assert_eq!(AnnotationMetadata::default().candidate_role, CandidateRole::NORMAL);
+    }
+
+    // ── parent → merged collapse (closure 5) ──────────────────────────────────
+
+    static PARENT_META: AnnotationMetadata = AnnotationMetadata {
+        qualifiers: &[MarkerId::of("leaf::q::template")],
+        markers: &[],
+        depends_on: &[],
+        candidate_role: CandidateRole::PRIMARY,
+        autowire_candidate: true,
+    };
+
+    static PARENT_PROVIDES: &[TypeRow] = &[];
+
+    fn parent_descriptor() -> Descriptor {
+        Descriptor {
+            contract: ContractId::of("crate::AbstractRepo"),
+            self_type: TypeId::of::<EnglishGreeter>(),
+            provides: PARENT_PROVIDES,
+            declared_name: Some("abstractRepo"),
+            aliases: &["repoTemplate"],
+            scope: ScopeDef::PROTOTYPE,
+            role: Role::Infrastructure,
+            meta: &PARENT_META,
+            parent: None,
+            origin: Origin::Native { crate_name: Some("tmpl") },
+        }
+    }
+
+    #[test]
+    fn annotation_metadata_is_empty_reports_default_vs_non_default() {
+        assert!(AnnotationMetadata::EMPTY.is_empty());
+        assert!(!PARENT_META.is_empty());
+    }
+
+    #[test]
+    fn child_with_empty_meta_inherits_parents_meta_and_provides_and_aliases() {
+        // A child declaring NO meta of its own inherits qualifiers/meta from the
+        // parent template, but keeps its OWN scope + role (the asymmetric merge).
+        let child = Descriptor {
+            contract: ContractId::of("crate::OrderRepo"),
+            self_type: TypeId::of::<EnglishGreeter>(),
+            provides: &[],
+            declared_name: Some("orderRepo"),
+            aliases: &[],
+            scope: ScopeDef::SINGLETON,
+            role: Role::Application,
+            meta: &AnnotationMetadata::EMPTY,
+            parent: Some(ContractId::of("crate::AbstractRepo")),
+            origin: Origin::Native { crate_name: Some("app") },
+        };
+        let merged = merge_descriptor(&child, &parent_descriptor());
+
+        // Identity stays the CHILD's.
+        assert_eq!(merged.contract, ContractId::of("crate::OrderRepo"));
+        assert_eq!(merged.declared_name, Some("orderRepo"));
+        // Child keeps its OWN scope + role.
+        assert_eq!(merged.scope, ScopeDef::SINGLETON);
+        assert_eq!(merged.role, Role::Application);
+        // Inherited meta (qualifiers + candidate_role) from the parent template.
+        assert_eq!(merged.meta.qualifiers.len(), 1);
+        assert_eq!(merged.meta.candidate_role, CandidateRole::PRIMARY);
+        // Inherited the parent's aliases (child declared none).
+        assert_eq!(merged.aliases, &["repoTemplate"]);
+        // The merge collapsed the parent link (no recompute later).
+        assert!(merged.parent.is_none());
+    }
+
+    #[test]
+    fn child_with_own_meta_keeps_it_and_keeps_its_own_identity() {
+        // A child that declares its OWN meta keeps it (child overrides parent).
+        let child = Descriptor {
+            contract: ContractId::of("crate::CustomRepo"),
+            self_type: TypeId::of::<EnglishGreeter>(),
+            provides: &[],
+            declared_name: None,
+            aliases: &["myAlias"],
+            scope: ScopeDef::SINGLETON,
+            role: Role::Application,
+            meta: &SVC_META,
+            parent: Some(ContractId::of("crate::AbstractRepo")),
+            origin: Origin::Native { crate_name: Some("app") },
+        };
+        let merged = merge_descriptor(&child, &parent_descriptor());
+        // Child's own meta wins (its candidate_role + qualifier).
+        assert_eq!(merged.meta.candidate_role, CandidateRole::PRIMARY);
+        assert_eq!(merged.meta.qualifiers, SVC_META.qualifiers);
+        // Child's own aliases win.
+        assert_eq!(merged.aliases, &["myAlias"]);
+        // declared_name absent on the child => inherit the parent's.
+        assert_eq!(merged.declared_name, Some("abstractRepo"));
+        assert!(merged.parent.is_none());
     }
 }

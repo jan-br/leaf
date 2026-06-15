@@ -46,21 +46,83 @@ use crate::handle::Published;
 #[non_exhaustive]
 #[derive(Default)]
 pub struct ResolveCtx<'a> {
+    /// The engine back-reference for REAL nested resolution: a `Provider::provide`
+    /// reads this to drive `Engine::get`/`Engine::create` for a collaborator,
+    /// resolving the whole graph THROUGH the one engine (no test-side resolver
+    /// mirror). Borrowed for `'a` — the engine owns `create`'s `&self`, so the
+    /// child `ResolveCtx` it threads into `provide` simply re-borrows it. `None`
+    /// on a `root()` cx (a bare provider drive with no nested resolution).
+    engine: Option<&'a crate::engine::Engine>,
+    /// The ambient scope-store accessor for `Multiplicity::PerContextKey` beans:
+    /// the `ScopeKind` → `&dyn InstanceStore` binding the request/session layer
+    /// installs at the scope boundary. `None` on a bare engine (so a scoped bean
+    /// resolved with no store installed is a loud `ScopeMismatch`, never a silent
+    /// singleton).
+    scope_store: Option<&'a dyn ScopeStores>,
     // A private marker binds the `'a` lifetime so the public signature is stable
-    // before the engine adds real borrowed fields. Zero-sized; costs nothing.
+    // before more borrowed fields are added. Zero-sized; costs nothing.
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> ResolveCtx<'a> {
     /// A root resolution context with no engine state bound yet.
     ///
-    /// Used by tests and by the bare `Engine` before context infrastructure is
-    /// installed; the rich constructor (carrying the engine/`Cx`) lands in the
-    /// registry/engine units.
+    /// Used by tests and by the bare `Provider`-drive paths before context
+    /// infrastructure is installed; the engine threads the richer constructors
+    /// ([`for_engine`](ResolveCtx::for_engine)/[`with_scope_stores`](ResolveCtx::with_scope_stores)).
     #[must_use]
     pub fn root() -> Self {
-        ResolveCtx { _marker: std::marker::PhantomData }
+        ResolveCtx { engine: None, scope_store: None, _marker: std::marker::PhantomData }
     }
+
+    /// A resolution context carrying the engine back-reference, so a
+    /// `Provider::provide` can perform REAL nested resolution (`A`-depends-on-`B`-
+    /// depends-on-`C`) THROUGH the one engine.
+    #[must_use]
+    pub fn for_engine(engine: &'a crate::engine::Engine) -> Self {
+        ResolveCtx { engine: Some(engine), scope_store: None, _marker: std::marker::PhantomData }
+    }
+
+    /// Derive a context that also carries the ambient scope-store accessor (the
+    /// request/session layer's `ScopeKind` → [`InstanceStore`](crate::lifecycle_engine::InstanceStore)
+    /// binding), preserving the engine back-reference.
+    #[must_use]
+    pub fn with_scope_stores(mut self, stores: &'a dyn ScopeStores) -> Self {
+        self.scope_store = Some(stores);
+        self
+    }
+
+    /// The engine back-reference, if one is threaded (nested resolution driver).
+    #[must_use]
+    pub fn engine(&self) -> Option<&'a crate::engine::Engine> {
+        self.engine
+    }
+
+    /// The ambient [`InstanceStore`](crate::lifecycle_engine::InstanceStore) for
+    /// `kind`, if a scope-store accessor is installed AND it binds `kind`.
+    ///
+    /// `Multiplicity::PerContextKey` resolution reads this; `None` means no
+    /// ambient store is installed for the scope (a loud `ScopeMismatch`).
+    #[must_use]
+    pub fn scope_store(
+        &self,
+        kind: crate::definition::ScopeKind,
+    ) -> Option<&'a dyn crate::lifecycle_engine::InstanceStore> {
+        self.scope_store.and_then(|s| s.store_for(kind))
+    }
+}
+
+/// The ambient scope-store accessor seam threaded onto [`ResolveCtx`]: maps a
+/// [`ScopeKind`](crate::definition::ScopeKind) to the per-context
+/// [`InstanceStore`](crate::lifecycle_engine::InstanceStore) the request/session
+/// layer installs at the scope boundary (reached through the async-context `Cx`
+/// binding). Object-safe so it rides the `ResolveCtx` as a `&dyn` borrow.
+pub trait ScopeStores: Send + Sync {
+    /// The ambient store backing `kind`, if this accessor binds it.
+    fn store_for(
+        &self,
+        kind: crate::definition::ScopeKind,
+    ) -> Option<&dyn crate::lifecycle_engine::InstanceStore>;
 }
 
 impl std::fmt::Debug for ResolveCtx<'_> {

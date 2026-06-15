@@ -344,12 +344,10 @@ mod tests {
 
     #[test]
     fn cmp_chain_sorts_a_mixed_chain_outermost_first() {
-        let mut v = vec![
-            chain(RoleTier::Application, 0, OrderSource::Implicit, "app"),
+        let mut v = [chain(RoleTier::Application, 0, OrderSource::Implicit, "app"),
             chain(RoleTier::Infrastructure, TX_ORDER, OrderSource::Annotation, "tx"),
             chain(RoleTier::Infrastructure, CACHE_ORDER, OrderSource::Annotation, "cache"),
-            chain(RoleTier::Support, 0, OrderSource::Implicit, "support"),
-        ];
+            chain(RoleTier::Support, 0, OrderSource::Implicit, "support")];
         v.sort_by(cmp_chain);
         let ids: Vec<RoleTier> = v.iter().map(|c| c.tier).collect();
         assert_eq!(
@@ -371,7 +369,7 @@ mod tests {
     #[test]
     fn cache_order_is_strictly_less_than_tx_order() {
         // A cache hit must be able to short-circuit BEFORE a tx is opened.
-        assert!(CACHE_ORDER < TX_ORDER, "cache must wrap (sit outside) tx");
+        const { assert!(CACHE_ORDER < TX_ORDER, "cache must wrap (sit outside) tx") };
     }
 
     #[test]
@@ -391,15 +389,13 @@ mod tests {
 
     #[test]
     fn canonical_advice_chain_is_validate_retry_async_cache_tx_concurrency_translate() {
-        let mut v = vec![
-            ("translate", TRANSLATE_ORDER),
+        let mut v = [("translate", TRANSLATE_ORDER),
             ("tx", TX_ORDER),
             ("cache", CACHE_ORDER),
             ("async", ASYNC_ORDER),
             ("retry", RETRY_ORDER),
             ("validate", VALIDATE_ORDER),
-            ("concurrency", CONCURRENCY_ORDER),
-        ];
+            ("concurrency", CONCURRENCY_ORDER)];
         v.sort_by_key(|(_, o)| *o);
         let names: Vec<&str> = v.iter().map(|(n, _)| *n).collect();
         assert_eq!(
@@ -410,17 +406,15 @@ mod tests {
 
     #[test]
     fn async_dispatch_order_is_strictly_less_than_error_isolation_order() {
-        assert!(ASYNC_DISPATCH_ORDER < ERROR_ISOLATION_ORDER);
+        const { assert!(ASYNC_DISPATCH_ORDER < ERROR_ISOLATION_ORDER) };
     }
 
     #[test]
     fn canonical_multicaster_pipeline_order() {
-        let mut v = vec![
-            ("metrics", METRICS_ORDER),
+        let mut v = [("metrics", METRICS_ORDER),
             ("context_prop", CONTEXT_PROP_ORDER),
             ("error_isolation", ERROR_ISOLATION_ORDER),
-            ("async_dispatch", ASYNC_DISPATCH_ORDER),
-        ];
+            ("async_dispatch", ASYNC_DISPATCH_ORDER)];
         v.sort_by_key(|(_, o)| *o);
         let names: Vec<&str> = v.iter().map(|(n, _)| *n).collect();
         assert_eq!(

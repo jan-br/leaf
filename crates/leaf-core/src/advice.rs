@@ -678,7 +678,7 @@ mod tests {
     fn tx_attribute_default_is_required() {
         assert_eq!(TxAttribute::DEFAULT.propagation, TxPropagation::Required);
         assert_eq!(TxAttribute::DEFAULT.isolation, Isolation::Default);
-        assert!(!TxAttribute::DEFAULT.read_only);
+        const { assert!(!TxAttribute::DEFAULT.read_only) };
     }
 
     #[test]
@@ -918,7 +918,7 @@ mod tests {
         };
         const ASYNC: AsyncMeta = AsyncMeta { qualifier: Some("ioPool") };
         assert_eq!(TX.propagation, TxPropagation::RequiresNew);
-        assert!(CACHE.sync);
+        const { assert!(CACHE.sync) };
         assert_eq!(ASYNC.qualifier, Some("ioPool"));
     }
 }

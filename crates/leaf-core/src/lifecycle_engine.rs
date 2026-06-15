@@ -693,7 +693,7 @@ mod tests {
         assert!(p.depends_on.is_empty());
         assert_eq!(p.bootstrap, Bootstrap::Default);
         assert!(!p.has_callbacks());
-        assert_eq!(LifecyclePlan::default().smart_init, false);
+        assert!(!LifecyclePlan::default().smart_init);
     }
 
     // ── init/destroy callbacks run in mirrored order ─────────────────────────
