@@ -562,23 +562,6 @@ fn type_id_of(ty: &Type) -> TokenStream {
     quote! { const { ::core::any::TypeId::of::<#ty>() } }
 }
 
-/// The bean type a field/param of type `ty` injects: `Ref<T>` → `T` (the field
-/// stores the shared handle; the provider resolves `T` and threads the `Ref<T>` in),
-/// any other type → itself. Shared by the struct-field, free-fn-param, and
-/// `#[configuration]`-method-param lowerings so the Ref-stripping rule is one place.
-#[must_use]
-pub fn produced_ty(ty: &Type) -> Type {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "Ref"
-        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return inner.clone();
-    }
-    ty.clone()
-}
-
 /// Lower the constructor's dependencies to const `::leaf_core::InjectionPoint`
 /// rows (one per dependency).
 ///

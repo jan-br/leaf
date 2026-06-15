@@ -1,0 +1,27 @@
+error[E0277]: the trait bound `Atomic<u64>: Injectable` is not satisfied
+  --> tests/ui/state_field_without_inject_ctor_is_not_injectable.rs:14:11
+   |
+14 |     hits: AtomicU64,
+   |           ^^^^^^^^^ the trait `Injectable` is not implemented for `Atomic<u64>`
+   |
+help: the following other types implement trait `Injectable`
+  --> $WORKSPACE/crates/leaf-core/src/injectable.rs
+   |
+   | impl<T: Bean> Injectable for Ref<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `leaf_core::Ref<T>`
+...
+   | impl<T: Bean> Injectable for Lookup<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Lookup<T>`
+...
+   | impl<T: Bean> Injectable for LazyRef<T> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `LazyRef<T>`
+
+error[E0599]: no associated function or constant named `new` found for struct `CounterService` in the current scope
+  --> tests/ui/state_field_without_inject_ctor_is_not_injectable.rs:12:1
+   |
+12 | #[component]
+   | ^^^^^^^^^^^^ associated function or constant not found in `CounterService`
+13 | struct CounterService {
+   | --------------------- associated function or constant `new` not found for this struct
+   |
+   = note: this error originates in the attribute macro `component` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -217,6 +217,11 @@ pub fn struct_input(
     input.explicit_name = explicit_name;
     input.meta = meta;
     input.deps = deps;
+    // The struct field-default routes through `Injectable` (trait dispatch): each
+    // field carries its VERBATIM type and the emitter derives the injection point +
+    // resolution from `<FieldTy as ::leaf_core::Injectable>::{RESOLVABLE, inject}` —
+    // never a name-stripped `Ref<…>` TypeId (the design's no-type-names rule).
+    input.inject_via_trait = true;
     input.is_generic = is_generic;
     Ok(input)
 }
@@ -436,21 +441,42 @@ fn sig_to_deps(func: &ItemFn) -> Result<Vec<Dependency>, EmitError> {
                     Pat::Ident(p) => p.ident.to_string(),
                     _ => format!("_{i}"),
                 };
-                deps.push(Dependency { name, ty: produced_ty(&pat_ty.ty) });
+                deps.push(Dependency { name, ty: strip_ref(&pat_ty.ty) });
             }
         }
     }
     Ok(deps)
 }
 
+/// The bean type a `#[bean]` free-fn PARAMETER of type `ty` injects: `Ref<T>` → `T`,
+/// any other type → itself. The LEGACY name-stripped lowering for the `#[bean]`
+/// free-fn path, which Task 6 migrates onto the [`Injectable`](leaf_core::Injectable)
+/// trait (deleting this remaining `seg.ident == "Ref"` check). The struct
+/// field-default path already routes through the trait (see [`fields_to_deps`]).
+fn strip_ref(ty: &Type) -> Type {
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Ref"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return inner.clone();
+    }
+    ty.clone()
+}
+
 /// Lower a struct's fields to constructor injection points. Named fields key on the
 /// field ident (the implicit string qualifier); tuple fields key on `_<index>`.
 ///
-/// A field stored as `::leaf_core::Ref<T>` (the canonical shared-handle storage)
-/// injects the bean `T`: the emitted provider resolves `T` through the engine
-/// (yielding a `Ref<T>`) and threads that handle into the constructor. So the
-/// dependency's RESOLVED type strips one `Ref<…>` wrapper off the field type
-/// (a bare field type `T` is itself the resolved bean type).
+/// Each dependency carries the field's VERBATIM type (e.g. `Ref<T>`) — NEVER a
+/// name-stripped inner type. Resolution is the [`Injectable`](leaf_core::Injectable)
+/// trait's job: the emitter (with `inject_via_trait`) derives the injection point from
+/// `<FieldTy as Injectable>::RESOLVABLE` and resolves it via `<FieldTy as
+/// Injectable>::inject`, so a re-exported/aliased `Ref` is irrelevant (trait dispatch,
+/// not `seg.ident == "Ref"`). A field whose type is not `Injectable` (a bare bean type
+/// or internal state) is a loud compile error at the field's injection site — the
+/// design's no-bare-type, no-name-based-escape-hatch rule (use an `#[inject]`
+/// constructor for a state-holding bean).
 fn fields_to_deps(fields: &Fields) -> Vec<Dependency> {
     match fields {
         Fields::Named(named) => named
@@ -458,24 +484,17 @@ fn fields_to_deps(fields: &Fields) -> Vec<Dependency> {
             .iter()
             .map(|f| Dependency {
                 name: f.ident.as_ref().map(ToString::to_string).unwrap_or_default(),
-                ty: produced_ty(&f.ty),
+                ty: f.ty.clone(),
             })
             .collect(),
         Fields::Unnamed(unnamed) => unnamed
             .unnamed
             .iter()
             .enumerate()
-            .map(|(i, f)| Dependency { name: format!("_{i}"), ty: produced_ty(&f.ty) })
+            .map(|(i, f)| Dependency { name: format!("_{i}"), ty: f.ty.clone() })
             .collect(),
         Fields::Unit => Vec::new(),
     }
-}
-
-/// The bean type a field of type `ty` injects — delegates to the shared
-/// [`crate::descriptor::produced_ty`] so the `Ref<T>` → `T` handle-stripping rule
-/// lives in ONE place (shared with the free-fn-param + config-method-param paths).
-fn produced_ty(ty: &Type) -> Type {
-    crate::descriptor::produced_ty(ty)
 }
 
 #[cfg(test)]
@@ -550,9 +569,11 @@ mod tests {
 
     #[test]
     fn named_fields_become_named_injection_points() {
-        // Each named field is one injection point keyed on the field ident.
+        // Each named field is one injection point keyed on the field ident, carrying
+        // the field's VERBATIM type. Resolution routes through `Injectable` (trait
+        // dispatch), so the emitted point + resolve reference the field type as-is.
         let input = struct_input(
-            &item("struct Loud { greeter: Greeter, count: usize }"),
+            &item("struct Loud { greeter: leaf_core::Ref<Greeter>, more: leaf_core::Ref<Other> }"),
             Stereotype::Component,
             None,
             None,
@@ -561,16 +582,21 @@ mod tests {
         .expect("lowers");
         assert_eq!(input.deps.len(), 2);
         assert_eq!(input.deps[0].name, "greeter");
-        assert_eq!(input.deps[1].name, "count");
+        assert_eq!(input.deps[1].name, "more");
         let s = flat(&input);
-        assert!(s.contains("__engine.get::<Greeter>().await?"), "got: {s}");
+        assert!(
+            s.contains("<leaf_core::Ref<Greeter>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "got: {s}"
+        );
     }
 
     #[test]
-    fn a_ref_handle_field_injects_the_inner_bean_type() {
-        // A field stored as `Ref<Greeter>` injects bean `Greeter`: the provider
-        // resolves `Greeter` (yielding a `Ref<Greeter>`) and threads that handle in
-        // — so the resolved type strips one `Ref<…>` off the field type.
+    fn a_ref_handle_field_resolves_through_the_injectable_trait_verbatim() {
+        // A field stored as `Ref<Greeter>` injects through `<Ref<Greeter> as
+        // Injectable>` (trait dispatch decides `Ref` semantics — never a name strip):
+        // the dependency carries the FULL `Ref<Greeter>` type and the provider awaits
+        // `<Ref<Greeter> as Injectable>::inject` (the resolved value IS the field the
+        // ctor consumes — no re-wrapping, no `Ref<Ref<…>>`).
         let input = struct_input(
             &item("struct Loud { greeter: leaf_core::Ref<Greeter> }"),
             Stereotype::Component,
@@ -581,9 +607,49 @@ mod tests {
         .expect("lowers");
         assert_eq!(input.deps.len(), 1);
         let s = flat(&input);
-        assert!(s.contains("__engine.get::<Greeter>().await?"), "got: {s}");
-        // The provider must NOT resolve a double-wrapped `Ref<Ref<…>>`.
-        assert!(!s.contains("get::<leaf_core::Ref<Greeter>>"), "got: {s}");
+        assert!(
+            s.contains("<leaf_core::Ref<Greeter>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "got: {s}"
+        );
+        // The legacy name-stripped engine resolve is GONE.
+        assert!(!s.contains("__engine.get::<Greeter>"), "got: {s}");
+    }
+
+    #[test]
+    fn field_default_resolves_through_the_injectable_trait_not_a_name_strip() {
+        // Task 4: the struct field-default path routes through `Injectable` (trait
+        // dispatch), NOT a name-stripped `Bar` TypeId. For `#[component] struct Foo {
+        // dep: Ref<Bar> }` (no `#[inject]` ctor) the field-default InjectionPoint is
+        // built from `<Ref<Bar> as Injectable>::RESOLVABLE` and the provider resolves
+        // via `<Ref<Bar> as Injectable>::inject` — the emitted tokens reference
+        // `Injectable`, never the legacy `__engine.get::<Bar>()` name-strip.
+        let input = struct_input(
+            &item("struct Foo { dep: leaf_core::Ref<Bar> }"),
+            Stereotype::Component,
+            None,
+            None,
+            Scope::Singleton,
+        )
+        .expect("lowers");
+        // The dep carries the VERBATIM field type (no `Ref<…>` strip).
+        assert_eq!(input.deps.len(), 1);
+        assert!(input.inject_via_trait, "the field-default routes through the trait");
+        let s = flat(&input);
+        // The point + the resolution both go through the Injectable trait, verbatim.
+        assert!(
+            s.contains(
+                "<leaf_core::Ref<Bar>as::leaf_core::Injectable>::RESOLVABLE"
+            ),
+            "the injection point derives from `<FieldTy as Injectable>::RESOLVABLE`: {s}"
+        );
+        assert!(
+            s.contains("<leaf_core::Ref<Bar>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "the provider resolves via `<FieldTy as Injectable>::inject`: {s}"
+        );
+        // The name-stripped legacy path is GONE: no `__engine.get::<Bar>()`, no
+        // `InjectionPoint::single(... Bar ...)`.
+        assert!(!s.contains("__engine.get::<Bar>"), "no name-stripped engine resolve: {s}");
+        assert!(!s.contains("InjectionPoint::single"), "no name-stripped point: {s}");
     }
 
     #[test]

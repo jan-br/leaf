@@ -648,7 +648,7 @@ fn method_deps(method: &ImplItemFn, method_ident: &str) -> Result<Vec<Dependency
                     Pat::Ident(p) => p.ident.to_string(),
                     _ => format!("_{i}"),
                 };
-                deps.push(Dependency { name, ty: descriptor::produced_ty(&pat_ty.ty) });
+                deps.push(Dependency { name, ty: strip_ref(&pat_ty.ty) });
             }
         }
     }
@@ -663,6 +663,23 @@ fn method_deps(method: &ImplItemFn, method_ident: &str) -> Result<Vec<Dependency
         });
     }
     Ok(deps)
+}
+
+/// The bean type a `#[bean]` config-method PARAMETER of type `ty` injects: `Ref<T>` →
+/// `T`, any other type → itself. The LEGACY name-stripped lowering for the `#[bean]`
+/// method path, which Task 6 migrates onto the [`Injectable`](leaf_core::Injectable)
+/// trait (deleting this remaining `seg.ident == "Ref"` check). The struct field-default
+/// path already routes through the trait.
+fn strip_ref(ty: &Type) -> Type {
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "Ref"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
+    {
+        return inner.clone();
+    }
+    ty.clone()
 }
 
 /// The intra-config `#[bean]`→`#[bean]` self-call lint: walk the method body and

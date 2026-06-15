@@ -46,4 +46,9 @@ fn ui() {
     // SEED_PAIRINGS/INJECTION_PLAN_PAIRINGS constructor rows. It steers to the
     // impl-block form (`#[inject]` marks the constructor of an `#[advisable]` impl).
     t.compile_fail("tests/ui/inject_outside_advisable_is_a_hard_error.rs");
+    // A state-holding `#[component]` with NO `#[inject]` constructor fails to compile
+    // LOUDLY: the field-default routes every field through `Injectable` (trait
+    // dispatch, no name strip), and a plain state field is not `Injectable`. The
+    // remediation is an `#[inject]` constructor (Task 4 — the no-type-names rule).
+    t.compile_fail("tests/ui/state_field_without_inject_ctor_is_not_injectable.rs");
 }
