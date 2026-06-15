@@ -65,6 +65,11 @@ use crate::stereotype::Stereotype;
 /// The attribute name a method must carry to be lowered as a `@bean` factory method.
 const BEAN_ATTR: &str = "bean";
 
+/// The marker a method must carry to be lowered as the bean's `#[inject]` constructor
+/// (the impl-block macro reads it; the standalone `#[inject]` proc-macro is a
+/// hard-error-with-hint).
+const INJECT_ATTR: &str = "inject";
+
 /// Emit the full `#[configuration] impl Cfg { #[bean] fn .. }` artifact: one const
 /// `::leaf_core::Descriptor` (+ its `ProviderSeed`/`InjectionPlan`) per `#[bean]`
 /// method, all through the SAME descriptor currency. The impl block itself is kept
@@ -234,7 +239,106 @@ pub fn emit_advisable_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
     // is sidestepped exactly like `#[bean]`/`#[advice]`: the impl-block macro iterates
     // the methods and emits the sibling rows (the natural-annotation auto-wire path).
     let concerns = emit_method_concerns(item, &bean_ident, &self_ty)?;
-    Ok(quote::quote! { #join_points #method_table #concerns })
+    // The `#[inject]` CONSTRUCTOR: its PARAMETERS are the bean's injection points
+    // (lowered through `Injectable`, never name-stripping). The provider+plan are keyed
+    // by the bean's ContractId into the SEED/INJECTION_PLAN pairing slices, where they
+    // OVERRIDE the stereotype's struct field-default by contract (Task 5). Absent when
+    // the impl has no `#[inject]` ctor (the stereotype field-default stands).
+    let ctor_wiring = emit_inject_constructor(item, &self_ty, &bean_ident)?;
+    Ok(quote::quote! { #join_points #method_table #concerns #ctor_wiring })
+}
+
+/// Emit the construction wiring for the impl's `#[inject]` CONSTRUCTOR, if present:
+/// the per-bean `InjectionPlan` (one point per constructor PARAMETER, derived through
+/// `<ParamTy as ::leaf_core::Injectable>::RESOLVABLE`) and the generated `Provider`
+/// (resolving each param via `<ParamTy as ::leaf_core::Injectable>::inject(ctx)` then
+/// calling the inherent `Self::new(..)`), submitted into the `SEED_PAIRINGS` /
+/// `INJECTION_PLAN_PAIRINGS` slices keyed by the impl self-type's `ContractId`.
+///
+/// Returns an empty stream when the impl carries no `#[inject]` constructor (the
+/// stereotype's struct field-default then stands).
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when more than one method is `#[inject]`-marked
+/// (an ambiguous constructor) or the lowering otherwise fails.
+fn emit_inject_constructor(
+    item: &ItemImpl,
+    self_ty: &Type,
+    bean_ident: &str,
+) -> Result<TokenStream, EmitError> {
+    let Some(ctor) = inject_constructor(item, bean_ident)? else {
+        return Ok(TokenStream::new());
+    };
+
+    // The constructor's PARAMETERS are the injection points — carried VERBATIM (no
+    // `Ref<…>` strip): the trait-based emitter derives the resolvable target from
+    // `<ParamTy as Injectable>::RESOLVABLE`, so aliases/re-exports are irrelevant.
+    let deps = constructor_param_deps(ctor);
+
+    // The same `descriptor` currency the stereotype/`#[bean]` paths use, but in the
+    // TRAIT-driven mode (points + provider route through `Injectable`) and WITHOUT the
+    // `Descriptor`/`COMPONENTS` row (the stereotype macro on the struct owns identity;
+    // this contributes ONLY the construction recipe + plan, paired by ContractId).
+    let mut input = BeanInput::new(self_ty.clone(), bean_ident, bean_ident);
+    input.module_qualified = true;
+    input.scope = Scope::Singleton;
+    input.deps = deps;
+    input.inject_via_trait = true;
+    descriptor::emit_wiring_only(&input)
+}
+
+/// Find the impl's lone `#[inject]`-marked constructor (a method whose return is
+/// `Self`/the impl self-type), if any.
+///
+/// # Errors
+/// [`EmitError`] when more than one method carries `#[inject]` — an ambiguous
+/// constructor is a Tier-0 `compile_error!`.
+fn inject_constructor<'a>(
+    item: &'a ItemImpl,
+    bean_ident: &str,
+) -> Result<Option<&'a ImplItemFn>, EmitError> {
+    let mut found: Option<&ImplItemFn> = None;
+    for inner in &item.items {
+        let ImplItem::Fn(func) = inner else { continue };
+        if !has_attr(&func.attrs, INJECT_ATTR) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(EmitError {
+                message: format!(
+                    "`{bean_ident}` has more than one `#[inject]` constructor: an \
+                     `#[advisable]` impl admits exactly ONE `#[inject]` constructor \
+                     (its parameters are the bean's injection points). Mark only the \
+                     single constructor `#[inject]`."
+                ),
+            });
+        }
+        found = Some(func);
+    }
+    Ok(found)
+}
+
+/// Lower a `#[inject]` constructor's typed parameters to injection points, carrying
+/// each parameter's FULL declared type VERBATIM (no `Ref<…>` strip — the trait-based
+/// emitter resolves it through `<ParamTy as Injectable>`). A `self` receiver (an
+/// `#[inject]` method that is not a constructor — the deferred setter-injection form)
+/// is skipped here; each typed param keys on its binding ident (or `_<index>`).
+fn constructor_param_deps(ctor: &ImplItemFn) -> Vec<Dependency> {
+    ctor.sig
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, arg)| match arg {
+            FnArg::Receiver(_) => None,
+            FnArg::Typed(pat_ty) => {
+                let name = match &*pat_ty.pat {
+                    Pat::Ident(p) => p.ident.to_string(),
+                    _ => format!("_{i}"),
+                };
+                Some(Dependency { name, ty: (*pat_ty.ty).clone() })
+            }
+        })
+        .collect()
 }
 
 /// Emit the per-concern artifacts for every natural concern annotation on a `&self`
@@ -1256,5 +1360,156 @@ mod tests {
         );
         let s = flat(&emit_advisable_impl(&item).expect("emits"));
         assert!(!s.contains("ADVISOR_PAIRINGS"), "an associated fn is not advised: {s}");
+    }
+
+    // ── the #[inject] constructor lowering (trait-based, no type-name detection) ───
+
+    #[test]
+    fn an_inject_constructor_lowers_its_params_through_injectable() {
+        // The headline: `#[advisable] impl OrderService { #[inject] fn new(catalog:
+        // Ref<CatalogService>) -> Self { .. } }` lowers the CONSTRUCTOR'S PARAMETERS
+        // (not the struct's fields) into a per-bean InjectionPlan whose single point is
+        // built from `<Ref<CatalogService> as Injectable>::RESOLVABLE` — trait dispatch,
+        // never matching "Ref" in the tokens.
+        let item = impl_item(
+            "impl OrderService {
+                #[inject]
+                fn new(catalog: Ref<CatalogService>) -> Self { todo!() }
+                fn place_order(&self, amount: i64) -> i64 { todo!() }
+             }",
+        );
+        let ts = emit_advisable_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The per-bean InjectionPlan is built from the param type through Injectable —
+        // the produced TypeId comes from `RESOLVABLE`, NOT a name-stripped `CatalogService`.
+        assert!(s.contains("::leaf_core::InjectionPlan"), "got: {s}");
+        assert!(
+            s.contains("<Ref<CatalogService>as::leaf_core::Injectable>::RESOLVABLE"),
+            "the injection point must derive from `<ParamTy as Injectable>::RESOLVABLE`: {s}"
+        );
+        // The point carries the parameter binding name as the implicit string qualifier.
+        assert!(s.contains(r#"name:"catalog""#), "got: {s}");
+    }
+
+    #[test]
+    fn an_inject_constructor_provider_resolves_params_via_inject_then_calls_new() {
+        // The provider awaits `<ParamTy as Injectable>::inject(ctx)` per param (the
+        // resolved value IS the handle the ctor consumes — no Ref-rewrapping) then
+        // calls the inherent `OrderService::new(..)`.
+        let item = impl_item(
+            "impl OrderService {
+                #[inject]
+                fn new(catalog: Ref<CatalogService>) -> Self { todo!() }
+             }",
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        assert!(
+            s.contains("<Ref<CatalogService>as::leaf_core::Injectable>::inject"),
+            "the provider must resolve each param via `<ParamTy as Injectable>::inject`: {s}"
+        );
+        // The construction calls the inherent `new` with the resolved param.
+        assert!(s.contains("<OrderService>::new(__dep_catalog)"), "got: {s}");
+        assert!(s.contains("::leaf_core::Published::shared_value"), "got: {s}");
+        // It must NOT name-strip the handle and resolve the inner type via Engine::get.
+        assert!(
+            !s.contains("__engine.get::<CatalogService>"),
+            "the trait path must not fall back to name-stripped Engine::get: {s}"
+        );
+    }
+
+    #[test]
+    fn an_inject_constructor_keys_its_wiring_rows_on_the_bean_contract() {
+        // The constructor provider's ProviderSeed + InjectionPlan are submitted into the
+        // SEED_PAIRINGS / INJECTION_PLAN_PAIRINGS slices, keyed by the impl SELF-TYPE's
+        // module-qualified ContractId (`module_path!()::OrderService`) so leaf-boot's
+        // JOIN pairs them with the OrderService Descriptor.
+        let item = impl_item(
+            "impl OrderService {
+                #[inject]
+                fn new(catalog: Ref<CatalogService>) -> Self { todo!() }
+             }",
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        let contract =
+            r#"::leaf_core::ContractId::of(::core::concat!(::core::module_path!(),"::","OrderService"))"#;
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains(&format!("::leaf_core::SeedPairingRow{{contract:{contract}")),
+            "the seed row must key on the bean contract: {s}"
+        );
+        assert!(
+            s.contains(
+                "#[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]"
+            ),
+            "got: {s}"
+        );
+        assert!(
+            s.contains(&format!("::leaf_core::InjectionPlanPairingRow{{contract:{contract}")),
+            "the plan row must key on the bean contract: {s}"
+        );
+    }
+
+    #[test]
+    fn an_inject_constructor_with_no_params_emits_an_empty_plan() {
+        // The state-seeding shape: `#[inject] fn new() -> Self { .. }` (zero injected
+        // params, seeds internal state) — an empty InjectionPlan + a `new()` call.
+        let item = impl_item(
+            "impl OrderRepository {
+                #[inject]
+                fn new() -> Self { todo!() }
+                fn save(&self) {}
+             }",
+        );
+        let ts = emit_advisable_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(s.contains("::leaf_core::InjectionPlan"), "got: {s}");
+        assert_eq!(s.matches("as::leaf_core::Injectable>::RESOLVABLE").count(), 0, "got: {s}");
+        assert!(s.contains("<OrderRepository>::new()"), "got: {s}");
+        // The advisable join-point/method-table consts STILL emit beside the ctor wiring.
+        assert!(s.contains("pubstatic__leaf_methods_OrderRepository"), "got: {s}");
+    }
+
+    #[test]
+    fn an_advisable_impl_with_no_inject_constructor_emits_no_ctor_wiring() {
+        // Backward-compat: an `#[advisable]` impl WITHOUT an `#[inject]` ctor emits only
+        // the proxy metadata (join points + method table) — the stereotype macro still
+        // owns the field-default provider/plan. No constructor SEED/PLAN rows here.
+        let item = impl_item(
+            "impl OrderService {
+                fn new(repo: Ref<Repository>) -> Self { todo!() }
+                fn place_order(&self, amount: i64) -> i64 { todo!() }
+             }",
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        assert!(s.contains("pubstatic__leaf_methods_OrderService"), "the proxy metadata emits: {s}");
+        assert!(
+            !s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
+            "no #[inject] ctor => no constructor SEED_PAIRINGS row: {s}"
+        );
+    }
+
+    #[test]
+    fn two_inject_constructors_in_one_impl_are_a_hard_error() {
+        // More than one `#[inject]` constructor is ambiguous — a Tier-0 compile_error!.
+        let item = impl_item(
+            "impl OrderService {
+                #[inject]
+                fn new(a: Ref<A>) -> Self { todo!() }
+                #[inject]
+                fn other(b: Ref<B>) -> Self { todo!() }
+             }",
+        );
+        let err = emit_advisable_impl(&item).expect_err("two #[inject] ctors hard-error");
+        assert!(err.message.contains("inject"), "got: {}", err.message);
+        assert!(
+            err.message.to_lowercase().contains("one") || err.message.contains("constructor"),
+            "got: {}",
+            err.message
+        );
     }
 }

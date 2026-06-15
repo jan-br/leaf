@@ -218,6 +218,20 @@ pub struct BeanInput {
     /// Which distributed slice the const `Descriptor` row is submitted into
     /// (`COMPONENTS` by default; `AUTO_CONFIGS` for `#[auto_config]`).
     pub slice: Slice,
+    /// When `true`, each dependency's [`ty`](Dependency::ty) is the VERBATIM
+    /// parameter/field type (e.g. `Ref<Svc>`), and the emitter routes resolution
+    /// through the [`Injectable`](leaf_core::Injectable) trait: the injection point
+    /// is built from `<Ty as ::leaf_core::Injectable>::RESOLVABLE` (trait dispatch,
+    /// never name matching) and the provider resolves each via `<Ty as
+    /// ::leaf_core::Injectable>::inject(ctx)` (the resolved value IS the param the
+    /// ctor consumes — no `Ref<…>` re-wrapping).
+    ///
+    /// When `false` (the default), the legacy NAME-STRIPPED path applies:
+    /// [`ty`](Dependency::ty) is the already-`Ref<…>`-stripped inner bean type, the
+    /// point is `InjectionPoint::single(TypeId::of::<Ty>(), name)`, and the provider
+    /// resolves `Ty` through `Engine::get` and threads a `Ref<Ty>` in. (Task 4
+    /// migrates the remaining `false` paths onto the trait + deletes the strip.)
+    pub inject_via_trait: bool,
 }
 
 impl BeanInput {
@@ -240,6 +254,7 @@ impl BeanInput {
             receiver_ty: None,
             is_generic: false,
             slice: Slice::default(),
+            inject_via_trait: false,
         }
     }
 }
@@ -323,12 +338,13 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
     let seed_row_ident = format_ident!("__LEAF_SEED_PAIRING_{}", mangled);
     let plan_row_ident = format_ident!("__LEAF_PLAN_PAIRING_{}", mangled);
 
-    let points = emit_injection_points(&input.deps);
+    let points = emit_injection_points(&input.deps, input.inject_via_trait);
     let provider_impl = emit_provider(
         self_ty,
         input.ctor.as_ref(),
         input.receiver_ty.as_ref(),
         &input.deps,
+        input.inject_via_trait,
         &provider_ident,
         &desc_ident,
     );
@@ -423,6 +439,99 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
     })
 }
 
+/// Emit ONLY the construction WIRING for a bean whose identity (the `Descriptor` +
+/// `COMPONENTS` row + `Bean` impl) is emitted ELSEWHERE — the `#[advisable] impl`
+/// `#[inject]`-constructor case, where the stereotype macro on the struct owns the
+/// `Descriptor` and this contributes the per-bean `InjectionPlan` + the generated
+/// `Provider`/`ProviderSeed`, submitted into the `SEED_PAIRINGS` /
+/// `INJECTION_PLAN_PAIRINGS` slices keyed by the bean's `ContractId`.
+///
+/// The constructor pairing rows carry the SAME `ContractId` as the stereotype's
+/// field-default rows; leaf-boot's `merge_by_contract` selects between them (Task 5 —
+/// the constructor wins). To avoid emitting DUPLICATE item names beside the
+/// stereotype's helpers for the same bean, every helper item here is mangled under a
+/// distinct `__LEAF_CTOR_*` / `__leaf_ctor_seed_*` namespace, and the generated
+/// provider's `descriptor()` references the stereotype-emitted
+/// `__LEAF_DESCRIPTOR_<Ident>` const (the same bean's identity row).
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when the target is generic (no single concrete
+/// type to wire) — the same constraint the `Descriptor` emission carries.
+pub fn emit_wiring_only(input: &BeanInput) -> Result<TokenStream, EmitError> {
+    if input.is_generic {
+        return Err(EmitError {
+            message: format!(
+                "`{}` is generic: a generic bean has no single concrete type to wire a \
+                 `#[inject]` constructor for. Register a concrete instantiation with \
+                 `register_component!({}<Concrete>)`.",
+                input.ident, input.ident
+            ),
+        });
+    }
+
+    let self_ty = &input.self_ty;
+    let contract = emit_contract(input);
+
+    let mangled = mangle(&input.ident);
+    // Distinct `__LEAF_CTOR_*` namespace so these helpers never collide with the
+    // stereotype's own `__LEAF_*`/`__leaf_seed_*` items for the same bean ident.
+    let points_ident = format_ident!("__LEAF_CTOR_POINTS_{}", mangled);
+    let plan_ident = format_ident!("__LEAF_CTOR_PLAN_{}", mangled);
+    let provider_ident = format_ident!("__LeafCtorProvider_{}", mangled);
+    let seed_ident = format_ident!("__leaf_ctor_seed_{}", mangled);
+    let seed_row_ident = format_ident!("__LEAF_CTOR_SEED_PAIRING_{}", mangled);
+    let plan_row_ident = format_ident!("__LEAF_CTOR_PLAN_PAIRING_{}", mangled);
+    // The stereotype macro on the struct emits this descriptor const (the bean's
+    // identity row); the ctor provider borrows it for its `descriptor()` return.
+    let desc_ident = format_ident!("__LEAF_DESCRIPTOR_{}", mangled);
+
+    let points = emit_injection_points(&input.deps, input.inject_via_trait);
+    let provider_impl = emit_provider(
+        self_ty,
+        input.ctor.as_ref(),
+        input.receiver_ty.as_ref(),
+        &input.deps,
+        input.inject_via_trait,
+        &provider_ident,
+        &desc_ident,
+    );
+
+    Ok(quote! {
+        // ── the per-bean InjectionPlan (one point per CONSTRUCTOR parameter) ──
+        #[allow(non_upper_case_globals)]
+        const #points_ident: &[::leaf_core::InjectionPoint] = &[ #(#points),* ];
+        #[allow(non_upper_case_globals)]
+        const #plan_ident: ::leaf_core::InjectionPlan =
+            ::leaf_core::InjectionPlan { points: #points_ident };
+
+        // ── the generated Provider + its PUBLIC const ProviderSeed (the ctor recipe) ──
+        #provider_impl
+        #[allow(non_upper_case_globals)]
+        #[doc(hidden)]
+        pub const #seed_ident: ::leaf_core::ProviderSeed =
+            || ::std::sync::Arc::new(#provider_ident);
+
+        // ── the wiring-pairing submissions, keyed by the bean ContractId ──
+        // Both rows carry the SAME contract as the stereotype's field-default rows;
+        // leaf-boot's merge selects the constructor over the field-default (Task 5).
+        #[allow(non_upper_case_globals)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
+            contract: #contract,
+            seed: #seed_ident,
+        };
+        #[allow(non_upper_case_globals)]
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
+            ::leaf_core::InjectionPlanPairingRow {
+                contract: #contract,
+                plan: #plan_ident,
+            };
+    })
+}
+
 /// Emit the bean's stable `::leaf_core::ContractId` const expression.
 ///
 /// Two shapes: a [`module_qualified`](BeanInput::module_qualified) input defers the
@@ -471,13 +580,52 @@ pub fn produced_ty(ty: &Type) -> Type {
 }
 
 /// Lower the constructor's dependencies to const `::leaf_core::InjectionPoint`
-/// rows (one per dependency — `single(produced, name)`, by-type by default).
-fn emit_injection_points(deps: &[Dependency]) -> Vec<TokenStream> {
+/// rows (one per dependency).
+///
+/// Two shapes, selected by `inject_via_trait`:
+///
+/// * the TRAIT path (`true`): each `dep.ty` is the VERBATIM param/field type
+///   (`Ref<Svc>`), so the point derives entirely from `<Ty as Injectable>::RESOLVABLE`
+///   — trait dispatch, NEVER matching `"Ref"` in the tokens. The const `Resolvable`'s
+///   `cardinality`/`strictness` are mapped onto the point's `arity`/`kind` in a
+///   const block (so the wave-planner reads the right graph edge: a `Strict` single
+///   is a `Bean` construction edge; a deferred/tolerant handle is a `Deferral` that
+///   removes the edge).
+/// * the legacy NAME-STRIPPED path (`false`): `dep.ty` is the already-stripped inner
+///   bean type and the point is the by-type `single(TypeId::of::<Ty>(), name)`.
+fn emit_injection_points(deps: &[Dependency], inject_via_trait: bool) -> Vec<TokenStream> {
     deps.iter()
         .map(|dep| {
-            let produced = type_id_of(&dep.ty);
             let name = &dep.name;
-            quote! { ::leaf_core::InjectionPoint::single(#produced, #name) }
+            if inject_via_trait {
+                let ty = &dep.ty;
+                quote! {
+                    const {
+                        let __r = <#ty as ::leaf_core::Injectable>::RESOLVABLE;
+                        ::leaf_core::InjectionPoint {
+                            produced: __r.produced,
+                            generics: &[],
+                            qualifiers: &[],
+                            name: #name,
+                            arity: match __r.cardinality {
+                                ::leaf_core::Cardinality::Single => ::leaf_core::Arity::Single,
+                                ::leaf_core::Cardinality::Multiple => ::leaf_core::Arity::Collection,
+                            },
+                            kind: match __r.strictness {
+                                // A strict single is a real construction-time edge; a
+                                // tolerant (deferred) handle removes the edge (the cycle
+                                // break — resolves post-build through its Weak back-ref).
+                                ::leaf_core::Strictness::Strict => ::leaf_core::PointKind::Bean,
+                                _ => ::leaf_core::PointKind::Deferral,
+                            },
+                            collection: ::core::option::Option::None,
+                        }
+                    }
+                }
+            } else {
+                let produced = type_id_of(&dep.ty);
+                quote! { ::leaf_core::InjectionPoint::single(#produced, #name) }
+            }
         })
         .collect()
 }
@@ -517,16 +665,27 @@ fn emit_provider(
     ctor: Option<&syn::Path>,
     receiver_ty: Option<&Type>,
     deps: &[Dependency],
+    inject_via_trait: bool,
     provider_ident: &syn::Ident,
     desc_ident: &syn::Ident,
 ) -> TokenStream {
-    // Resolve each dependency through the engine back-ref, then bind it to a
-    // local the constructor call consumes.
+    // Resolve each dependency, then bind it to a local the constructor call consumes.
+    // Two shapes, selected by `inject_via_trait`:
+    //   * the TRAIT path: `<Ty as Injectable>::inject(__cx)` yields the FULL handle
+    //     the ctor declared (`Ref<Svc>`/`Lookup<Svc>`/…) — no re-wrapping;
+    //   * the legacy path: resolve the (already-stripped) inner bean `Ty` through the
+    //     one `Engine::get` seam, yielding a `Ref<Ty>` threaded into the ctor.
     let resolves = deps.iter().map(|dep| {
         let local = format_ident!("__dep_{}", dep.name);
         let dep_ty = &dep.ty;
-        quote! {
-            let #local: ::leaf_core::Ref<#dep_ty> = __engine.get::<#dep_ty>().await?;
+        if inject_via_trait {
+            quote! {
+                let #local = <#dep_ty as ::leaf_core::Injectable>::inject(__cx).await?;
+            }
+        } else {
+            quote! {
+                let #local: ::leaf_core::Ref<#dep_ty> = __engine.get::<#dep_ty>().await?;
+            }
         }
     });
     let args = deps.iter().map(|dep| {
@@ -557,6 +716,20 @@ fn emit_provider(
         (_, None) => (TokenStream::new(), quote! { <#self_ty>::new( #(#args),* ) }),
     };
 
+    // The `__engine` back-ref is read only by the legacy `Engine::get` resolves and
+    // the config-method receiver resolve. A pure-trait provider with no receiver never
+    // touches it, so it is bound ONLY when needed (an unconditional bind would be an
+    // `unused variable` warning under `-D warnings`).
+    let engine_bind = if !inject_via_trait || receiver_ty.is_some() {
+        quote! {
+            let __engine = __cx.engine().ok_or_else(|| {
+                ::leaf_core::LeafError::new(::leaf_core::ErrorKind::ConstructionFailed)
+            })?;
+        }
+    } else {
+        TokenStream::new()
+    };
+
     quote! {
         #[allow(non_camel_case_types)]
         struct #provider_ident;
@@ -572,9 +745,7 @@ fn emit_provider(
                 ::core::result::Result<::leaf_core::Published, ::leaf_core::LeafError>,
             > {
                 ::std::boxed::Box::pin(async move {
-                    let __engine = __cx.engine().ok_or_else(|| {
-                        ::leaf_core::LeafError::new(::leaf_core::ErrorKind::ConstructionFailed)
-                    })?;
+                    #engine_bind
                     #receiver_resolve
                     #(#resolves)*
                     let __instance = #construct;
