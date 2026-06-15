@@ -18,17 +18,18 @@
 //! The pointcut is [`TxPointcut`] — leaf-tx's own const-constructible predicate
 //! (matching by the bean's concrete `TypeId` or a tx [`MarkerId`]), since the
 //! kernel `within`/`annotated_marker` combinators are not const-constructible into
-//! a `&'static` row. (When the `#[transactional]` macro lands a per-bean TX marker,
-//! the auto-wire pointcut keys on it; until then it is a leaf-tx-owned marker — a
-//! NOTE in the crate docs.)
+//! a `&'static` row.
 //!
-//! ## Attribute NOTE
+//! ## The `#[transactional]` declarative annotation
 //!
-//! `MakeInterceptor` is a bare fn-pointer (no captured env), so the auto-wire row
-//! always applies [`TxAttribute::DEFAULT`] (propagation `Required`, any-`Err`
-//! rolls back). A per-method [`TxAttribute`] table — the macro-emitted const the
-//! design pins — is deferred (a NOTE in the crate docs); the interceptor already
-//! honors a non-default attribute when one is supplied programmatically via
+//! The NATURAL `#[transactional(manager = Mgr)]` annotation on a `#[advisable]`-impl
+//! method auto-wires the tx advisor: the impl-block macro emits a per-method-unique
+//! [`AdvisorPairingRow`] keyed by the bean's `TypeId` (a [`TxPointcut`] over it),
+//! binding the named manager `M` + the method's `Result<T,_>` return classifier via
+//! [`make_transaction_interceptor_for`] (all the const builders here are `const fn` so
+//! the emitted row is a `static` initializer). The auto-wire row applies
+//! [`TxAttribute::DEFAULT`] (propagation `Required`, any-`Err` rolls back); a finer
+//! per-method [`TxAttribute`] is supplied programmatically via
 //! [`TransactionInterceptor::new`].
 
 use std::any::TypeId;
@@ -44,21 +45,21 @@ use crate::interceptor::{result_classifier, TransactionInterceptor};
 
 /// The stable identity of the built-in (auto-wired) tx advisor.
 #[must_use]
-pub fn tx_advisor_contract() -> ContractId {
+pub const fn tx_advisor_contract() -> ContractId {
     ContractId::of("leaf::tx::TransactionAdvisor")
 }
 
 /// The chain order of the tx advisor: the pinned `TX_ORDER = 500` with an
 /// `Interface` source (a framework-declared, most-specific order).
 #[must_use]
-pub fn tx_order_key() -> OrderKey {
+pub const fn tx_order_key() -> OrderKey {
     OrderKey { value: TX_ORDER, source: OrderSource::Interface }
 }
 
-/// The default tx marker the auto-wire advisor keys on (the marker a future
+/// The default tx marker the auto-wire advisor keys on (the marker the
 /// `#[transactional]` macro emits onto the advised bean's `AnnotationMetadata`).
 #[must_use]
-pub fn tx_marker() -> MarkerId {
+pub const fn tx_marker() -> MarkerId {
     MarkerId::of("leaf::tx::Transactional")
 }
 
@@ -73,8 +74,12 @@ pub fn tx_marker() -> MarkerId {
 /// leaf-tx owns this one. `TypeId::of::<T>()` is callable in an inline `const {}`
 /// block (stable), so a binding site writes:
 ///
-/// ```ignore
-/// static P: TxPointcut = TxPointcut::new(&[const { TypeId::of::<MyBean>() }], &[]);
+/// ```no_run
+/// use std::any::TypeId;
+/// use leaf_tx::TxPointcut;
+/// struct MyBean;
+/// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
+/// static P: TxPointcut = TxPointcut::new(&TYPES, &[]);
 /// ```
 pub struct TxPointcut {
     types: &'static [TypeId],
@@ -140,7 +145,7 @@ pub static TX_MARKER_POINTCUT: TxPointcut =
 /// re-wrapped as `Arc<dyn TransactionManager>` — the same resolve-and-upcast bean
 /// bridge the `#[aspect]` `make_interceptor` uses.
 #[must_use]
-pub fn make_transaction_interceptor<M>() -> MakeInterceptor
+pub const fn make_transaction_interceptor<M>() -> MakeInterceptor
 where
     M: TransactionManager + 'static,
 {
@@ -171,7 +176,7 @@ where
 /// (its return is `Result<T, LeafError>`). The monomorphized fn-item coerces to the
 /// bare [`MakeInterceptor`] fn-pointer, baking the per-`T` classifier in.
 #[must_use]
-pub fn make_transaction_interceptor_for<M, T>() -> MakeInterceptor
+pub const fn make_transaction_interceptor_for<M, T>() -> MakeInterceptor
 where
     M: TransactionManager + 'static,
     T: std::any::Any + Send + 'static,
@@ -210,7 +215,7 @@ fn manager_mismatch() -> LeafError {
 /// `Role::Infrastructure` + `TX_ORDER` (the canonical chain slot, INSIDE cache —
 /// `CACHE_ORDER < TX_ORDER` — so a cache hit short-circuits before a tx opens).
 #[must_use]
-pub fn tx_advisor_pairing<M>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
+pub const fn tx_advisor_pairing<M>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
 where
     M: TransactionManager + 'static,
 {
@@ -228,7 +233,7 @@ where
 /// [`make_transaction_interceptor_for`]) so a method returning `Result<T, LeafError>`
 /// rolls back on a business `Result::Err` too. `T` is the advised method's `Ok` type.
 #[must_use]
-pub fn tx_advisor_pairing_for<M, T>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
+pub const fn tx_advisor_pairing_for<M, T>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
 where
     M: TransactionManager + 'static,
     T: std::any::Any + Send + 'static,

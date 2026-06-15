@@ -1,28 +1,27 @@
 //! THE leaf-tx AUTO-ADVISE PROOF-GATE: a REAL annotated app whose
-//! `#[component]` + `#[advisable]` service with a "transactional" method is
+//! `#[component]` + `#[advisable]` service with `#[transactional]` methods is
 //! AUTO-ADVISED end-to-end through `Application::new().run()` — proving the
-//! Infrastructure tx advisor leaf-tx ships AUTO-WIRES (commit on `Ok`, rollback on
-//! `Err`, the advice running in `TX_ORDER`).
+//! Infrastructure tx advisor leaf-tx ships AUTO-WIRES from the NATURAL annotation
+//! (commit on `Ok`, rollback on `Err`, the advice running in `TX_ORDER`).
 //!
-//! What is user code (annotations + one slice row):
-//! - a `#[component]` `LedgerTxManager` — a `TransactionManager` bean wrapping
+//! What is user code (the NATURAL declarative annotation — NO `#[aspect]`, NO
+//! hand-written `ADVISOR_PAIRINGS` row):
+//! - a `register_component!` `LedgerTxManager` — a `TransactionManager` bean wrapping
 //!   leaf-tx's no-op [`InMemoryTransactionManager`] (a real datastore manager would
 //!   be its own ordinary bean; a local newtype is needed only because the orphan
 //!   rule forbids `#[component]`-ing a foreign type from this test crate);
-//! - a `#[component]` + `#[advisable]` `LedgerService` whose methods return
-//!   `Result<i64, LeafError>` (`record_ok` commits, `record_err` rolls back) — the
-//!   ADVISED bean;
-//! - ONE const `ADVISOR_PAIRINGS` row the binary submits, exactly like `#[aspect]`
-//!   emits — so `Application::run` AUTO-COLLECTS the tx advisor with NO
-//!   hand-assembled `.with_advisors`.
+//! - a `#[component]` + `#[advisable]` `LedgerService` whose methods carry
+//!   `#[transactional(manager = LedgerTxManager)]` and return `Result<i64, LeafError>`
+//!   (`record_ok` commits, `record_err` rolls back) — the ADVISED bean.
 //!
-//! Everything else (the proxy plan, the chain install at R4, the `make_interceptor`
-//! resolving the manager through the container) is the run pipeline's auto-wiring.
-//! The test then `invoke_advised`-es each method and asserts the manager saw the
-//! right begin/commit/rollback — the demarcation the auto-installed
-//! `TransactionInterceptor` drove.
+//! The `#[transactional]` annotation on each `#[advisable]`-impl method is what the
+//! impl-block macro lowers to the const `ADVISOR_PAIRINGS` row (the tx advisor keyed
+//! by the bean's `TypeId`, binding the manager + the `Result<i64,_>` return classifier)
+//! — so `Application::run` AUTO-COLLECTS the tx advisor with NO `.with_advisors`. The
+//! test then `invoke_advised`-es each method and asserts the manager saw the right
+//! begin/commit/rollback — the demarcation the auto-installed `TransactionInterceptor`
+//! drove from the declarative annotation.
 
-use std::any::TypeId;
 use std::sync::Arc;
 
 use leaf_boot::{Application, RunOverlay, SealInputs};
@@ -30,8 +29,12 @@ use leaf_core::{
     BoxFuture, ContractId, ErasedArgs, ErrorKind, LeafError, MethodKey, ResolveCtx,
     TransactionManager, TxDefinition, TxState, TxSyncRegistry,
 };
+// `#[transactional]` is NOT imported: it is a per-method MARKER the `#[advisable]`
+// impl macro STRIPS + lowers (the impl-block macro owns the row), so — exactly like
+// `#[bean]` inside `#[configuration] impl` — it is consumed before attribute-macro
+// resolution and needs no import.
 use leaf_macros::{advisable, component, register_component};
-use leaf_tx::{tx_advisor_contract, InMemoryTransactionManager, TxPointcut};
+use leaf_tx::InMemoryTransactionManager;
 
 // ─────────────────────── the tx manager bean ────────────────────────────────
 
@@ -83,10 +86,11 @@ impl TransactionManager for LedgerTxManager {
 
 // ───────────────────────── the advised service bean ─────────────────────────
 
-/// A `@Component` service whose methods are TRANSACTIONAL (advised by the tx
-/// advisor). `record_ok` returns `Ok` (→ commit); `record_err` returns `Err`
-/// (→ rollback). Both return `Result<i64, LeafError>` so the tx advisor's return
-/// classifier can detect the business outcome.
+/// A `@Component` service whose methods are TRANSACTIONAL via the NATURAL
+/// `#[transactional]` annotation (advised by the tx advisor the annotation auto-wires).
+/// `record_ok` returns `Ok` (→ commit); `record_err` returns `Err` (→ rollback). Both
+/// return `Result<i64, LeafError>` so the auto-emitted return classifier can detect the
+/// business outcome.
 #[component]
 #[derive(Debug)]
 struct LedgerService;
@@ -97,46 +101,21 @@ impl LedgerService {
         LedgerService
     }
 
-    /// A successful transactional write → the tx commits.
+    /// A successful transactional write → the tx commits. The `#[transactional]`
+    /// annotation auto-wires the tx advisor (binding the `LedgerTxManager` bean + the
+    /// `Result<i64,_>` rollback classifier) keyed by this bean's `TypeId`.
+    #[transactional(manager = LedgerTxManager)]
     fn record_ok(&self, amount: i64) -> Result<i64, LeafError> {
         Ok(amount + 1)
     }
 
     /// A failing transactional write → the tx rolls back (the default rule: any
     /// `Err` rolls back), and the `Err` is still returned to the caller.
+    #[transactional(manager = LedgerTxManager)]
     fn record_err(&self, _amount: i64) -> Result<i64, LeafError> {
         Err(LeafError::new(ErrorKind::ValidationError))
     }
 }
-
-// ───────────────────── the AUTO-WIRED tx advisor row ────────────────────────
-
-// The tx advisor matches LedgerService by its concrete TypeId (the recursion-safe
-// pointcut — it never advises the manager bean itself). The const TypeId-of seam
-// mints the 'static slice exactly as a `#[transactional]` macro would.
-static ADVISED_TYPES: [TypeId; 1] = [const { TypeId::of::<LedgerService>() }];
-static TX_POINTCUT: TxPointcut = TxPointcut::new(&ADVISED_TYPES, &[]);
-
-// THE auto-wire row: one const `AdvisorPairingRow` in `ADVISOR_PAIRINGS` (the same
-// channel `Application::run` collects `#[aspect]` rows from), binding the manager
-// bean + the i64-return classifier. No `.with_advisors` in the run call. The
-// `make_interceptor` is a non-capturing closure literal (const-promoted to the bare
-// fn-pointer exactly like the `#[aspect]` codegen emits), deferring the generic
-// `make_transaction_interceptor_for` build to call time at R4.
-#[leaf_core::linkme::distributed_slice(leaf_core::ADVISOR_PAIRINGS)]
-#[linkme(crate = leaf_core::linkme)]
-static TX_ADVISOR_ROW: leaf_core::AdvisorPairingRow = leaf_core::AdvisorPairingRow {
-    contract: ContractId::of("leaf::tx::TransactionAdvisor"),
-    order: leaf_core::OrderKey {
-        value: leaf_core::TX_ORDER,
-        source: leaf_core::OrderSource::Interface,
-    },
-    role: leaf_core::Role::Infrastructure,
-    pointcut: &TX_POINTCUT,
-    make_interceptor: |c| {
-        leaf_tx::make_transaction_interceptor_for::<LedgerTxManager, i64>()(c)
-    },
-};
 
 // ─────────────────────────────── the milestone ──────────────────────────────
 
@@ -149,7 +128,7 @@ async fn a_transactional_bean_auto_advises_through_run_and_commits_or_rolls_back
     let spawner: Arc<dyn leaf_core::Spawner> =
         Arc::new(leaf_tokio::TokioExecutionFacility::new());
 
-    // Drive the FULL run pipeline with NOTHING but annotations + the one slice row.
+    // Drive the FULL run pipeline with NOTHING but the natural annotations.
     let running = Application::new()
         .with_name("ledger-app")
         .with_spawner(spawner)
@@ -157,12 +136,18 @@ async fn a_transactional_bean_auto_advises_through_run_and_commits_or_rolls_back
         .await
         .expect("the app auto-wires and runs to Ready");
 
-    // The tx advisor row auto-collected (the headline: it is in ADVISOR_PAIRINGS).
+    // The tx advisor rows auto-collected from the `#[transactional]` annotations: each
+    // is a per-method-unique row whose contract is the tx family base @ the
+    // module-qualified `Bean::method` (so two transactional beans/methods never collide
+    // in the row index).
+    let record_ok_contract = ContractId::of(&format!(
+        "leaf::tx::TransactionAdvisor@{module}::LedgerService::record_ok"
+    ));
     assert!(
         leaf_core::collect_slice(&leaf_core::ADVISOR_PAIRINGS)
             .iter()
-            .any(|r| r.contract == tx_advisor_contract()),
-        "the tx Infrastructure advisor row auto-collected from ADVISOR_PAIRINGS"
+            .any(|r| r.contract == record_ok_contract),
+        "the tx Infrastructure advisor row for `record_ok` auto-collected from #[transactional]"
     );
 
     // The service is AUTOMATICALLY advised (the proxy installed at R4).
@@ -174,7 +159,7 @@ async fn a_transactional_bean_auto_advises_through_run_and_commits_or_rolls_back
         .expect("LedgerService in registry");
     assert!(
         running.is_advised(svc_id),
-        "the #[advisable] bean is AUTOMATICALLY advised by the auto-collected tx advisor"
+        "the #[transactional] #[advisable] bean is AUTOMATICALLY advised by the auto-wired tx advisor"
     );
 
     // The SAME shared manager singleton the auto-installed interceptor resolves.

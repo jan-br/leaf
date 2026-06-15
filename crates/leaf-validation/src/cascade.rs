@@ -128,9 +128,25 @@ pub trait ValidateInto {
 /// impl). Wraps a `&V` and drives a fresh cascade (a guard seeded with `V`'s
 /// identity) when the kernel `validate` is called.
 ///
-/// ```ignore
-/// let props = AppProps { .. };
-/// binder_validate(&AsValidate(&props), &mut cx); // &dyn Validate
+/// ```no_run
+/// use leaf_core::{Validate, ValidationContext};
+/// use leaf_validation::{AsValidate, Cascade, ValidateInto};
+///
+/// struct AppProps {
+///     name: String,
+/// }
+/// impl ValidateInto for AppProps {
+///     fn validate_into(&self, c: &mut Cascade<'_>) {
+///         c.check("name", leaf_validation::constraints::not_empty(&self.name));
+///     }
+/// }
+///
+/// let props = AppProps { name: "leaf".into() };
+/// let mut cx = ValidationContext::new();
+/// // The binder/config face wants a `&dyn Validate`: `AsValidate` is that bridge.
+/// let as_validate = AsValidate(&props);
+/// let dynamic: &dyn Validate = &as_validate;
+/// dynamic.validate(&mut cx);
 /// ```
 pub struct AsValidate<'a, V: ValidateInto + ?Sized>(pub &'a V);
 

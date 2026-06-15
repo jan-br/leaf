@@ -39,26 +39,26 @@
 //! lite-mode footgun into a loud diagnostic + the `take it as a parameter instead`
 //! hint (phase3/05).
 //!
-//! ## Scope NOTE — method-level `#[cacheable]`/`#[scheduled]`
+//! ## Method-level DECLARATIVE concern annotations
 //!
-//! The two gaps this module closes are the design's headline method-level forms:
-//! `@Bean` on a `#[configuration]` class method (configuration-classes) and
-//! `@Around`/`@Before` advice on an `#[aspect]` class method (aspect-model). The
-//! same "iterate the impl's methods, emit one row per method" engine
-//! ([`emit_aspect_impl`]) is the general shape a method-level `#[cacheable]` (a cache
-//! ADVISOR, phase3/09) or `#[scheduled]` (a `SCHEDULED` row, phase3 scheduling) would
-//! reuse — they are advisors/tasks keyed on the method, not a NEW mechanism. Those
-//! remain in their existing FREE-FN forms in [`crate::scheduling`]; wiring an
-//! `#[advisable] impl Svc { #[cacheable] fn .. }` lane through this same iterator is a
-//! deliberately-deferred follow-on (it needs the cache/schedule descriptor's
-//! method-receiver binding, which is the proxy substrate's `make_interceptor`/
-//! `TargetSource` concern — leaf-boot, out of this codegen unit's scope), NOT a
-//! re-litigation of the attr-on-method constraint this module already resolves.
+//! `#[advisable] impl Svc { #[transactional] fn .. #[cacheable(key="#0")] fn .. }` is
+//! the SAME "iterate the impl's methods, emit one row per method" engine: the
+//! [`emit_advisable_impl`] iterator (which emits the join-point spec + the
+//! downcast-thunk method table) ALSO reads each natural concern annotation
+//! (`#[transactional]`/`#[cacheable]`/`#[cache_put]`/`#[cache_evict]`/`#[validated]`/
+//! `#[retryable]`/`#[concurrency_limit]`) on a `&self` method and emits, per concern,
+//! the per-method metadata const + the `ADVISOR_PAIRINGS` row keyed by the bean's
+//! `TypeId` + the return-classifier / arg-key fn — through the THIN [`crate::concern`]
+//! emitters that reference the concern crates' interceptor builders. This is the
+//! natural-annotation auto-wire path (no `#[aspect]`, no `.with_advisors`); the free-fn
+//! `#[cacheable]`/`#[scheduled]` forms in [`crate::scheduling`] remain for non-impl
+//! standalone use.
 
 use proc_macro2::TokenStream;
 use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, Pat, ReturnType, Type};
 
 use crate::advisor::{self, AdviceKind};
+use crate::concern;
 use crate::descriptor::{self, BeanInput, Dependency, EmitError, Scope};
 use crate::stereotype::Stereotype;
 
@@ -173,7 +173,52 @@ pub fn emit_advisable_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
     let methods = advisable_methods(item, &bean_ident);
     let join_points = advisor::emit_join_points(&bean_ident, &self_ty, &methods);
     let method_table = advisor::emit_method_table(&bean_ident, &self_ty, &methods);
-    Ok(quote::quote! { #join_points #method_table })
+    // The DECLARATIVE per-concern rows: each `&self` method carrying a natural concern
+    // annotation (`#[transactional]`/`#[cacheable]`/…) emits its metadata const + the
+    // `ADVISOR_PAIRINGS` row keyed by the bean's TypeId. The attr-on-method limitation
+    // is sidestepped exactly like `#[bean]`/`#[advice]`: the impl-block macro iterates
+    // the methods and emits the sibling rows (the natural-annotation auto-wire path).
+    let concerns = emit_method_concerns(item, &bean_ident, &self_ty)?;
+    Ok(quote::quote! { #join_points #method_table #concerns })
+}
+
+/// Emit the per-concern artifacts for every natural concern annotation on a `&self`
+/// method of the `#[advisable] impl`. Each method may carry several concerns (e.g. a
+/// `#[transactional] #[cacheable]` method) — each emits its own row.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) on a malformed concern attribute, a missing
+/// required field, or a concern on a method that cannot carry it.
+fn emit_method_concerns(
+    item: &ItemImpl,
+    bean_ident: &str,
+    self_ty: &Type,
+) -> Result<TokenStream, EmitError> {
+    let mut rows = TokenStream::new();
+    for inner in &item.items {
+        let ImplItem::Fn(func) = inner else { continue };
+        if !has_self_receiver(func) {
+            continue;
+        }
+        let sig = concern::MethodSig {
+            method_path: format!("{bean_ident}::{}", func.sig.ident),
+            ret_type: match &func.sig.output {
+                ReturnType::Type(_, ty) => (**ty).clone(),
+                ReturnType::Default => syn::parse_str("()").expect("unit type parses"),
+            },
+            first_arg_type: non_receiver_arg_types(func).into_iter().next(),
+        };
+        for attr in &func.attrs {
+            let Some(name) = attr.path().segments.last().map(|s| s.ident.to_string()) else {
+                continue;
+            };
+            let Some(kind) = concern::Concern::from_keyword(&name) else {
+                continue;
+            };
+            rows.extend(concern::emit_concern(kind, attr_tokens(attr), bean_ident, self_ty, &sig)?);
+        }
+    }
+    Ok(rows)
 }
 
 /// The advisable (`&self`/`&mut self`) inherent methods of an impl block, lowered to
@@ -784,5 +829,110 @@ mod tests {
         let item = impl_item("impl SomeTrait for Svc { fn f(&self) {} }");
         let err = emit_advisable_impl(&item).expect_err("a trait impl is rejected");
         assert!(err.message.contains("inherent"), "got: {}", err.message);
+    }
+
+    // ── declarative per-concern annotations on #[advisable] impl methods ──────────
+
+    #[test]
+    fn an_advisable_impl_emits_a_tx_advisor_row_for_a_transactional_method() {
+        // The headline natural-annotation auto-wire: a `#[transactional]` method on an
+        // #[advisable] impl emits the tx ADVISOR_PAIRINGS row (keyed by the bean's
+        // TypeId) ALONGSIDE the join-point spec + method table — no #[aspect], no row.
+        let item = impl_item(
+            "impl LedgerService {
+                #[transactional(manager = LedgerTxManager)]
+                fn record(&self, amount: i64) -> Result<i64, LeafError> { todo!() }
+             }",
+        );
+        let ts = emit_advisable_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The method table + join points still emit.
+        assert!(s.contains("pubstatic__leaf_methods_LedgerService"), "got: {s}");
+        // The tx advisor row keyed by the bean TypeId, with the manager + return-T.
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("::leaf_tx::make_transaction_interceptor_for::<LedgerTxManager,i64>"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn an_advisable_impl_emits_cache_rows_for_cacheable_and_evict_methods() {
+        let item = impl_item(
+            r#"impl UserService {
+                #[cacheable("users", manager = MgrBean)]
+                fn find(&self) -> i64 { todo!() }
+                #[cache_evict("users", all_entries, manager = MgrBean)]
+                fn evict(&self) -> i64 { todo!() }
+             }"#,
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        assert!(s.contains("::leaf_cache::CacheOp::Cacheable"), "got: {s}");
+        assert!(s.contains("::leaf_cache::CacheOp::CacheEvict"), "got: {s}");
+        assert!(s.contains("all_entries:true"), "got: {s}");
+        // Two ADVISOR_PAIRINGS rows (one per cache method).
+        assert_eq!(
+            s.matches("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]")
+                .count(),
+            2,
+            "two cache methods => two rows: {s}"
+        );
+    }
+
+    #[test]
+    fn an_advisable_impl_emits_validated_retryable_and_limit_rows() {
+        let item = impl_item(
+            "impl Svc {
+                #[validated]
+                fn create(&self, req: CreateUser) -> Result<String, LeafError> { todo!() }
+                #[retryable(max = 3)]
+                fn flaky(&self, base: i64) -> Result<i64, LeafError> { todo!() }
+                #[concurrency_limit(2, gate = LimitGate)]
+                async fn guarded(&self, x: i64) -> i64 { todo!() }
+             }",
+        );
+        let ts = emit_advisable_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("::leaf_validation::single_arg_make_interceptor::<CreateUser>()"),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::RetryPolicy::new(3u32)"), "got: {s}");
+        assert!(
+            s.contains("::leaf_resilience::make_concurrency_interceptor::<LimitGate>()"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_concern_attribute_is_a_loud_compile_error() {
+        // A `#[transactional]` with no manager is a loud error (no default manager type).
+        let item = impl_item(
+            "impl S {
+                #[transactional]
+                fn record(&self) -> Result<i64, E> { todo!() }
+             }",
+        );
+        let err = emit_advisable_impl(&item).expect_err("a missing manager hard-errors");
+        assert!(err.message.contains("manager"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn a_concern_on_an_associated_fn_is_ignored() {
+        // Only `&self` methods are advisable call seams; a concern on an associated fn
+        // (no receiver) is not an advised method, so it emits no row.
+        let item = impl_item(
+            "impl S {
+                #[transactional(manager = M)]
+                fn make() -> Self { todo!() }
+             }",
+        );
+        let s = flat(&emit_advisable_impl(&item).expect("emits"));
+        assert!(!s.contains("ADVISOR_PAIRINGS"), "an associated fn is not advised: {s}");
     }
 }

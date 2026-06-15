@@ -36,4 +36,9 @@ fn ui() {
     t.compile_fail("tests/ui/cacheable_requires_a_name.rs");
     // The #[advice] kind vocabulary is closed — an unknown keyword hard-errors.
     t.compile_fail("tests/ui/advice_unknown_kind_is_a_hard_error.rs");
+    // A declarative concern annotation applied STANDALONE (not on a method inside an
+    // `#[advisable] impl`) is a loud error steering to the impl-block form (a
+    // method-position attr alone cannot emit the sibling ADVISOR_PAIRINGS row). The
+    // WORKING impl-block form is exercised by the concern crates' auto_advise tests.
+    t.compile_fail("tests/ui/concern_outside_advisable_is_a_hard_error.rs");
 }

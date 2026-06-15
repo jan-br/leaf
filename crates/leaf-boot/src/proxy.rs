@@ -414,41 +414,29 @@ impl InstalledProxies {
             Self::fixed_target_for(registry, bean).map_err(AdviceError::TargetResolution)?,
         );
         let cx = ResolveCtx::for_engine(engine);
-        // `Call.args` is the empty pack; the real args ride a take-once cell so the
-        // owned-args `MethodEntry.invoke` thunk can consume them on the (single)
-        // innermost proceed (the common, non-replaying around-advisor path).
+        // `Call.args` carries the REAL (cloneable) args (the advised-arg ABI): every
+        // interceptor in the chain can INSPECT them (cache-key-from-arg-#0, validate a
+        // @Valid arg), and a REPLAYABLE `Next::proceed` (retry) re-runs the
+        // args-bearing target by re-cloning a fresh copy off `Call.args` per attempt —
+        // so an args-bearing advised method is now genuinely re-proceedable (the
+        // take-once-cell limitation is dissolved).
         let call = Call::new(
             method,
             BeanKey::ByContract(registry.descriptor(bean).contract),
-            ErasedArgs::none(),
+            args,
             &target,
             &cx,
         );
         let invoke = entry.invoke;
-        // Whether the advised method takes NO arguments (the caller packed the empty
-        // `()` carrier). For a no-arg method the carrier is reconstructible
-        // (`ErasedArgs::none()`), so a REPLAYING advisor — the retry advisor, which
-        // re-`proceed`s a fresh attempt per the substrate's REPLAYABLE `Next` — can
-        // re-run the real method. An args-bearing erased carrier is NOT cloneable, so
-        // a re-proceed for such a method stays a loud `DowncastMismatch` (the
-        // documented v1 limitation: declarative retry of an args-bearing advised
-        // method needs a per-method args re-pack the macro would emit).
-        let no_args = args.type_id_of() == std::any::TypeId::of::<()>();
-        let args_cell: std::sync::Mutex<Option<ErasedArgs>> = std::sync::Mutex::new(Some(args));
         let tail: Box<Tail> = Box::new(move |call: &Call<'_>| {
             // Re-resolve the singleton per proceed, then drive the macro-emitted
-            // downcast thunk over it with the take-once args (re-supplying the empty
-            // carrier on a replay of a no-arg method).
+            // downcast thunk over a FRESH clone of the args (re-cloned each replay, so
+            // a retry re-runs an args-bearing method with the same args every attempt).
             let resolved = call.source.get(call.cx);
-            let taken = args_cell
-                .lock()
-                .expect("args cell")
-                .take()
-                .or_else(|| no_args.then(ErasedArgs::none));
+            let fresh = call.args.replay();
             Box::pin(async move {
                 let bean = resolved.await.map_err(AdviceError::TargetResolution)?;
-                let args = taken.ok_or(AdviceError::DowncastMismatch { method })?;
-                invoke(&bean, args, call.cx).await
+                invoke(&bean, fresh, call.cx).await
             })
         });
         chain.invoke(&call, &*tail).await
@@ -773,6 +761,216 @@ mod tests {
         .unwrap();
         assert_eq!(out.unpack::<i64>().unwrap(), 105, "the real method ran (100 + 5)");
         assert_eq!(*TI_LOG.lock().unwrap(), vec!["enter", "exit"], "routed through the chain");
+    }
+
+    // A retrying interceptor: re-`proceed`s the call N times (the substrate's
+    // REPLAYABLE `Next`) — the args-bearing replay the take-once cell could not do.
+    struct RetryThrice;
+    impl leaf_core::Interceptor for RetryThrice {
+        fn intercept<'a>(
+            &'a self,
+            call: &'a Call<'a>,
+            mut next: Next<'a>,
+        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
+            Box::pin(async move {
+                let mut last = next.proceed(call).await;
+                last = next.proceed(call).await.or(last);
+                next.proceed(call).await.or(last)
+            })
+        }
+    }
+
+    #[test]
+    fn transparent_invoke_carries_real_args_and_a_retry_re_proceeds_an_args_bearing_method() {
+        // THE headline gap fix: a transparent `invoke` of an args-bearing method
+        // (1) carries the REAL typed args on `Call.args` (inspectable by the chain),
+        // and (2) is RE-PROCEEDABLE — a retrying interceptor re-runs the args-bearing
+        // method 3x, each attempt re-cloning a fresh copy of the args off `Call.args`.
+        let mut builder = RegistryBuilder::new();
+        let d = svc_desc();
+        let id = builder.register(d, Arc::new(SvcProv(d))).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        block(engine.get::<Svc>()).unwrap(); // publish the singleton
+
+        // The advisor: a retry that re-proceeds an args-bearing call 3 times.
+        let advisor = AdvisorPairing::new(
+            ContractId::of("test::RetryAdvisor"),
+            OrderKey::implicit(),
+            Role::Application,
+            &ANY,
+            |_c: &dyn Container| Box::pin(async { Ok(Arc::new(RetryThrice) as Arc<dyn Interceptor>) }),
+        )
+        .into_descriptor();
+        let mut jps = std::collections::HashMap::new();
+        let methods = vec![leaf_core::MethodJoinPoint {
+            method: MethodKey::of("test::Svc::add"),
+            arg_types: Default::default(),
+            ret_type: TypeId::of::<i64>(),
+        }];
+        jps.insert(
+            id,
+            leaf_core::BeanJoinPoints {
+                bean_type: TypeId::of::<Svc>(),
+                markers: &AnnotationMetadata::EMPTY,
+                methods: &methods,
+            },
+        );
+        let plan = ProxyPlan::freeze(
+            std::slice::from_ref(&advisor),
+            engine.registry(),
+            &CreatorPolicy::ALL,
+            &jps,
+        )
+        .unwrap();
+
+        // The macro-emitted thunk: count the REAL-method invocations + assert the
+        // args reached the thunk fresh every attempt (the args-bearing tuple `(i64,)`).
+        static TARGET_RUNS: AtomicU32 = AtomicU32::new(0);
+        TARGET_RUNS.store(0, Ordering::SeqCst);
+        fn add_invoke(
+            bean: &ErasedBean,
+            args: ErasedArgs,
+            _cx: &ResolveCtx<'_>,
+        ) -> leaf_core::BoxFuture<'static, Result<ErasedRet, AdviceError>> {
+            TARGET_RUNS.fetch_add(1, Ordering::SeqCst);
+            let svc = Arc::clone(bean).downcast::<Svc>().expect("Svc");
+            Box::pin(async move {
+                let (add,) = args.unpack::<(i64,)>().map_err(|_| {
+                    AdviceError::DowncastMismatch { method: MethodKey::of("test::Svc::add") }
+                })?;
+                Ok(ErasedRet::pack(svc.base + add))
+            })
+        }
+        static TABLE: MethodTable = MethodTable(&[leaf_core::MethodEntry {
+            key: MethodKey::of("test::Svc::add"),
+            invoke: add_invoke,
+        }]);
+        let tables = [MethodTablePairing::new(ContractId::of("test::Svc"), &TABLE)];
+
+        let installed =
+            block(InstalledProxies::install_with_tables(&engine, &plan, &[advisor], &tables)).unwrap();
+
+        // TRANSPARENT invoke of an ARGS-BEARING method through the retry chain.
+        let out = block(installed.invoke(
+            engine.registry(),
+            &engine,
+            id,
+            MethodKey::of("test::Svc::add"),
+            ErasedArgs::pack((5_i64,)),
+        ))
+        .unwrap();
+        // The real method ran 3 times (the args-bearing replay), each over (100 + 5).
+        assert_eq!(out.unpack::<i64>().unwrap(), 105, "the real method ran (100 + 5)");
+        assert_eq!(
+            TARGET_RUNS.load(Ordering::SeqCst),
+            3,
+            "the args-bearing method was RE-PROCEEDED 3 times (replay re-clones the args)"
+        );
+    }
+
+    // An interceptor that INSPECTS arg #0 off `Call.args` and routes on it (the
+    // cache-key / validation read shape) — short-circuits on a sentinel arg.
+    struct RouteOnArgZero;
+    impl leaf_core::Interceptor for RouteOnArgZero {
+        fn intercept<'a>(
+            &'a self,
+            call: &'a Call<'a>,
+            mut next: Next<'a>,
+        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
+            // Read arg #0 WITHOUT consuming the args (they survive for the tail).
+            let arg0 = call.args.downcast_ref::<(i64,)>().map(|(a,)| *a);
+            Box::pin(async move {
+                if arg0 == Some(-1) {
+                    // Route a sentinel arg to a short-circuit (the body never runs).
+                    return Ok(ErasedRet::pack(7777_i64));
+                }
+                next.proceed(call).await
+            })
+        }
+    }
+
+    #[test]
+    fn transparent_invoke_lets_an_interceptor_read_arg_zero_and_route_on_it() {
+        let mut builder = RegistryBuilder::new();
+        let d = svc_desc();
+        let id = builder.register(d, Arc::new(SvcProv(d))).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        block(engine.get::<Svc>()).unwrap();
+
+        let advisor = AdvisorPairing::new(
+            ContractId::of("test::RouteAdvisor"),
+            OrderKey::implicit(),
+            Role::Application,
+            &ANY,
+            |_c: &dyn Container| {
+                Box::pin(async { Ok(Arc::new(RouteOnArgZero) as Arc<dyn Interceptor>) })
+            },
+        )
+        .into_descriptor();
+        let mut jps = std::collections::HashMap::new();
+        let methods = vec![leaf_core::MethodJoinPoint {
+            method: MethodKey::of("test::Svc::add"),
+            arg_types: Default::default(),
+            ret_type: TypeId::of::<i64>(),
+        }];
+        jps.insert(
+            id,
+            leaf_core::BeanJoinPoints {
+                bean_type: TypeId::of::<Svc>(),
+                markers: &AnnotationMetadata::EMPTY,
+                methods: &methods,
+            },
+        );
+        let plan = ProxyPlan::freeze(
+            std::slice::from_ref(&advisor),
+            engine.registry(),
+            &CreatorPolicy::ALL,
+            &jps,
+        )
+        .unwrap();
+
+        fn add_invoke(
+            bean: &ErasedBean,
+            args: ErasedArgs,
+            _cx: &ResolveCtx<'_>,
+        ) -> leaf_core::BoxFuture<'static, Result<ErasedRet, AdviceError>> {
+            let svc = Arc::clone(bean).downcast::<Svc>().expect("Svc");
+            Box::pin(async move {
+                let (add,) = args.unpack::<(i64,)>().map_err(|_| {
+                    AdviceError::DowncastMismatch { method: MethodKey::of("test::Svc::add") }
+                })?;
+                Ok(ErasedRet::pack(svc.base + add))
+            })
+        }
+        static TABLE: MethodTable = MethodTable(&[leaf_core::MethodEntry {
+            key: MethodKey::of("test::Svc::add"),
+            invoke: add_invoke,
+        }]);
+        let tables = [MethodTablePairing::new(ContractId::of("test::Svc"), &TABLE)];
+        let installed =
+            block(InstalledProxies::install_with_tables(&engine, &plan, &[advisor], &tables)).unwrap();
+
+        // A non-sentinel arg proceeds to the real method (100 + 5).
+        let out = block(installed.invoke(
+            engine.registry(),
+            &engine,
+            id,
+            MethodKey::of("test::Svc::add"),
+            ErasedArgs::pack((5_i64,)),
+        ))
+        .unwrap();
+        assert_eq!(out.unpack::<i64>().unwrap(), 105, "a non-sentinel arg proceeds (100 + 5)");
+
+        // The sentinel arg #0 = -1 routes to the short-circuit (body never runs).
+        let out = block(installed.invoke(
+            engine.registry(),
+            &engine,
+            id,
+            MethodKey::of("test::Svc::add"),
+            ErasedArgs::pack((-1_i64,)),
+        ))
+        .unwrap();
+        assert_eq!(out.unpack::<i64>().unwrap(), 7777, "arg #0 routed to the short-circuit");
     }
 
     #[test]

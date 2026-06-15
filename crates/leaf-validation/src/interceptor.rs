@@ -128,8 +128,9 @@ mod tests {
         FixedTarget::new(Arc::new(Nop))
     }
 
-    // The @Valid argument bean.
-    #[derive(Debug)]
+    // The @Valid argument bean (Clone — the advised-arg bound: args ride Call.args +
+    // are re-cloned per replay).
+    #[derive(Debug, Clone)]
     struct CreateUser {
         name: String,
         age: i64,

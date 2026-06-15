@@ -44,6 +44,22 @@ fn compile_error(err: &EmitError) -> proc_macro2::TokenStream {
     quote! { ::core::compile_error!(#message); }
 }
 
+/// The DECLARATIVE per-concern method annotations the `#[advisable] impl` iterator
+/// OWNS (stripped from the re-emitted impl, then lowered to their `ADVISOR_PAIRINGS`
+/// rows by the impl-block macro — a method-position attr alone cannot emit the
+/// sibling row). `cacheable` is included so the natural method form
+/// (`#[cacheable(key="#0")]` on an `#[advisable]` method) is stripped + lowered by the
+/// impl iterator; the standalone free-fn `#[cacheable]` macro is unchanged.
+const CONCERN_ATTRS: &[&str] = &[
+    "transactional",
+    "cacheable",
+    "cache_put",
+    "cache_evict",
+    "validated",
+    "retryable",
+    "concurrency_limit",
+];
+
 /// `#[component]` — the base stereotype. Emits one const `::leaf_core::Descriptor`
 /// row (+ `ProviderSeed`/`InjectionPlan`/`Bean` impl) for the annotated struct.
 ///
@@ -426,21 +442,31 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   (`__leaf_methods_<Ident>` — one downcast-thunk `::leaf_core::MethodEntry` per
 ///   advised method) — the two consts the auto-proxy pipeline JOINs by `ContractId` so
 ///   the transparent proxy auto-installs with NO hand-written `MethodTable` in user
-///   code. The impl block is kept verbatim.
+///   code. The impl block is kept verbatim. It ALSO reads each NATURAL declarative
+///   concern annotation on a `&self` method (`#[transactional]` / `#[cacheable]` /
+///   `#[cache_put]` / `#[cache_evict]` / `#[validated]` / `#[retryable]` /
+///   `#[concurrency_limit]`) and emits its per-method-unique `ADVISOR_PAIRINGS` row +
+///   metadata const (the natural-annotation auto-wire path; those concern attrs are
+///   STRIPPED from the re-emitted impl since the impl-block macro owns their lowering).
 ///
 /// A generic target hard-errors with the `register_proxy!(Concrete)` hint.
 #[proc_macro_attribute]
 pub fn advisable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed_item = parse_macro_input!(item as Item);
     // The METHOD-AWARE impl form: emit the join-point spec + the method table (the
-    // downcast thunks) for the impl's `&self` methods. The struct form (the
-    // Descriptor row) is the STRUCT attr's concern.
+    // downcast thunks) + the per-method DECLARATIVE concern rows for the impl's
+    // `&self` methods. The struct form (the Descriptor row) is the STRUCT attr's
+    // concern. The natural concern annotations (`#[transactional]`/`#[cacheable]`/…)
+    // are STRIPPED from the re-emitted impl — the impl-block macro OWNS their lowering
+    // (a method-position attr alone cannot emit the sibling ADVISOR_PAIRINGS row), so
+    // leaving them on would double-emit / error.
     if let Item::Impl(item_impl) = parsed_item {
+        let cleaned = strip_inner_attrs(item_impl.clone(), CONCERN_ATTRS);
         return match config_impl::emit_advisable_impl(&item_impl) {
-            Ok(rows) => quote! { #item_impl #rows }.into(),
+            Ok(rows) => quote! { #cleaned #rows }.into(),
             Err(err) => {
                 let error = compile_error(&err);
-                quote! { #item_impl #error }.into()
+                quote! { #cleaned #error }.into()
             }
         };
     }
@@ -704,9 +730,15 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! { #parsed #rows }.into()
 }
 
-/// `#[cacheable("cacheName", sync = true, …)]` — cache a free-fn result. Emits a
+/// `#[cacheable("cacheName", sync = true, …)]` — cache a FREE-FN result. Emits a
 /// const `::leaf_core::CacheOpMeta` + the cache advisor identity row in `ADVISORS`
 /// (pinned to the `CACHE_ORDER` chain const). At least one cache name is required.
+///
+/// NOTE: the NATURAL method form `#[cacheable("users", key = "#0", manager = Mgr)]` on a
+/// method INSIDE an `#[advisable] impl` is a different lowering — the impl-block macro
+/// STRIPS this attr before it expands and emits the per-method `ADVISOR_PAIRINGS`
+/// auto-wire row (see [`advisable`]); this standalone form is the free-fn metadata
+/// emitter.
 #[proc_macro_attribute]
 pub fn cacheable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(item as ItemFn);
@@ -719,6 +751,79 @@ pub fn cacheable(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let rows = scheduling::emit_cacheable(&parsed.sig.ident.to_string(), "invoke", &args);
     quote! { #parsed #rows }.into()
+}
+
+// ═══════════════ the DECLARATIVE per-concern method annotations ══════════════
+//
+// These are the NATURAL declarative concern annotations (NOT `#[aspect]`): a method
+// on a `#[advisable] impl` carries `#[transactional]` / `#[cacheable(key="#0")]` /
+// `#[cache_put]` / `#[cache_evict]` / `#[validated]` / `#[retryable]` /
+// `#[concurrency_limit(n)]`, and the `#[advisable]` impl-block macro STRIPS + lowers
+// each to its `ADVISOR_PAIRINGS` row (the impl iterator, not these per-method attrs,
+// emits the sibling row — a method-position attr alone cannot). So these standalone
+// proc-macro attributes exist only to make the annotation valid in attribute position;
+// applied OUTSIDE an `#[advisable] impl` they are a loud `compile_error!` steering to
+// the impl-block form (the same constraint the `#[bean]`/`#[advice]` per-method attrs
+// hit). The heavy lowering lives in `leaf_codegen::concern`, driven by the
+// `#[advisable] impl` iterator (`leaf_codegen::config_impl::emit_advisable_impl`).
+
+/// `#[transactional(manager = Mgr, rollback_for(..))]` — demarcate a transaction on a
+/// `#[advisable]`-impl method (commit on `Ok`, rollback on `Err`). See the module
+/// note: the `#[advisable]` impl macro lowers it; standalone it is a hard error.
+#[proc_macro_attribute]
+pub fn transactional(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    concern_marker_only(item, "transactional")
+}
+
+/// `#[cache_put(cache = "…", key = "#0", manager = Mgr)]` — always run the body + put
+/// (refresh) on a `#[advisable]`-impl method. Lowered by the `#[advisable]` impl macro.
+#[proc_macro_attribute]
+pub fn cache_put(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    concern_marker_only(item, "cache_put")
+}
+
+/// `#[cache_evict(cache = "…", all_entries, manager = Mgr)]` — evict around the body on
+/// a `#[advisable]`-impl method. Lowered by the `#[advisable]` impl macro.
+#[proc_macro_attribute]
+pub fn cache_evict(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    concern_marker_only(item, "cache_evict")
+}
+
+/// `#[validated]` — validate the `@Valid` argument before the body (a bad arg
+/// short-circuits) on a `#[advisable]`-impl method. Lowered by the impl macro.
+#[proc_macro_attribute]
+pub fn validated(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    concern_marker_only(item, "validated")
+}
+
+/// `#[retryable(max = 3, backoff = exponential(base = 10, mult = 2.0))]` — retry a
+/// `#[advisable]`-impl method on a retryable error. Lowered by the impl macro.
+#[proc_macro_attribute]
+pub fn retryable(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    concern_marker_only(item, "retryable")
+}
+
+/// `#[concurrency_limit(n, gate = MyGate)]` — bound concurrent entries to a
+/// `#[advisable]`-impl method via a `ConcurrencyGate`. Lowered by the impl macro.
+#[proc_macro_attribute]
+pub fn concurrency_limit(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    concern_marker_only(item, "concurrency_limit")
+}
+
+/// The shared body for the per-method concern markers: keep the item verbatim and
+/// append a `compile_error!` — applied standalone (outside an `#[advisable] impl`) a
+/// per-method concern attr cannot emit its sibling `ADVISOR_PAIRINGS` row, so it
+/// steers to the impl-block form. Inside an `#[advisable] impl` the macro is STRIPPED
+/// before it expands (the impl iterator owns the lowering), so this never fires there.
+fn concern_marker_only(item: TokenStream, kw: &str) -> TokenStream {
+    let parsed: proc_macro2::TokenStream = item.into();
+    let message = format!(
+        "`#[{kw}]` is a declarative concern annotation for a method INSIDE an \
+         `#[advisable] impl Bean {{ .. }}` block: the impl-block macro lowers it to its \
+         advisor row (a method-position attribute alone cannot emit the sibling \
+         `ADVISOR_PAIRINGS` row). Put the `#[advisable]` attribute on the impl block."
+    );
+    quote! { #parsed ::core::compile_error!(#message); }.into()
 }
 
 /// `#[resource("config/app.yaml")]` — register a compiled-in classpath resource.

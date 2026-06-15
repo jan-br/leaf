@@ -462,6 +462,18 @@ pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]
 /// 3. calls (`.await`s, if `is_async`) the real method on the downcast target;
 /// 4. `::leaf_core::ErasedRet::pack(ret)` → the erased return the chain unwinds.
 ///
+/// ## The advised-arg bound (`Clone + Send + Sync + 'static`)
+///
+/// Each `Ai` is `Clone + Send + Sync + 'static` — the LOAD-BEARING advised-method
+/// argument constraint (Spring's args are re-invocable objects): the args ride
+/// `Call.args` so every interceptor INSPECTS them (cache-key-from-a-param, a `@Valid`
+/// arg), and a REPLAYABLE `Next::proceed` (retry) re-runs the args-bearing target by
+/// re-cloning a fresh copy off `Call.args` per attempt. `ErasedArgs::pack` carries the
+/// monomorphized clone thunk, so the tail re-supplies fresh args without the take-once
+/// cell — args-bearing declarative retry is now sound, not a v1 limitation. A non-`Clone`
+/// arg type is a compile error at the `pack::<(A0, …)>` site (the `Clone` bound), steered
+/// to "make the argument `Clone`" — the documented advised-method constraint.
+///
 /// A bare struct form supplies no methods (an empty table); the method-aware
 /// impl-block form / the binary supplies the per-method specs.
 #[must_use]

@@ -1,58 +1,38 @@
 //! THE leaf-cache AUTO-ADVISE PROOF-GATE: a REAL annotated app whose
-//! `#[component]` + `#[advisable]` service with a `#[cacheable]`-described method is
+//! `#[advisable]` service with `#[cacheable(key="#0")]` / `#[cache_evict]` methods is
 //! AUTO-ADVISED end-to-end through `Application::new().run()` — proving the
-//! Infrastructure cache advisor leaf-cache ships AUTO-WIRES: a HIT short-circuits
-//! the method body on the 2nd call (the body runs ONCE), and `cache_evict`
-//! invalidates so the 3rd call recomputes.
+//! Infrastructure cache advisor leaf-cache ships AUTO-WIRES from the NATURAL
+//! annotation: a HIT short-circuits the method body (the body runs ONCE PER KEY), a
+//! DIFFERENT arg is a different cache entry (per-arg keying), and `#[cache_evict]`
+//! invalidates so the next call recomputes.
 //!
-//! What is user code (annotations + one slice row):
-//! - a `#[cacheable("users")]` free fn — its emitted `CacheOpMeta` const
-//!   (`__leaf_cache_users_cache_spec_invoke`) is the per-method metadata the cache
-//!   advisor reads (the macro emits the metadata; the auto-wire row + key fn are the
-//!   binding site's, exactly like leaf-tx's `#[transactional]` staging);
-//! - a `#[component]` `InMemoryCacheManagerBean` — a `CacheManager` bean wrapping
-//!   leaf-cache's [`InMemoryCacheManager`] (a real backend would be its own bean; a
-//!   local newtype is needed only because the orphan rule forbids `#[component]`-ing
-//!   the foreign type);
-//! - a `#[component]` + `#[advisable]` `UserService` whose `find` method counts its
-//!   invocations + returns an `i64` — the ADVISED, cached bean;
-//! - TWO const `ADVISOR_PAIRINGS` rows the binary submits (a `@Cacheable` advisor on
-//!   `find` and a `@CacheEvict` advisor on `evict`), exactly like `#[aspect]` emits —
-//!   so `Application::run` AUTO-COLLECTS the cache advisor with NO hand-assembled
-//!   `.with_advisors`.
+//! What is user code (the NATURAL declarative annotations — NO `#[aspect]`, NO
+//! hand-written `ADVISOR_PAIRINGS` row, NO marker-fn `CacheOpMeta`):
+//! - a `register_component!` `InMemoryCacheManagerBean` — a `CacheManager` bean
+//!   wrapping leaf-cache's [`InMemoryCacheManager`] (a real backend would be its own
+//!   bean; a local newtype is needed only because the orphan rule forbids
+//!   `#[component]`-ing the foreign type);
+//! - a `#[advisable]` `UserService` whose `find(id: u64)` carries
+//!   `#[cacheable("users", key = "#0", manager = InMemoryCacheManagerBean)]` (the cached
+//!   read, keyed PER-ARG) and whose `evict` carries `#[cache_evict("users",
+//!   all_entries, manager = InMemoryCacheManagerBean)]` (clear-all) — the ADVISED bean.
 //!
-//! Everything else (the proxy plan, the chain install at R4, the `make_interceptor`
-//! resolving the manager through the container) is the run pipeline's auto-wiring.
+//! Each natural annotation on a `#[advisable]`-impl method is what the impl-block macro
+//! lowers to the per-method `CacheOpMeta` const plus the `ADVISOR_PAIRINGS` row (the
+//! cache advisor keyed by the bean's `TypeId`, binding the manager, the method's
+//! return-`T`, and the `key = "#0"` typed arg-key fn) — so `Application::run`
+//! AUTO-COLLECTS the cache advisor with NO `.with_advisors`.
 
-use std::any::TypeId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use leaf_boot::{Application, RunOverlay, SealInputs};
-use leaf_core::{Cache, CacheManager, ContractId, ErasedArgs, Interceptor, LeafError, MethodKey};
-use leaf_macros::{advisable, cacheable, register_component};
-use leaf_cache::{
-    cache_advisor_contract, resolve_manager, unit_key_fn, CacheInterceptor, CacheOp, CachePointcut,
-    CacheRule, InMemoryCacheManager,
-};
-
-// ─────────────────── the #[cacheable] metadata source ────────────────────────
-
-// The `#[cacheable]` macro emits a PUBLIC `CacheOpMeta` const the cache advisor
-// reads. Applied to a marker fn here (the macro is free-fn-shaped); the emitted
-// const `__leaf_cache_users_cache_spec_invoke` IS the per-method metadata the
-// @Cacheable rule below points at — the proof the macro emits the metadata the
-// advisor consumes.
-#[cacheable("users")]
-#[allow(dead_code)] // the macro-emitted CacheOpMeta const is what is consumed
-fn users_cache_spec() {}
-
-// The @CacheEvict op metadata for the write method: clear the whole `users` cache
-// on a write (the real `all_entries` semantic — invalidates regardless of which
-// method/key populated the entry). Emits `__leaf_cache_users_evict_spec_invoke`.
-#[cacheable("users", all_entries = true)]
-#[allow(dead_code)]
-fn users_evict_spec() {}
+use leaf_core::{Cache, CacheManager, ContractId, ErasedArgs, MethodKey};
+// `#[cacheable]` / `#[cache_evict]` are NOT imported: they are per-method MARKERS the
+// `#[advisable]` impl macro STRIPS + lowers (the impl-block macro owns the rows), so —
+// exactly like `#[bean]` inside `#[configuration] impl` — they need no import.
+use leaf_cache::InMemoryCacheManager;
+use leaf_macros::{advisable, register_component};
 
 // ───────────────────────── the cache manager bean ────────────────────────────
 
@@ -80,9 +60,11 @@ impl CacheManager for InMemoryCacheManagerBean {
 
 // ───────────────────────── the advised service bean ──────────────────────────
 
-/// A `@Component` service whose `find` method is CACHEABLE (advised by the cache
-/// advisor). It counts its body invocations so the test can assert a HIT
-/// short-circuits the body on the 2nd call. `evict` is a cache-evicting method.
+/// A `@Component` service whose `find(id)` method is CACHEABLE PER-ARG (advised by the
+/// cache advisor the `#[cacheable(key="#0")]` annotation auto-wires). It counts its body
+/// invocations so the test can assert a HIT short-circuits the body for a SEEN key while
+/// a NEW key recomputes. `evict` is a cache-evicting method (clear the whole `users`
+/// cache).
 #[derive(Debug)]
 struct UserService {
     runs: Arc<AtomicUsize>,
@@ -95,17 +77,19 @@ impl UserService {
         UserService { runs: Arc::new(AtomicUsize::new(0)) }
     }
 
-    /// The CACHED read (NO args — see the key-fn NOTE below): increments the run
-    /// counter and returns a value derived from it (so a recompute is observably
-    /// different from a hit). A HIT returns the cached value WITHOUT running this
-    /// body — `run_count` does not advance.
-    fn find(&self) -> i64 {
+    /// The CACHED, PER-ARG read: `key = "#0"` keys on the `id` argument, so a HIT for a
+    /// SEEN id short-circuits the body (the counter does not advance) while a NEW id
+    /// recomputes. Returns a value derived from the run count + the id so a recompute is
+    /// observably distinct from a hit.
+    #[cacheable("users", key = "#0", manager = InMemoryCacheManagerBean)]
+    fn find(&self, id: u64) -> i64 {
         let n = self.runs.fetch_add(1, Ordering::SeqCst);
-        100 + n as i64
+        1000 + (n as i64) * 100 + id as i64
     }
 
-    /// The EVICTING write: clears the whole `users` cache (the test asserts the
-    /// next `find` recomputes).
+    /// The EVICTING write: clears the whole `users` cache (the test asserts the next
+    /// `find` for any id recomputes).
+    #[cache_evict("users", all_entries, manager = InMemoryCacheManagerBean)]
     fn evict(&self) -> i64 {
         0
     }
@@ -116,71 +100,10 @@ impl UserService {
     }
 }
 
-// ───────────────────── the AUTO-WIRED cache advisor rows ─────────────────────
-
-// The cache advisor matches UserService by its concrete TypeId (the recursion-safe
-// pointcut — it never advises the manager bean itself).
-static ADVISED_TYPES: [TypeId; 1] = [const { TypeId::of::<UserService>() }];
-static CACHE_POINTCUT: CachePointcut = CachePointcut::new(&ADVISED_TYPES, &[]);
-
-// THE auto-wire cache row: ONE const `AdvisorPairingRow` in `ADVISOR_PAIRINGS` (the
-// same channel `Application::run` collects `#[aspect]` rows from), binding the
-// manager bean + per-method rules (`find` = @Cacheable, `evict` = @CacheEvict over
-// the SAME `users` cache). No `.with_advisors` in the run call. The make_interceptor
-// is a non-capturing closure literal (const-promoted to the bare fn-pointer exactly
-// like the `#[aspect]` codegen emits).
-#[leaf_core::linkme::distributed_slice(leaf_core::ADVISOR_PAIRINGS)]
-#[linkme(crate = leaf_core::linkme)]
-static CACHE_ADVISOR_ROW: leaf_core::AdvisorPairingRow = leaf_core::AdvisorPairingRow {
-    contract: ContractId::of("leaf::cache::CacheAdvisor"),
-    order: leaf_core::OrderKey {
-        value: leaf_core::CACHE_ORDER,
-        source: leaf_core::OrderSource::Interface,
-    },
-    role: leaf_core::Role::Infrastructure,
-    pointcut: &CACHE_POINTCUT,
-    make_interceptor: |c| Box::pin(build_user_cache(c)),
-};
-
-// The bean bridge: resolve the manager + build a CacheInterceptor with BOTH the
-// @Cacheable `find` rule (return type i64, reading the #[cacheable]-emitted
-// CacheOpMeta) and the @CacheEvict `evict` rule (clear-all on the SAME `users`
-// cache). Both use the unit key fn — keying on a single per-method entry.
-//
-// NOTE (honest, the design's deferred ErasedArgs ABI risk, doc line ~172): keying
-// the cache on a method ARGUMENT (`#[cacheable(key="#id")]`) is NOT exercised here
-// because the auto-proxy invocation (`InstalledProxies::invoke`) leaves `Call.args`
-// EMPTY and rides the real args through a take-once cell the tail thunk consumes —
-// so an interceptor cannot read the args off `Call.args` to build a per-arg key
-// through the current substrate. Arg-aware keying works when args ARE on `Call.args`
-// (the leaf-cache unit tests pass them directly); threading args to the interceptor
-// through the auto-proxy is a substrate follow-up. So the cached `find` is a no-arg
-// method (one logical entry), which is the correct + faithful headline proof.
-async fn build_user_cache(
-    c: &dyn leaf_core::Container,
-) -> Result<std::sync::Arc<dyn Interceptor>, LeafError> {
-    let manager = resolve_manager::<InMemoryCacheManagerBean>(c).await?;
-    let rules = vec![
-        CacheRule::for_method::<i64>(
-            MethodKey::of("UserService::find"),
-            CacheOp::Cacheable,
-            &__leaf_cache_users_cache_spec_invoke,
-            unit_key_fn(),
-        ),
-        CacheRule::for_method::<i64>(
-            MethodKey::of("UserService::evict"),
-            CacheOp::CacheEvict,
-            &__leaf_cache_users_evict_spec_invoke,
-            unit_key_fn(),
-        ),
-    ];
-    Ok(std::sync::Arc::new(CacheInterceptor::new(manager, rules)) as std::sync::Arc<dyn Interceptor>)
-}
-
 // ─────────────────────────────── the milestone ──────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cacheable_bean_auto_advises_through_run_and_a_hit_short_circuits() {
+async fn a_cacheable_bean_auto_advises_through_run_and_caches_per_arg() {
     leaf_tokio::install_ambient_store().ok();
     let module = module_path!();
     let service_contract = ContractId::of(&format!("{module}::UserService"));
@@ -188,7 +111,7 @@ async fn a_cacheable_bean_auto_advises_through_run_and_a_hit_short_circuits() {
     let spawner: Arc<dyn leaf_core::Spawner> =
         Arc::new(leaf_tokio::TokioExecutionFacility::new());
 
-    // Drive the FULL run pipeline with NOTHING but annotations + the one slice row.
+    // Drive the FULL run pipeline with NOTHING but the natural annotations.
     let running = Application::new()
         .with_name("cache-app")
         .with_spawner(spawner)
@@ -196,12 +119,17 @@ async fn a_cacheable_bean_auto_advises_through_run_and_a_hit_short_circuits() {
         .await
         .expect("the app auto-wires and runs to Ready");
 
-    // The cache advisor row auto-collected (the headline: it is in ADVISOR_PAIRINGS).
+    // The cache advisor rows auto-collected from the `#[cacheable]`/`#[cache_evict]`
+    // annotations: each is a per-method-unique row whose contract is the cache family
+    // base @ the module-qualified `Bean::method` (so two cache methods do not collide).
+    let find_contract = ContractId::of(&format!(
+        "leaf::cache::CacheAdvisor@{module}::UserService::find"
+    ));
     assert!(
         leaf_core::collect_slice(&leaf_core::ADVISOR_PAIRINGS)
             .iter()
-            .any(|r| r.contract == cache_advisor_contract()),
-        "the cache Infrastructure advisor row auto-collected from ADVISOR_PAIRINGS"
+            .any(|r| r.contract == find_contract),
+        "the cache advisor row for `find` auto-collected from the #[cacheable] annotation"
     );
 
     // The service is AUTOMATICALLY advised (the proxy installed at R4).
@@ -213,47 +141,45 @@ async fn a_cacheable_bean_auto_advises_through_run_and_a_hit_short_circuits() {
         .expect("UserService in registry");
     assert!(
         running.is_advised(svc_id),
-        "the #[advisable] bean is AUTOMATICALLY advised by the auto-collected cache advisor"
+        "the #[cacheable] #[advisable] bean is AUTOMATICALLY advised by the auto-wired cache advisor"
     );
 
     let svc = running.context().get::<UserService>().await.expect("the service resolves");
     assert_eq!(svc.run_count(), 0, "no body run yet");
 
-    // ── 1st call: MISS — the body runs, the value is cached ──
-    let r1 = running
-        .invoke_advised(svc_id, MethodKey::of("UserService::find"), ErasedArgs::pack(()))
-        .await
-        .expect("the advised call routes through the auto-installed cache chain");
-    assert_eq!(r1.unpack::<i64>().expect("i64 return"), 100, "the real method ran (100 + run #0)");
-    assert_eq!(svc.run_count(), 1, "the body ran on the MISS");
+    // Helper: invoke `find(id)` through the auto-installed cache chain.
+    let find = |id: u64| {
+        running.invoke_advised(svc_id, MethodKey::of("UserService::find"), ErasedArgs::pack((id,)))
+    };
 
-    // ── 2nd call: HIT — the body does NOT run; the cached value returns ──
-    let r2 = running
-        .invoke_advised(svc_id, MethodKey::of("UserService::find"), ErasedArgs::pack(()))
-        .await
-        .expect("the advised call routes through the cache chain");
-    assert_eq!(r2.unpack::<i64>().expect("i64 return"), 100, "the CACHED value (100) is returned");
-    assert_eq!(svc.run_count(), 1, "a HIT SHORT-CIRCUITED the body — it ran exactly ONCE");
+    // ── find(7): MISS — the body runs, the value cached under key #7 ──
+    let r1 = find(7).await.expect("the advised call routes through the auto-installed cache chain");
+    assert_eq!(r1.unpack::<i64>().expect("i64"), 1007, "the real method ran (1000 + run#0*100 + 7)");
+    assert_eq!(svc.run_count(), 1, "the body ran on the MISS for id 7");
 
-    // ── 3rd call: still a HIT (the body STILL ran only once) ──
-    let r3 = running
-        .invoke_advised(svc_id, MethodKey::of("UserService::find"), ErasedArgs::pack(()))
-        .await
-        .expect("a third cached call");
-    assert_eq!(r3.unpack::<i64>().expect("i64 return"), 100, "still the cached 100");
-    assert_eq!(svc.run_count(), 1, "repeated hits never re-run the body");
+    // ── find(7) again: HIT — the body does NOT run; the cached value returns ──
+    let r2 = find(7).await.expect("a cached call");
+    assert_eq!(r2.unpack::<i64>().expect("i64"), 1007, "the CACHED value (1007) for id 7 returns");
+    assert_eq!(svc.run_count(), 1, "a HIT for the SEEN key short-circuited the body");
 
-    // ── cache_evict invalidates: the next find recomputes ──
+    // ── find(9): a DIFFERENT arg is a DIFFERENT cache entry — the body recomputes ──
+    let r3 = find(9).await.expect("a fresh-key call");
+    assert_eq!(r3.unpack::<i64>().expect("i64"), 1109, "a NEW key recomputed (1000 + run#1*100 + 9)");
+    assert_eq!(svc.run_count(), 2, "per-arg keying: a different arg is a different entry");
+
+    // ── find(9) again: HIT for the now-seen key #9 ──
+    let r4 = find(9).await.expect("a cached call for id 9");
+    assert_eq!(r4.unpack::<i64>().expect("i64"), 1109, "the CACHED value (1109) for id 9 returns");
+    assert_eq!(svc.run_count(), 2, "id 9 is now a HIT — the body ran exactly once per key");
+
+    // ── cache_evict invalidates the whole cache: the next find recomputes ──
     running
         .invoke_advised(svc_id, MethodKey::of("UserService::evict"), ErasedArgs::pack(()))
         .await
         .expect("the evicting call routes through the evict advisor");
-    let r4 = running
-        .invoke_advised(svc_id, MethodKey::of("UserService::find"), ErasedArgs::pack(()))
-        .await
-        .expect("the post-evict find");
-    assert_eq!(r4.unpack::<i64>().expect("i64 return"), 101, "the recomputed value (100 + run #1)");
-    assert_eq!(svc.run_count(), 2, "cache_evict INVALIDATED the entry — find recomputed");
+    let r5 = find(7).await.expect("the post-evict find for id 7");
+    assert_eq!(r5.unpack::<i64>().expect("i64"), 1207, "evict cleared id 7 → recompute (run#2*100 + 7)");
+    assert_eq!(svc.run_count(), 3, "cache_evict INVALIDATED the cache — find recomputed");
 
     // ── shutdown drains cleanly ──
     let report = running.shutdown().await;

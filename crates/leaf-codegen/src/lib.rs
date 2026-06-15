@@ -34,6 +34,12 @@
 //! - [`advisor`] — the `#[advisable]`/`#[aspect]`/`#[advice]`/`#[pointcut]` AOP
 //!   lowering: the `ADVISORS` identity row + the chain-order pairing const
 //!   (declarative-advice phase3/09).
+//! - [`concern`] — the DECLARATIVE per-concern lowering the natural-annotation
+//!   macros (`#[transactional]`/`#[cacheable]`/`#[cache_put]`/`#[cache_evict]`/
+//!   `#[validated]`/`#[retryable]`/`#[concurrency_limit]`) emit through the
+//!   `#[advisable] impl` iterator: the per-method metadata const + the
+//!   `ADVISOR_PAIRINGS` row binding the concern crate's interceptor + the
+//!   return-classifier / arg-key fn (declarative-advice phase3/09).
 //! - [`listener`] — the `#[event_listener]`/`#[transactional_event_listener]`
 //!   lowering: the `EVENT_LISTENERS` row + the defer/phase + condition dispatch
 //!   metadata (events phase3/12).
@@ -46,6 +52,7 @@ pub mod advisor;
 pub mod annotation;
 pub mod app;
 pub mod cargo_leaf;
+pub mod concern;
 pub mod conditional;
 pub mod config;
 pub mod config_impl;

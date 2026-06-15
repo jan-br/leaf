@@ -21,15 +21,17 @@
 //! `within`/`annotated_marker` combinators are not const-constructible into a
 //! `&'static` row.
 //!
-//! ## Attribute NOTE
+//! ## The `#[cacheable]` / `#[cache_put]` / `#[cache_evict]` declarative annotations
 //!
-//! `MakeInterceptor` is a bare fn-pointer (no captured env). The `#[cacheable]`
-//! macro emits the per-method [`CacheOpMeta`] PUBLIC const + the `ADVISORS`
-//! identity row, but not the `ADVISOR_PAIRINGS` auto-wire row nor a typed key fn
-//! (the same staging as leaf-tx's `#[transactional]`); so a binding site supplies
-//! the [`CacheOpMeta`] reference + the typed [`CacheKeyFn`](crate::CacheKeyFn) + the
-//! return type `T` to [`make_cache_interceptor`]. A per-method
-//! `(CacheOpMeta, key_fn, T)` table threaded by the macro is deferred (a NOTE).
+//! The NATURAL `#[cacheable("users", key = "#0", manager = Mgr)]` annotation (and the
+//! `#[cache_put]`/`#[cache_evict]` variants) on a `#[advisable]`-impl method auto-wires
+//! the cache advisor: the impl-block macro emits the per-method [`CacheOpMeta`] const
+//! PLUS a per-method-unique [`AdvisorPairingRow`] keyed by the bean's `TypeId`, whose
+//! `make_interceptor` calls [`build_cache_interceptor`] with the named manager `M`, the
+//! method's return type `T`, the [`CacheOp`], the [`CacheOpMeta`], and the typed
+//! [`CacheKeyFn`](crate::CacheKeyFn) (`key = "#N"` → a closure reading positional arg N
+//! off `Call.args`; unset → [`unit_key_fn`](crate::unit_key_fn)). The contract is
+//! per-method-unique so two cache methods on one bean do not collide in the row index.
 
 use std::any::TypeId;
 use std::sync::Arc;
@@ -44,7 +46,7 @@ use crate::interceptor::{CacheInterceptor, CacheKeyFn, CacheOp};
 
 /// The stable identity of the built-in (auto-wired) cache advisor.
 #[must_use]
-pub fn cache_advisor_contract() -> ContractId {
+pub const fn cache_advisor_contract() -> ContractId {
     ContractId::of("leaf::cache::CacheAdvisor")
 }
 
@@ -52,7 +54,7 @@ pub fn cache_advisor_contract() -> ContractId {
 /// `Interface` source (a framework-declared, most-specific order) — OUTSIDE tx
 /// (`CACHE_ORDER < TX_ORDER`) so a hit short-circuits before a tx opens.
 #[must_use]
-pub fn cache_order_key() -> OrderKey {
+pub const fn cache_order_key() -> OrderKey {
     OrderKey { value: CACHE_ORDER, source: OrderSource::Interface }
 }
 
@@ -60,7 +62,7 @@ pub fn cache_order_key() -> OrderKey {
 /// `#[cacheable]` bean-attribute would emit onto the advised bean's
 /// `AnnotationMetadata`).
 #[must_use]
-pub fn cache_marker() -> MarkerId {
+pub const fn cache_marker() -> MarkerId {
     MarkerId::of("leaf::cache::Cacheable")
 }
 
@@ -75,8 +77,12 @@ pub fn cache_marker() -> MarkerId {
 /// not const-constructible into a `&'static` row, so leaf-cache owns this one. A
 /// binding site writes:
 ///
-/// ```ignore
-/// static P: CachePointcut = CachePointcut::new(&[const { TypeId::of::<MyBean>() }], &[]);
+/// ```no_run
+/// use std::any::TypeId;
+/// use leaf_cache::CachePointcut;
+/// struct MyBean;
+/// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
+/// static P: CachePointcut = CachePointcut::new(&TYPES, &[]);
 /// ```
 pub struct CachePointcut {
     types: &'static [TypeId],
@@ -202,7 +208,7 @@ fn manager_mismatch() -> LeafError {
 /// `op`/`meta`/`key_fn` baked in (a const closure literal, exactly like the
 /// `#[aspect]` codegen emits).
 #[must_use]
-pub fn cache_advisor_pairing(
+pub const fn cache_advisor_pairing(
     pointcut: &'static dyn Pointcut,
     make_interceptor: MakeInterceptor,
 ) -> AdvisorPairingRow {

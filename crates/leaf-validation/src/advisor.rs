@@ -21,16 +21,15 @@
 //! const-constructible into a `&'static` row (the same reason leaf-tx owns
 //! `TxPointcut`).
 //!
-//! ## Attribute NOTE
+//! ## The `#[validated]` declarative annotation
 //!
-//! `MakeInterceptor` is a bare fn-pointer (no captured env), so a const auto-wire row
-//! bakes in the per-method [`ArgValidator`] at the binding site (the same way the
-//! leaf-tx auto-wire row bakes in the manager + return classifier). The `#[validated]`
-//! STRUCT/METHOD attribute macro (which would emit the per-method `ArgValidator` +
-//! the VALIDATE marker the pointcut keys on + the per-arg `@Valid` table) is NOT in
-//! leaf-macros; until it lands a binding site supplies the validator via
-//! [`make_validation_interceptor`] and the pointcut keys on a leaf-validation-owned
-//! marker (a NOTE in the crate docs — the leaf-tx precedent).
+//! The NATURAL `#[validated]` annotation on a `#[advisable]`-impl method auto-wires the
+//! method-validation advisor: the impl-block macro emits a per-method-unique
+//! [`AdvisorPairingRow`] keyed by the bean's `TypeId` (a [`ValidationPointcut`] over
+//! it), whose `make_interceptor` is [`single_arg_make_interceptor`] monomorphized over
+//! the method's FIRST argument type `A` (the `@Valid` arg, which must be
+//! [`ValidateInto`](crate::ValidateInto)). Validation is compiled per type, so the
+//! `make_interceptor` resolves nothing from the container.
 
 use std::any::TypeId;
 use std::sync::Arc;
@@ -44,7 +43,7 @@ use crate::interceptor::MethodValidationInterceptor;
 
 /// The stable identity of the built-in (auto-wired) validation advisor.
 #[must_use]
-pub fn validation_advisor_contract() -> ContractId {
+pub const fn validation_advisor_contract() -> ContractId {
     ContractId::of("leaf::validation::MethodValidationAdvisor")
 }
 
@@ -52,14 +51,14 @@ pub fn validation_advisor_contract() -> ContractId {
 /// (OUTERMOST) with an `Interface` source (a framework-declared, most-specific
 /// order).
 #[must_use]
-pub fn validation_order_key() -> OrderKey {
+pub const fn validation_order_key() -> OrderKey {
     OrderKey { value: VALIDATE_ORDER, source: OrderSource::Interface }
 }
 
 /// The default validation marker the auto-wire advisor keys on (the marker a future
 /// `#[validated]` macro emits onto the advised bean's `AnnotationMetadata`).
 #[must_use]
-pub fn validation_marker() -> MarkerId {
+pub const fn validation_marker() -> MarkerId {
     MarkerId::of("leaf::validation::Validated")
 }
 
@@ -73,8 +72,12 @@ pub fn validation_marker() -> MarkerId {
 /// [`AdvisorPairingRow`]. `TypeId::of::<T>()` is callable in an inline `const {}`
 /// block (stable), so a binding site writes:
 ///
-/// ```ignore
-/// static P: ValidationPointcut = ValidationPointcut::new(&[const { TypeId::of::<MyBean>() }], &[]);
+/// ```no_run
+/// use std::any::TypeId;
+/// use leaf_validation::ValidationPointcut;
+/// struct MyBean;
+/// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
+/// static P: ValidationPointcut = ValidationPointcut::new(&TYPES, &[]);
 /// ```
 pub struct ValidationPointcut {
     types: &'static [TypeId],
@@ -135,7 +138,7 @@ pub static VALIDATED_MARKER_POINTCUT: ValidationPointcut =
 /// the bare [`MakeInterceptor`] fn-pointer, baking `A` in — the const path a
 /// `#[validated]` macro (or a binding site) uses.
 #[must_use]
-pub fn single_arg_make_interceptor<A>() -> MakeInterceptor
+pub const fn single_arg_make_interceptor<A>() -> MakeInterceptor
 where
     A: crate::ValidateInto + 'static,
 {
@@ -154,7 +157,7 @@ where
 /// `Role::Infrastructure` + `VALIDATE_ORDER` (the OUTERMOST chain slot, before every
 /// other concern, so a bad arg never reaches tx/cache or the real method).
 #[must_use]
-pub fn validation_advisor_pairing<A>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
+pub const fn validation_advisor_pairing<A>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
 where
     A: crate::ValidateInto + 'static,
 {

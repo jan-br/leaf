@@ -70,7 +70,13 @@ use crate::registry::Registry;
 /// whole `Call` — and thus the arg pack — must be `Sync`. Async DI method args
 /// are `Send + Sync + 'static` already (they ride the same publication contract
 /// as beans), so this is the natural bound, not an extra restriction.
-pub struct ErasedArgs(pub Box<dyn Any + Send + Sync>);
+pub struct ErasedArgs(pub Box<dyn Any + Send + Sync>, CloneArgs);
+
+/// The per-pack clone thunk: re-pack a FRESH [`ErasedArgs`] from a borrow of the
+/// erased tuple. Monomorphized at [`ErasedArgs::pack`] over the concrete tuple `T`
+/// (which is `Clone` — the advised-arg bound), so a replay re-supplies a fresh
+/// owned clone of the SAME args without the caller knowing the concrete type.
+type CloneArgs = fn(&(dyn Any + Send + Sync)) -> ErasedArgs;
 
 impl ErasedArgs {
     /// Pack a typed argument tuple (the generated per-method glue calls this).
@@ -79,18 +85,33 @@ impl ErasedArgs {
     /// no-arg method packs `()` (or uses [`ErasedArgs::none`]), a one-arg method
     /// packs `(a0,)` — and the matching [`MethodEntry`] thunk recovers it with
     /// `unpack::<(A0, …)>()`. This is the settled positional-tuple ABI.
+    ///
+    /// ## The advised-arg bound (`Clone + Send + Sync + 'static`)
+    ///
+    /// The packed tuple is `Clone` (the LOAD-BEARING advised-method-argument
+    /// constraint — Spring's args are re-invocable objects): the [`Call`] keeps the
+    /// args inspectable for the whole chain AND a REPLAYABLE [`Next::proceed`] (retry)
+    /// re-runs the args-bearing target by CLONING a fresh copy per attempt via the
+    /// monomorphized clone thunk baked in here. `Send + Sync` rides the shared `Call`;
+    /// `'static` rides the erased box. This is the natural bound on a DI method arg
+    /// (it already rides the bean publication contract), not an extra restriction.
     #[must_use]
-    pub fn pack<T: Any + Send + Sync>(args: T) -> Self {
-        ErasedArgs(Box::new(args))
+    pub fn pack<T: Any + Send + Sync + Clone>(args: T) -> Self {
+        ErasedArgs(Box::new(args), |a: &(dyn Any + Send + Sync)| {
+            // The downcast cannot fail: this thunk is only ever paired with a box of
+            // its own monomorphized `T` (set together at the same `pack::<T>` site).
+            let typed = a.downcast_ref::<T>().expect("ErasedArgs clone thunk type pairing");
+            ErasedArgs::pack(typed.clone())
+        })
     }
 
     /// An empty (unit `()`) argument pack — the carrier for a no-arg advised method.
     #[must_use]
     pub fn none() -> Self {
-        ErasedArgs(Box::new(()))
+        ErasedArgs::pack(())
     }
 
-    /// Recover the typed argument tuple by downcast.
+    /// Recover the typed argument tuple by downcast (consumes the pack).
     ///
     /// # Errors
     /// Returns the original box if the concrete tuple type is not exactly `T`.
@@ -98,10 +119,37 @@ impl ErasedArgs {
         self.0.downcast::<T>().map(|b| *b)
     }
 
+    /// Borrow + downcast the packed tuple to `&T` (the non-consuming typed read an
+    /// interceptor uses to INSPECT args off the [`Call`] — route on arg #0, build a
+    /// cache key, validate a `@Valid` arg — without taking ownership).
+    #[must_use]
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+
+    /// Re-pack a FRESH owned clone of these args (the replay primitive): the tail
+    /// thunk calls this per [`Next::proceed`] so a retrying interceptor re-runs an
+    /// args-bearing target with a fresh copy each attempt. Sound because [`pack`]
+    /// requires the tuple to be `Clone` (the advised-arg bound).
+    ///
+    /// [`pack`]: ErasedArgs::pack
+    #[must_use]
+    pub fn replay(&self) -> ErasedArgs {
+        (self.1)(&*self.0)
+    }
+
     /// The concrete `TypeId` of the packed tuple (diagnostics / dynamic dispatch).
     #[must_use]
     pub fn type_id_of(&self) -> TypeId {
         (*self.0).type_id()
+    }
+}
+
+impl Clone for ErasedArgs {
+    /// Clone via the monomorphized clone thunk (the args tuple is `Clone` — the
+    /// advised-arg bound), so a `Call` carrying `ErasedArgs` is itself replayable.
+    fn clone(&self) -> Self {
+        self.replay()
     }
 }
 
@@ -1280,6 +1328,150 @@ mod tests {
         assert_eq!(out.unpack::<i64>().unwrap(), 42);
         // The target ran exactly twice (the replay).
         assert_eq!(target_calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    // ── ErasedArgs: cloneable / replayable args (the advised-arg ABI) ─────────
+
+    #[test]
+    fn erased_args_clone_re_supplies_a_fresh_owned_copy() {
+        // The advised-arg bound (Clone): the args pack clones into a fresh owned copy
+        // a replay can consume, without the caller knowing the concrete tuple type.
+        let args = ErasedArgs::pack((7_i64, "hi".to_string()));
+        let cloned = args.clone();
+        // The original still inspectable (clone did not consume it).
+        assert_eq!(args.downcast_ref::<(i64, String)>().unwrap().0, 7);
+        // The clone is an independent owned value (unpack consumes it).
+        let (n, s) = cloned.unpack::<(i64, String)>().expect("typed");
+        assert_eq!((n, s.as_str()), (7, "hi"));
+        // The original is STILL intact after the clone was consumed.
+        assert_eq!(args.downcast_ref::<(i64, String)>().unwrap().1, "hi");
+    }
+
+    #[test]
+    fn erased_args_replay_yields_independent_clones() {
+        let args = ErasedArgs::pack((41_i64,));
+        let a = args.replay();
+        let b = args.replay();
+        assert_eq!(a.unpack::<(i64,)>().unwrap().0, 41);
+        assert_eq!(b.unpack::<(i64,)>().unwrap().0, 41);
+        // The source survives N replays.
+        assert_eq!(args.downcast_ref::<(i64,)>().unwrap().0, 41);
+    }
+
+    // A retrying interceptor that re-proceeds N times; the tail recovers fresh typed
+    // args off `Call.args` PER attempt (the args-bearing replay the take-once cell
+    // could not do). Each attempt sees the SAME args.
+    struct RetryN {
+        n: u32,
+    }
+    impl Interceptor for RetryN {
+        fn intercept<'a>(
+            &'a self,
+            call: &'a Call<'a>,
+            mut next: Next<'a>,
+        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
+            let n = self.n;
+            Box::pin(async move {
+                let mut last = next.proceed(call).await;
+                for _ in 1..n {
+                    last = next.proceed(call).await;
+                }
+                last
+            })
+        }
+    }
+
+    #[test]
+    fn a_retrying_interceptor_re_proceeds_an_args_bearing_method_each_attempt() {
+        // The headline: an args-bearing advised method is re-proceeded N times, each
+        // attempt recovering a FRESH typed clone of the args off `Call.args` — the
+        // replayable args-bearing retry the design requires.
+        let target_calls = Arc::new(AtomicU32::new(0));
+        let seen_args = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let tc = Arc::clone(&target_calls);
+        let sa = Arc::clone(&seen_args);
+        // The tail re-derives typed args off Call.args via a FRESH replay per proceed
+        // (what the boot tail does), so a non-Copy / owned arg is re-runnable too.
+        let tail: Box<Tail> = Box::new(move |call: &Call<'_>| {
+            tc.fetch_add(1, AtomicOrdering::SeqCst);
+            let fresh = call.args.replay();
+            let (add,) = fresh.unpack::<(i64,)>().expect("fresh typed args");
+            sa.lock().unwrap().push(add);
+            Box::pin(async move { Ok(ErasedRet::pack(add + 1)) }) as BoxFuture<'_, _>
+        });
+        let chain = AdviceChain::new(Box::new([Arc::new(RetryN { n: 3 }) as Arc<dyn Interceptor>]));
+        let source = fixed_svc(0);
+        let cx = ctx();
+        // The args ride `Call.args` (inspectable + replayable), NOT a take-once cell.
+        let call = Call::new(
+            mkey("svc::add"),
+            BeanKey::ByType(TypeId::of::<Svc>()),
+            ErasedArgs::pack((41_i64,)),
+            &source,
+            &cx,
+        );
+        let out = futures::executor::block_on(chain.invoke(&call, &*tail)).expect("ok");
+        assert_eq!(out.unpack::<i64>().unwrap(), 42);
+        // The target ran 3 times (the args-bearing replay) — each seeing the SAME arg.
+        assert_eq!(target_calls.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(*seen_args.lock().unwrap(), vec![41, 41, 41]);
+        // And the args are STILL inspectable on the Call after all replays.
+        assert_eq!(call.args.downcast_ref::<(i64,)>().unwrap().0, 41);
+    }
+
+    #[test]
+    fn an_interceptor_reads_arg_zero_off_the_call_and_routes_on_it() {
+        // A CacheInterceptor-style read: route on arg #0 WITHOUT consuming the args.
+        struct RouteOnArg0;
+        impl Interceptor for RouteOnArg0 {
+            fn intercept<'a>(
+                &'a self,
+                call: &'a Call<'a>,
+                mut next: Next<'a>,
+            ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
+                // Read arg #0 off the Call (inspectable, NOT taken).
+                let routed = call.args.downcast_ref::<(i64,)>().map(|(a,)| *a);
+                Box::pin(async move {
+                    if routed == Some(0) {
+                        // Short-circuit on a sentinel arg WITHOUT running the target.
+                        return Ok(ErasedRet::pack(-1_i64));
+                    }
+                    next.proceed(call).await
+                })
+            }
+        }
+        let chain = AdviceChain::new(Box::new([Arc::new(RouteOnArg0) as Arc<dyn Interceptor>]));
+        let source = fixed_svc(100);
+        let cx = ctx();
+        // A regular arg proceeds; the sentinel 0 short-circuits.
+        let call = Call::new(
+            mkey("svc::add"),
+            BeanKey::ByType(TypeId::of::<Svc>()),
+            ErasedArgs::pack((5_i64,)),
+            &source,
+            &cx,
+        );
+        // svc_tail expects a bare i64 addend; use a small tuple-aware tail here.
+        let tail: Box<Tail> = Box::new(|call: &Call<'_>| {
+            Box::pin(async move {
+                let bean = call.source.get(call.cx).await.map_err(AdviceError::TargetResolution)?;
+                let svc = bean.downcast_ref::<Svc>().unwrap();
+                let (add,) = call.args.downcast_ref::<(i64,)>().copied().unwrap();
+                Ok(ErasedRet::pack(svc.base + add))
+            })
+        });
+        let out = futures::executor::block_on(chain.invoke(&call, &*tail)).expect("ok");
+        assert_eq!(out.unpack::<i64>().unwrap(), 105, "a non-sentinel arg proceeds (100 + 5)");
+
+        let sentinel = Call::new(
+            mkey("svc::add"),
+            BeanKey::ByType(TypeId::of::<Svc>()),
+            ErasedArgs::pack((0_i64,)),
+            &source,
+            &cx,
+        );
+        let out = futures::executor::block_on(chain.invoke(&sentinel, &*tail)).expect("ok");
+        assert_eq!(out.unpack::<i64>().unwrap(), -1, "arg #0 routed to the short-circuit");
     }
 
     // ── Pointcut combinators ─────────────────────────────────────────────────

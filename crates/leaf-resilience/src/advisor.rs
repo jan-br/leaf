@@ -15,9 +15,18 @@
 //! The pointcut is [`ResiliencePointcut`] — leaf-resilience's own const-constructible
 //! predicate (by concrete `TypeId` or a resilience [`MarkerId`]), since the kernel
 //! `within`/`annotated_marker` combinators are not const-constructible into a
-//! `&'static` row. (When the `#[retryable]`/`#[concurrency_limit]` macros land, the
-//! auto-wire pointcut keys on the emitted markers; until then it is a resilience-owned
-//! marker — a NOTE in the crate docs.)
+//! `&'static` row.
+//!
+//! ## The `#[retryable]` / `#[concurrency_limit]` declarative annotations
+//!
+//! The NATURAL `#[retryable(max = 3, backoff = ..)]` annotation on a `#[advisable]`-impl
+//! method auto-wires the retry advisor (a per-method-unique [`AdvisorPairingRow`] keyed
+//! by the bean's `TypeId`, building a [`RetryInterceptor`](crate::RetryInterceptor) over
+//! the parsed [`RetryPolicy`] + backoff + the method's `Result<T,_>` retry classifier);
+//! `#[concurrency_limit(n, gate = G)]` auto-wires the concurrency-limit advisor (resolving
+//! the named gate `G` via [`make_concurrency_interceptor`]). The contract is
+//! per-method-unique so two resilience-advised beans/methods never collide in the row
+//! index.
 //!
 //! ## Mandatory two-advisor self-check
 //!
@@ -41,41 +50,41 @@ use crate::template::ResilientRetry;
 
 /// The stable identity of the built-in (auto-wired) retry advisor.
 #[must_use]
-pub fn retry_advisor_contract() -> ContractId {
+pub const fn retry_advisor_contract() -> ContractId {
     ContractId::of("leaf::resilience::RetryAdvisor")
 }
 
 /// The stable identity of the built-in (auto-wired) concurrency-limit advisor.
 #[must_use]
-pub fn concurrency_advisor_contract() -> ContractId {
+pub const fn concurrency_advisor_contract() -> ContractId {
     ContractId::of("leaf::resilience::ConcurrencyLimitAdvisor")
 }
 
 /// The chain order of the retry advisor: the pinned `RETRY_ORDER = 200` with an
 /// `Interface` source (a framework-declared order — OUTSIDE tx, INSIDE validation).
 #[must_use]
-pub fn retry_order_key() -> OrderKey {
+pub const fn retry_order_key() -> OrderKey {
     OrderKey { value: RETRY_ORDER, source: OrderSource::Interface }
 }
 
 /// The chain order of the concurrency-limit advisor: the pinned
 /// `CONCURRENCY_ORDER = 550` with an `Interface` source (INSIDE tx).
 #[must_use]
-pub fn concurrency_order_key() -> OrderKey {
+pub const fn concurrency_order_key() -> OrderKey {
     OrderKey { value: CONCURRENCY_ORDER, source: OrderSource::Interface }
 }
 
-/// The marker the auto-wire retry advisor keys on (the marker a future
+/// The marker the auto-wire retry advisor keys on (the marker the
 /// `#[retryable]` macro emits onto the advised bean's `AnnotationMetadata`).
 #[must_use]
-pub fn retryable_marker() -> MarkerId {
+pub const fn retryable_marker() -> MarkerId {
     MarkerId::of("leaf::resilience::Retryable")
 }
 
-/// The marker the auto-wire concurrency-limit advisor keys on (the marker a future
+/// The marker the auto-wire concurrency-limit advisor keys on (the marker the
 /// `#[concurrency_limit]` macro emits).
 #[must_use]
-pub fn concurrency_limit_marker() -> MarkerId {
+pub const fn concurrency_limit_marker() -> MarkerId {
     MarkerId::of("leaf::resilience::ConcurrencyLimit")
 }
 
@@ -90,9 +99,12 @@ pub fn concurrency_limit_marker() -> MarkerId {
 /// `&'static` row). `TypeId::of::<T>()` is callable in an inline `const {}` block,
 /// so a binding site writes:
 ///
-/// ```ignore
-/// static P: ResiliencePointcut =
-///     ResiliencePointcut::new(&[const { TypeId::of::<MyBean>() }], &[]);
+/// ```no_run
+/// use std::any::TypeId;
+/// use leaf_resilience::ResiliencePointcut;
+/// struct MyBean;
+/// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
+/// static P: ResiliencePointcut = ResiliencePointcut::new(&TYPES, &[]);
 /// ```
 pub struct ResiliencePointcut {
     types: &'static [TypeId],
@@ -173,7 +185,7 @@ pub trait RetrySpec: Send + Sync + 'static {
 /// The monomorphized fn-item coerces to the bare [`MakeInterceptor`] fn-pointer,
 /// baking the per-advisor policy/backoff in via `S` (no captured env).
 #[must_use]
-pub fn make_retry_interceptor<S: RetrySpec>() -> MakeInterceptor {
+pub const fn make_retry_interceptor<S: RetrySpec>() -> MakeInterceptor {
     |_container: &dyn Container| {
         Box::pin(async move {
             let interceptor = RetryInterceptor::new(ResilientRetry::new(S::policy(), S::backoff()));
@@ -191,7 +203,7 @@ pub fn make_retry_interceptor<S: RetrySpec>() -> MakeInterceptor {
 /// `BeanKey::ByType(TypeId::of::<G>())` and downcast to `Arc<G>` — the same
 /// resolve-and-upcast bean bridge the tx advisor uses for its manager.
 #[must_use]
-pub fn make_concurrency_interceptor<G>() -> MakeInterceptor
+pub const fn make_concurrency_interceptor<G>() -> MakeInterceptor
 where
     G: ConcurrencyGate + 'static,
 {
@@ -227,7 +239,7 @@ fn gate_mismatch() -> ResolveError {
 /// in the const [`RetrySpec`] `S`. `Role::Infrastructure` + `RETRY_ORDER` (outside
 /// tx, inside validation).
 #[must_use]
-pub fn retry_advisor_pairing<S: RetrySpec>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow {
+pub const fn retry_advisor_pairing<S: RetrySpec>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow {
     AdvisorPairingRow {
         contract: retry_advisor_contract(),
         order: retry_order_key(),
@@ -241,7 +253,7 @@ pub fn retry_advisor_pairing<S: RetrySpec>(pointcut: &'static dyn Pointcut) -> A
 /// concrete gate `G` and matching `pointcut`. `Role::Infrastructure` +
 /// `CONCURRENCY_ORDER` (inside tx).
 #[must_use]
-pub fn concurrency_advisor_pairing<G>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
+pub const fn concurrency_advisor_pairing<G>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
 where
     G: ConcurrencyGate + 'static,
 {

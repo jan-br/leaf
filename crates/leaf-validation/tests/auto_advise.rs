@@ -6,49 +6,42 @@
 //! BEFORE the real method runs, at `VALIDATE_ORDER` = OUTERMOST), PLUS the
 //! binder-side `ValidationBindHandler` adapter running JSR validation at config bind.
 //!
-//! What is user code (annotations + one slice row):
+//! What is user code (the NATURAL `#[validated]` annotation — NO `#[aspect]`, NO
+//! hand-written `ADVISOR_PAIRINGS` row):
 //! - a `#[component]` + `#[advisable]` `SignupService` whose `create(req: CreateUser)`
-//!   method takes a `@Valid` argument — the ADVISED bean;
+//!   method carries `#[validated]` and takes a `@Valid` argument — the ADVISED bean;
 //! - a `CreateUser` arg type with a hand-written `impl ValidateInto` (the
-//!   `#[derive(Validate)]` / `#[validated]` macros are deferred — see the crate NOTE,
-//!   the leaf-tx `#[transactional]` precedent);
-//! - ONE const `ADVISOR_PAIRINGS` row the binary submits, exactly like `#[aspect]`
-//!   emits — so `Application::run` AUTO-COLLECTS the validation advisor with NO
-//!   hand-assembled `.with_advisors`;
-//! - a `#[config_properties]` `PoolProps` bean whose `max-connections` field carries
-//!   a `range(min=1)` constraint — proving FACE 3 (config-binding JSR validation).
+//!   `#[derive(Validate)]` constraint-derive is its own deferred macro; the
+//!   `#[validated]` ADVISOR macro is what this test exercises);
+//! - a `#[config_properties]`-shaped `PoolProps` bean whose `max-connections` field
+//!   carries a `range(min=1)` constraint — proving FACE 3 (config-binding validation).
 //!
-//! Everything else (the proxy plan, the chain install at R4, the make_interceptor)
-//! is the run pipeline's auto-wiring.
+//! The `#[validated]` annotation on the `#[advisable]`-impl `create` method is what the
+//! impl-block macro lowers to the const `ADVISOR_PAIRINGS` row (the validation advisor
+//! keyed by the bean's `TypeId`, binding the single-`@Valid`-arg validator over
+//! `CreateUser` — the method's first arg type) — so `Application::run` AUTO-COLLECTS the
+//! validation advisor with NO `.with_advisors`.
 //!
-//! ## NOTE — driving the AUTO-INSTALLED chain with real args
+//! ## Driving the AUTO-INSTALLED chain with real args
 //!
-//! `RunningApp::invoke_advised` hands the interceptor chain an EMPTY `Call.args`
-//! pack: the real args ride a take-once cell consumed only at the innermost tail (so
-//! the owned-args `MethodEntry.invoke` thunk can move them once). That is the
-//! proxy-substrate's deferred `ErasedArgs` pack-unpack ABI gap (the design's
-//! "Remaining risks": "validation's typed-arg access needs concrete arg types at the
-//! seam"). Method-ARG validation MUST see the typed args, so this test drives the
-//! chain that `Application::run` AUTO-INSTALLED (`proxies().chain_for(svc)`) over a
-//! `Call` carrying the REAL `(CreateUser,)` args — proving the auto-wired chain
-//! short-circuits a bad arg before the body, with the typed args the seam will carry
-//! once the ABI lands. The advisor auto-collection + the bean being auto-advised are
-//! still asserted through the run pipeline.
+//! `RunningApp::invoke_advised` now carries the REAL typed args on `Call.args` (the
+//! advised-arg ABI — each arg is `Clone + Send + Sync + 'static`), so the method-arg
+//! validation advisor reads the concrete `@Valid` arg straight off the call: this
+//! test drives the AUTO-INSTALLED chain end-to-end THROUGH `invoke_advised` — a valid
+//! arg reaches the real body, a bad arg SHORT-CIRCUITS with aggregated violations
+//! before the body runs. (The earlier take-once-cell + empty-`Call.args` ABI gap is
+//! dissolved.)
 
-use std::any::TypeId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use leaf_boot::{Application, RunOverlay, SealInputs};
-use leaf_core::{
-    AdviceError, BeanKey, BoxFuture, Call, ContractId, ErasedArgs, ErasedRet, ErrorKind, FixedTarget,
-    LeafError, MethodKey, ResolveCtx, Tail,
-};
-use leaf_macros::{advisable, component};
-use leaf_validation::{
-    single_arg_make_interceptor, validate_config, validation_advisor_contract, Cascade,
-    ValidateInto, ValidationPointcut,
-};
+use leaf_core::{ContractId, ErasedArgs, ErrorKind, LeafError, MethodKey};
+// `#[validated]` is NOT imported: it is a per-method MARKER the `#[advisable]` impl
+// macro STRIPS + lowers (the impl-block macro owns the row), so — exactly like
+// `#[bean]` inside `#[configuration] impl` — it needs no import.
+use leaf_macros::{advisable, register_component};
+use leaf_validation::{validate_config, Cascade, ValidateInto};
 
 // ─────────────────────────── the @Valid argument type ───────────────────────
 
@@ -70,50 +63,38 @@ impl ValidateInto for CreateUser {
 
 // ───────────────────────── the advised service bean ─────────────────────────
 
-/// A `@Component` service whose `create` method is VALIDATED (advised by the
-/// validation advisor): the `@Valid` `req` is checked before the body runs.
-#[component]
+/// A service whose `create` method is VALIDATED (advised by the validation advisor):
+/// the `@Valid` `req` is checked before the body runs. The `ran` flag is OWNED bean
+/// state proving whether the real body executed (`register_component!` so the atomic
+/// field is owned state, not a field-injected dep — the resilience-test precedent).
 #[derive(Debug)]
-struct SignupService;
+struct SignupService {
+    ran: AtomicBool,
+}
+register_component!(SignupService);
 
 #[advisable]
 impl SignupService {
     fn new() -> Self {
-        SignupService
+        SignupService { ran: AtomicBool::new(false) }
     }
 
-    /// Create a user from a VALIDATED request. The real body only runs when `req`
-    /// passes validation (a bad `req` short-circuits before this line).
+    /// Create a user from a VALIDATED request. The `#[validated]` annotation auto-wires
+    /// the validation advisor over this method's first arg type (`CreateUser`), keyed by
+    /// the bean's `TypeId`. The real body only runs when `req` passes validation (a bad
+    /// `req` short-circuits before this line) — it flips `ran` so the test can assert a
+    /// bad arg never reached it.
+    #[validated]
     fn create(&self, req: CreateUser) -> Result<String, LeafError> {
+        self.ran.store(true, Ordering::SeqCst);
         Ok(format!("created {} (age {})", req.name, req.age))
     }
+
+    /// `true` iff the real `create` body has run.
+    fn ran(&self) -> bool {
+        self.ran.load(Ordering::SeqCst)
+    }
 }
-
-// ───────────────────── the AUTO-WIRED validation advisor row ─────────────────
-
-// The validation advisor matches SignupService by its concrete TypeId (the
-// recursion-safe pointcut). The const TypeId-of seam mints the 'static slice exactly
-// as a `#[validated]` macro would.
-static ADVISED_TYPES: [TypeId; 1] = [const { TypeId::of::<SignupService>() }];
-static VALIDATION_POINTCUT: ValidationPointcut = ValidationPointcut::new(&ADVISED_TYPES, &[]);
-
-// THE auto-wire row: one const `AdvisorPairingRow` in `ADVISOR_PAIRINGS` (the same
-// channel `Application::run` collects `#[aspect]` rows from), baking in the per-method
-// single-`@Valid`-arg validator for `CreateUser`. No `.with_advisors` in the run
-// call. The make_interceptor is a const closure literal (const-promoted to the bare
-// fn-pointer exactly like the `#[aspect]` codegen emits).
-#[leaf_core::linkme::distributed_slice(leaf_core::ADVISOR_PAIRINGS)]
-#[linkme(crate = leaf_core::linkme)]
-static VALIDATION_ADVISOR_ROW: leaf_core::AdvisorPairingRow = leaf_core::AdvisorPairingRow {
-    contract: ContractId::of("leaf::validation::MethodValidationAdvisor"),
-    order: leaf_core::OrderKey {
-        value: leaf_core::VALIDATE_ORDER,
-        source: leaf_core::OrderSource::Interface,
-    },
-    role: leaf_core::Role::Infrastructure,
-    pointcut: &VALIDATION_POINTCUT,
-    make_interceptor: |c| single_arg_make_interceptor::<CreateUser>()(c),
-};
 
 // ───────────────── FACE 3: a @ConfigurationProperties with range(min=1) ──────
 
@@ -150,12 +131,17 @@ async fn a_validated_bean_auto_advises_through_run_and_a_bad_arg_short_circuits(
         .await
         .expect("the app auto-wires and runs to Ready");
 
-    // The validation advisor row auto-collected (the headline: it is in ADVISOR_PAIRINGS).
+    // The validation advisor row auto-collected from the `#[validated]` annotation: a
+    // per-method-unique row whose contract is the validation family base @ the
+    // module-qualified `Bean::method`.
+    let create_contract = ContractId::of(&format!(
+        "leaf::validation::MethodValidationAdvisor@{module}::SignupService::create"
+    ));
     assert!(
         leaf_core::collect_slice(&leaf_core::ADVISOR_PAIRINGS)
             .iter()
-            .any(|r| r.contract == validation_advisor_contract()),
-        "the validation Infrastructure advisor row auto-collected from ADVISOR_PAIRINGS"
+            .any(|r| r.contract == create_contract),
+        "the validation Infrastructure advisor row auto-collected from the #[validated] annotation"
     );
 
     // The service is AUTOMATICALLY advised (the proxy installed at R4).
@@ -170,66 +156,18 @@ async fn a_validated_bean_auto_advises_through_run_and_a_bad_arg_short_circuits(
         "the #[advisable] bean is AUTOMATICALLY advised by the auto-collected validation advisor"
     );
 
-    // The AUTO-INSTALLED chain (assembled by Application::run at R4) for the advised
-    // bean. We drive it directly over a Call carrying the REAL typed args (the
-    // invoke_advised empty-args ABI gap — see the module NOTE).
-    let proxies = running.unit().proxies().expect("proxies installed at R4");
-    let chain = proxies.chain_for(svc_id).expect("the auto-installed validation chain").clone();
     let method = MethodKey::of("SignupService::create");
+    let svc = running.context().get::<SignupService>().await.expect("SignupService resolves");
 
-    // The innermost target is the published singleton (the same FixedTarget the run
-    // pipeline's own tail resolves); our tail records whether the real body ran.
-    let registry = running.context().engine().registry();
-    let target = FixedTarget::new(
-        leaf_boot::InstalledProxies::fixed_target_for(registry, svc_id)
-            .expect("the advised singleton is published"),
-    );
-    let cx = ResolveCtx::root();
-
-    // ── VALID arg: the chain proceeds to the body (the tail runs) ──
-    let ran = Arc::new(AtomicBool::new(false));
-    let ran_in = Arc::clone(&ran);
-    let good_call = Call::new(
-        method,
-        BeanKey::ByContract(service_contract),
-        ErasedArgs::pack((CreateUser { name: "Jan".into(), age: 39 },)),
-        &target,
-        &cx,
-    );
-    let good_tail: Box<Tail> = Box::new(move |c: &Call<'_>| {
-        ran_in.store(true, Ordering::SeqCst);
-        // The body's view of the typed arg the validator just approved.
-        let arg = c.args.0.downcast_ref::<(CreateUser,)>().expect("the typed arg reached the body");
-        let ret: Result<String, LeafError> = Ok(format!("created {} (age {})", arg.0.name, arg.0.age));
-        Box::pin(async move { Ok(ErasedRet::pack(ret)) })
-            as BoxFuture<'_, Result<ErasedRet, AdviceError>>
-    });
-    let ok = chain
-        .invoke(&good_call, &*good_tail)
-        .await
-        .expect("the valid arg proceeds through the auto-installed validation chain");
-    let ok_ret: Result<String, LeafError> = ok.unpack().expect("the Result<String,_> return");
-    assert_eq!(ok_ret.expect("Ok"), "created Jan (age 39)", "the real body ran on a valid arg");
-    assert!(ran.load(Ordering::SeqCst), "the body ran (validation passed → proceed)");
-
-    // ── BAD arg: short-circuits with AGGREGATED violations, the body NEVER runs ──
-    let ran2 = Arc::new(AtomicBool::new(false));
-    let ran2_in = Arc::clone(&ran2);
-    let bad_call = Call::new(
-        method,
-        BeanKey::ByContract(service_contract),
-        // BOTH fields invalid → both violations aggregated.
-        ErasedArgs::pack((CreateUser { name: "".into(), age: 999 },)),
-        &target,
-        &cx,
-    );
-    let bad_tail: Box<Tail> = Box::new(move |_c: &Call<'_>| {
-        ran2_in.store(true, Ordering::SeqCst);
-        Box::pin(async { Ok(ErasedRet::pack(Ok::<String, LeafError>(String::new()))) })
-            as BoxFuture<'_, Result<ErasedRet, AdviceError>>
-    });
-    let bad = chain
-        .invoke(&bad_call, &*bad_tail)
+    // ── BAD arg FIRST: short-circuits with AGGREGATED violations, the body NEVER runs ──
+    // (Done before the valid call so `ran()` cleanly proves the body did not fire.)
+    let bad = running
+        .invoke_advised(
+            svc_id,
+            method,
+            // BOTH fields invalid → both violations aggregated.
+            ErasedArgs::pack((CreateUser { name: "".into(), age: 999 },)),
+        )
         .await
         .expect_err("a bad @Valid arg SHORT-CIRCUITS with a framework ValidationError");
     let leaf = bad.into_leaf_error();
@@ -242,7 +180,23 @@ async fn a_validated_bean_auto_advises_through_run_and_a_bad_arg_short_circuits(
     let details: Vec<String> = leaf.chain.iter().map(|c| c.detail.to_string()).collect();
     assert!(details.iter().any(|d| d.contains("name: validation.not_empty")), "the name violation");
     assert!(details.iter().any(|d| d.contains("age: validation.range")), "the age violation");
-    assert!(!ran2.load(Ordering::SeqCst), "the real body NEVER ran (short-circuited before proceed)");
+    assert!(!svc.ran(), "the real body NEVER ran (short-circuited before proceed)");
+
+    // ── VALID arg: invoke_advised carries the typed arg to the real body ──
+    // The args ride `Call.args` (the advised-arg ABI), so the validation advisor reads
+    // the @Valid `CreateUser` straight off the call and proceeds to the auto-installed
+    // method-table thunk (the REAL `create` body).
+    let ok = running
+        .invoke_advised(
+            svc_id,
+            method,
+            ErasedArgs::pack((CreateUser { name: "Jan".into(), age: 39 },)),
+        )
+        .await
+        .expect("the valid arg proceeds through the auto-installed validation chain");
+    let ok_ret: Result<String, LeafError> = ok.unpack().expect("the Result<String,_> return");
+    assert_eq!(ok_ret.expect("Ok"), "created Jan (age 39)", "the real body ran on a valid arg");
+    assert!(svc.ran(), "the body ran (validation passed → proceed → the real create body)");
 
     // ── shutdown drains cleanly ──
     let report = running.shutdown().await;

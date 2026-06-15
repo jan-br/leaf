@@ -8,46 +8,34 @@
 //! 2. a CONCURRENCY-LIMIT-advised method caps concurrent entries to the gate's
 //!    limit (no more than N bodies hold a permit at once).
 //!
-//! What is user code (annotations + the slice rows):
+//! What is user code (the NATURAL `#[retryable]` / `#[concurrency_limit]` annotations
+//! — NO `#[aspect]`, NO hand-written `ADVISOR_PAIRINGS` rows):
 //! - a `register_component!` `LimitGate` — a `ConcurrencyGate` bean wrapping
 //!   leaf-tokio's limit-2 `TokioExecutionFacility` (a local newtype: the orphan rule
 //!   forbids `#[component]`-ing the foreign type; `register_component!` constructs it
 //!   via `::new()`, NOT field-injection);
 //! - two `register_component!` + `#[advisable]` services with OWNED atomic state
-//!   (the ADVISED beans — `register_component!` so their atomic fields are owned
-//!   state, not injected deps);
-//! - the const `ADVISOR_PAIRINGS` rows the binary submits, exactly like `#[aspect]`
-//!   emits — so `Application::run` AUTO-COLLECTS the resilience advisors with NO
-//!   hand-assembled `.with_advisors`.
+//!   whose methods carry `#[retryable(max = 3)]` / `#[concurrency_limit(2, gate = ..)]`
+//!   (the ADVISED beans).
+//!
+//! Each natural annotation on a `#[advisable]`-impl method is what the impl-block macro
+//! lowers to the const `ADVISOR_PAIRINGS` row (the resilience advisors keyed by the
+//! bean's `TypeId`, `#[retryable]` binding the `Result<i64,_>` retry classifier and
+//! `#[concurrency_limit]` binding the named gate) — so `Application::run` AUTO-COLLECTS
+//! the resilience advisors with NO `.with_advisors`.
 
-use std::any::TypeId;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
 use leaf_boot::{Application, RunOverlay, SealInputs};
-use leaf_core::{
-    AdvisorPairingRow, BoxFuture, ConcurrencyGate, ContractId, ErasedArgs, ErrorKind, Interceptor,
-    LeafError, MethodKey, OrderKey, OrderSource, Permit, Role, CONCURRENCY_ORDER, RETRY_ORDER,
-};
+use leaf_core::{BoxFuture, ConcurrencyGate, ContractId, ErasedArgs, ErrorKind, LeafError, MethodKey, Permit};
+// `#[retryable]` / `#[concurrency_limit]` are NOT imported: they are per-method MARKERS
+// the `#[advisable]` impl macro STRIPS + lowers (the impl-block macro owns the rows),
+// so — exactly like `#[bean]` inside `#[configuration] impl` — they need no import.
 use leaf_macros::{advisable, register_component};
-use leaf_resilience::{
-    concurrency_advisor_contract, make_concurrency_interceptor, result_classifier, NoBackoff,
-    ResiliencePointcut, ResilientRetry, RetryInterceptor, RetryPolicy, Sleeper,
-};
 use leaf_tokio::TokioExecutionFacility;
-
-// ─────────────────────── a tokio-backed reactive Sleeper ─────────────────────
-
-/// A [`Sleeper`] that parks on `tokio::time::sleep` — the reactive timer the retry
-/// backoff awaits on (NO busy-poll).
-struct TokioSleeper;
-impl Sleeper for TokioSleeper {
-    fn sleep(&self, delay: Duration) -> BoxFuture<'static, ()> {
-        Box::pin(tokio::time::sleep(delay))
-    }
-}
 
 // ───────────────────────── the concurrency-gate bean ────────────────────────
 
@@ -78,31 +66,44 @@ impl ConcurrencyGate for LimitGate {
 /// injected dependency), shared across the retried method's three attempts.
 struct FlakyService {
     attempts: AtomicU32,
+    /// The arg value seen on the LAST attempt — proof the args-bearing method was
+    /// re-proceeded WITH its args (a fresh clone re-supplied each attempt).
+    last_arg: AtomicU32,
 }
 register_component!(FlakyService);
 
 #[advisable]
 impl FlakyService {
     fn new() -> Self {
-        FlakyService { attempts: AtomicU32::new(0) }
+        FlakyService { attempts: AtomicU32::new(0), last_arg: AtomicU32::new(0) }
     }
 
     /// Fails on attempts 1 and 2 (a retryable `Cancelled`), succeeds on attempt 3.
-    /// Takes NO args so the auto-installed boot tail can re-run it per retry attempt
-    /// (the substrate's REPLAYABLE `Next`; an args-bearing method's re-run is the
-    /// documented v1 limitation).
-    fn flaky(&self) -> Result<i64, LeafError> {
+    /// The `#[retryable(max = 3)]` annotation auto-wires the retry advisor (binding the
+    /// `Result<i64,_>` retry classifier, keyed by the bean's `TypeId`). Takes an `i64`
+    /// ARG — the auto-installed boot tail re-supplies a FRESH clone of the args off
+    /// `Call.args` per retry attempt (the substrate's REPLAYABLE `Next` over the
+    /// cloneable advised-arg ABI), so the args-bearing method is genuinely re-proceeded
+    /// with its args every attempt.
+    #[retryable(max = 3)]
+    fn flaky(&self, base: i64) -> Result<i64, LeafError> {
+        self.last_arg.store(base as u32, Ordering::SeqCst);
         let n = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
         if n < 3 {
             Err(LeafError::new(ErrorKind::Cancelled))
         } else {
-            Ok(100 + n as i64)
+            Ok(base + n as i64)
         }
     }
 
     /// How many times `flaky` actually ran (the proof it was re-invoked).
     fn attempts(&self) -> u32 {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    /// The arg the last attempt saw (proof each replay carried the args).
+    fn last_arg(&self) -> u32 {
+        self.last_arg.load(Ordering::SeqCst)
     }
 }
 
@@ -125,8 +126,11 @@ impl GuardedService {
 
     /// Enter (bump live + record peak), HOLD across a real async suspension (a tokio
     /// sleep, so concurrently-driven invocations genuinely overlap inside the guarded
-    /// region), exit. The interceptor holds the gate permit across this whole body,
-    /// so `peak` can never exceed the gate's limit.
+    /// region), exit. The `#[concurrency_limit(2, gate = LimitGate)]` annotation
+    /// auto-wires the concurrency-limit advisor (resolving the `LimitGate` bean, keyed
+    /// by this bean's `TypeId`); the interceptor holds the gate permit across this whole
+    /// body, so `peak` can never exceed the gate's limit.
+    #[concurrency_limit(2, gate = LimitGate)]
     async fn guarded(&self, _ignore: i64) -> i64 {
         let cur = self.live.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(cur, Ordering::SeqCst);
@@ -140,51 +144,6 @@ impl GuardedService {
         self.peak.load(Ordering::SeqCst)
     }
 }
-
-// ───────────────────── the AUTO-WIRED resilience advisor rows ────────────────
-
-// The advisors match each service by its concrete TypeId (the const TypeId-of seam
-// mints the 'static slice exactly as a `#[retryable]`/`#[concurrency_limit]` macro
-// would emit the marker pointcut).
-static RETRY_TYPES: [TypeId; 1] = [const { TypeId::of::<FlakyService>() }];
-static RETRY_POINTCUT: ResiliencePointcut = ResiliencePointcut::new(&RETRY_TYPES, &[]);
-
-static LIMIT_TYPES: [TypeId; 1] = [const { TypeId::of::<GuardedService>() }];
-static LIMIT_POINTCUT: ResiliencePointcut = ResiliencePointcut::new(&LIMIT_TYPES, &[]);
-
-// THE retry auto-wire row: builds a RetryInterceptor (max_attempts = 3, NoBackoff)
-// with the i64-return classifier so the business `Result::Err` drives the retry,
-// and a tokio reactive sleeper. A non-capturing closure literal (const-promoted to
-// the bare fn-pointer exactly like the `#[aspect]` codegen emits).
-#[leaf_core::linkme::distributed_slice(leaf_core::ADVISOR_PAIRINGS)]
-#[linkme(crate = leaf_core::linkme)]
-static RETRY_ADVISOR_ROW: AdvisorPairingRow = AdvisorPairingRow {
-    contract: ContractId::of("leaf::resilience::RetryAdvisor"),
-    order: OrderKey { value: RETRY_ORDER, source: OrderSource::Interface },
-    role: Role::Infrastructure,
-    pointcut: &RETRY_POINTCUT,
-    make_interceptor: |_container| {
-        Box::pin(async move {
-            let retry = ResilientRetry::new(RetryPolicy::new(3), Arc::new(NoBackoff))
-                .with_sleeper(Arc::new(TokioSleeper));
-            let interceptor =
-                RetryInterceptor::new(retry).with_return_classifier(result_classifier::<i64>());
-            Ok(Arc::new(interceptor) as Arc<dyn Interceptor>)
-        }) as BoxFuture<'_, Result<Arc<dyn Interceptor>, leaf_core::ResolveError>>
-    },
-};
-
-// THE concurrency-limit auto-wire row: resolves the LimitGate bean through the
-// container and wraps it in a ConcurrencyLimitInterceptor.
-#[leaf_core::linkme::distributed_slice(leaf_core::ADVISOR_PAIRINGS)]
-#[linkme(crate = leaf_core::linkme)]
-static LIMIT_ADVISOR_ROW: AdvisorPairingRow = AdvisorPairingRow {
-    contract: ContractId::of("leaf::resilience::ConcurrencyLimitAdvisor"),
-    order: OrderKey { value: CONCURRENCY_ORDER, source: OrderSource::Interface },
-    role: Role::Infrastructure,
-    pointcut: &LIMIT_POINTCUT,
-    make_interceptor: |c| make_concurrency_interceptor::<LimitGate>()(c),
-};
 
 // ─────────────────────────────── the milestone ──────────────────────────────
 
@@ -205,15 +164,23 @@ async fn resilience_advisors_auto_advise_through_run() {
         .await
         .expect("the app auto-wires and runs to Ready");
 
-    // BOTH resilience advisor rows auto-collected (the headline two-advisor check).
+    // BOTH resilience advisor rows auto-collected from the natural annotations (the
+    // headline two-advisor check). Each is a per-method-unique row whose contract is
+    // the resilience family base @ the module-qualified `Bean::method`.
     let collected = leaf_core::collect_slice(&leaf_core::ADVISOR_PAIRINGS);
+    let retry_contract = ContractId::of(&format!(
+        "leaf::resilience::RetryAdvisor@{module}::FlakyService::flaky"
+    ));
+    let limit_contract = ContractId::of(&format!(
+        "leaf::resilience::ConcurrencyLimitAdvisor@{module}::GuardedService::guarded"
+    ));
     assert!(
-        collected.iter().any(|r| r.contract == ContractId::of("leaf::resilience::RetryAdvisor")),
-        "the retry Infrastructure advisor row auto-collected"
+        collected.iter().any(|r| r.contract == retry_contract),
+        "the retry Infrastructure advisor row auto-collected from #[retryable]"
     );
     assert!(
-        collected.iter().any(|r| r.contract == concurrency_advisor_contract()),
-        "the concurrency-limit Infrastructure advisor row auto-collected"
+        collected.iter().any(|r| r.contract == limit_contract),
+        "the concurrency-limit Infrastructure advisor row auto-collected from #[concurrency_limit]"
     );
 
     // ── RETRY: the flaky bean is AUTOMATICALLY advised + retried ──
@@ -225,16 +192,19 @@ async fn resilience_advisors_auto_advise_through_run() {
         .expect("FlakyService in registry");
     assert!(running.is_advised(flaky_id), "FlakyService is auto-advised by the retry advisor");
 
+    // Drive the ARGS-BEARING method through the retry chain: each of the three
+    // attempts re-supplies a fresh clone of the `(100,)` args off `Call.args`.
     let out = running
-        .invoke_advised(flaky_id, MethodKey::of("FlakyService::flaky"), ErasedArgs::none())
+        .invoke_advised(flaky_id, MethodKey::of("FlakyService::flaky"), ErasedArgs::pack((100_i64,)))
         .await
         .expect("the advised call routes through the auto-installed retry chain");
     let ret: Result<i64, LeafError> = out.unpack().expect("the Result<i64,_> return");
-    // The third attempt succeeds: 100 + attempt number 3 = 103.
+    // The third attempt succeeds: base 100 + attempt number 3 = 103.
     assert_eq!(ret.expect("Ok after retries"), 103, "the third attempt won (failed twice, then Ok)");
 
     let flaky = running.context().get::<FlakyService>().await.expect("FlakyService resolves");
     assert_eq!(flaky.attempts(), 3, "the method was RE-INVOKED twice (three attempts total)");
+    assert_eq!(flaky.last_arg(), 100, "every replayed attempt carried the args (a fresh clone)");
 
     // ── CONCURRENCY-LIMIT: the guarded bean is advised + capped ──
     let guarded_id = running

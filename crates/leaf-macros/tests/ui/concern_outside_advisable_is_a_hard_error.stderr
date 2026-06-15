@@ -1,0 +1,7 @@
+error: `#[transactional]` is a declarative concern annotation for a method INSIDE an `#[advisable] impl Bean { .. }` block: the impl-block macro lowers it to its advisor row (a method-position attribute alone cannot emit the sibling `ADVISOR_PAIRINGS` row). Put the `#[advisable]` attribute on the impl block.
+  --> tests/ui/concern_outside_advisable_is_a_hard_error.rs:10:1
+   |
+10 | #[transactional(manager = Mgr)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the attribute macro `transactional` (in Nightly builds, run with -Z macro-backtrace for more info)
