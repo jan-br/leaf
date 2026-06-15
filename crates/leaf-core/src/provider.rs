@@ -59,6 +59,14 @@ pub struct ResolveCtx<'a> {
     /// resolved with no store installed is a loud `ScopeMismatch`, never a silent
     /// singleton).
     scope_store: Option<&'a dyn ScopeStores>,
+    /// The container back-reference threaded so a `Provider::provide` can build a
+    /// DEFERRED resolution handle ([`Lookup`](crate::Lookup)/[`LazyRef`](crate::LazyRef))
+    /// that re-resolves on demand. A [`Weak`](std::sync::Weak)
+    /// [`Container`](crate::injection::Container) (no `Arc` cycle — the container owns
+    /// the handles transitively). `None` on a bare `root()`/`for_engine` cx (no
+    /// deferred-handle wiring installed), so building a deferral handle without it is
+    /// a loud error, never a silent dead handle.
+    container: Option<crate::injection::ContainerRef>,
     // A private marker binds the `'a` lifetime so the public signature is stable
     // before more borrowed fields are added. Zero-sized; costs nothing.
     _marker: std::marker::PhantomData<&'a ()>,
@@ -72,7 +80,12 @@ impl<'a> ResolveCtx<'a> {
     /// ([`for_engine`](ResolveCtx::for_engine)/[`with_scope_stores`](ResolveCtx::with_scope_stores)).
     #[must_use]
     pub fn root() -> Self {
-        ResolveCtx { engine: None, scope_store: None, _marker: std::marker::PhantomData }
+        ResolveCtx {
+            engine: None,
+            scope_store: None,
+            container: None,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// A resolution context carrying the engine back-reference, so a
@@ -80,7 +93,12 @@ impl<'a> ResolveCtx<'a> {
     /// depends-on-`C`) THROUGH the one engine.
     #[must_use]
     pub fn for_engine(engine: &'a crate::engine::Engine) -> Self {
-        ResolveCtx { engine: Some(engine), scope_store: None, _marker: std::marker::PhantomData }
+        ResolveCtx {
+            engine: Some(engine),
+            scope_store: None,
+            container: None,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Derive a context that also carries the ambient scope-store accessor (the
@@ -92,10 +110,79 @@ impl<'a> ResolveCtx<'a> {
         self
     }
 
+    /// Derive a context that also carries the container back-reference a
+    /// `Provider::provide` reads to build a DEFERRED resolution handle
+    /// ([`Lookup`](crate::Lookup)/[`LazyRef`](crate::LazyRef)), preserving the engine
+    /// and scope-store bindings. The [`Weak`](std::sync::Weak) is cheap to clone and
+    /// holds no strong count (no `Arc` cycle).
+    #[must_use]
+    pub fn with_container(mut self, container: crate::injection::ContainerRef) -> Self {
+        self.container = Some(container);
+        self
+    }
+
     /// The engine back-reference, if one is threaded (nested resolution driver).
     #[must_use]
     pub fn engine(&self) -> Option<&'a crate::engine::Engine> {
         self.engine
+    }
+
+    /// The by-type [`BeanKey`](crate::BeanKey) for `T` — the one place the
+    /// `TypeId::of::<T>()` → `BeanKey::ByType` mapping lives, shared by the
+    /// [`Injectable`](crate::Injectable) deferred-handle resolution and the generated
+    /// providers.
+    #[must_use]
+    pub fn key_for<T: 'static>(&self) -> crate::identity::BeanKey {
+        crate::identity::BeanKey::ByType(TypeId::of::<T>())
+    }
+
+    /// The container back-reference for building a DEFERRED resolution handle, or a
+    /// loud [`LeafError`] if none is threaded.
+    ///
+    /// This is the seam [`Injectable::inject`](crate::Injectable::inject) reads for
+    /// [`Lookup`](crate::Lookup)/[`LazyRef`](crate::LazyRef): a deferred handle holds
+    /// a [`Weak`](std::sync::Weak) [`Container`](crate::injection::Container) and
+    /// re-resolves on demand.
+    ///
+    /// # Errors
+    /// [`ErrorKind::ConstructionFailed`](crate::ErrorKind::ConstructionFailed) if the
+    /// cx carries no container back-reference (a deferral handle cannot be built
+    /// without one — surfaced loudly, never as a silent dead handle).
+    pub fn container_ref(&self) -> Result<crate::injection::ContainerRef, LeafError> {
+        self.container.clone().ok_or_else(|| {
+            LeafError::new(crate::error::ErrorKind::ConstructionFailed).caused_by(
+                crate::error::Cause::plain(
+                    "building a deferred injection handle",
+                    "the resolution context carries no container back-reference",
+                ),
+            )
+        })
+    }
+
+    /// Eagerly resolve `T` (Strict, Single) through the engine back-reference,
+    /// returning the shared [`Ref<T>`](crate::Ref).
+    ///
+    /// The ONE eager-resolution seam shared by [`Injectable::inject`](crate::Injectable::inject)
+    /// for [`Ref`](crate::Ref) and the generated providers, encapsulating the
+    /// `engine().get::<T>()` round-trip so the resolution seam lives in one place.
+    ///
+    /// # Errors
+    /// [`ErrorKind::ConstructionFailed`](crate::ErrorKind::ConstructionFailed) if no
+    /// engine back-reference is threaded; otherwise any
+    /// [`LeafError`](crate::LeafError) from the nested resolution (missing/ambiguous
+    /// target or a construction fault).
+    pub async fn resolve_ref<T: crate::handle::Bean>(
+        &self,
+    ) -> Result<crate::handle::Ref<T>, LeafError> {
+        let engine = self.engine.ok_or_else(|| {
+            LeafError::new(crate::error::ErrorKind::ConstructionFailed).caused_by(
+                crate::error::Cause::plain(
+                    "resolving an injected dependency",
+                    "the resolution context carries no engine back-reference",
+                ),
+            )
+        })?;
+        engine.get::<T>().await
     }
 
     /// The ambient [`InstanceStore`](crate::lifecycle_engine::InstanceStore) for
