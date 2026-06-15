@@ -65,10 +65,16 @@
 // section attributes.
 #![allow(unsafe_code)]
 
-use crate::definition::Descriptor;
+use crate::bind::ConfigBindThunk;
+use crate::conditions::CondExpr;
+use crate::definition::{Descriptor, Role};
 use crate::error::{FailureAnalyzer, LeafError, Origin};
+use crate::handle::ErasedBean;
 use crate::identity::{ContractId, MarkerId};
+use crate::injection::InjectionPlan;
 use crate::order::OrderKey;
+use crate::provider::ProviderSeed;
+use crate::proxy::{BeanJoinPointsSpec, MakeInterceptor, MethodTable, Pointcut};
 
 /// The pinned `linkme` re-export — emitted code references
 /// `::leaf_core::linkme`, never a bare `::linkme`.
@@ -267,6 +273,162 @@ pub struct ConfigMetadataRow {
     pub prefix: &'static str,
 }
 
+// ───────────────── the per-bean WIRING-PAIRING channel rows ──────────────────
+//
+// THE per-bean wiring metadata is 100% macro-emitted: beside each bean's
+// `Descriptor`, the `#[component]`/`#[advisable]`/`#[runner]`/`#[config_properties]`
+// /`#[conditional]` macros emit `pub` pairing consts (`__leaf_seed_`/`__leaf_guard_`
+// /`__leaf_joinpoints_`/`__leaf_methods_`/`__leaf_runner_upcast_`/`__leaf_config_bind_`
+// + the per-bean `InjectionPlan`), each JOINed back to its bean by `ContractId`.
+//
+// These rows are the const-compatible TWINS of leaf-boot's `*Pairing` structs (the
+// runtime contract leaf-boot's `from_slices`/route/proxy/validate passes consume):
+// each carries the bean's `ContractId` + the const fn-ptr / `&'static` ref / data,
+// so the macro can submit one row per declaration into the matching channel via the
+// SAME `#[distributed_slice(::leaf_core::<SLICE>)]` + `#[linkme(crate =
+// ::leaf_core::linkme)]` pattern as the `COMPONENTS` submission. The channel
+// auto-collects them at link time exactly like `COMPONENTS`/`AUTO_CONFIGS`, so a
+// normal annotated app wires itself with NO hand-assembled `.with_seeds`/… calls
+// (those `.with_*` builders STAY as explicit escape hatches that ADD to the
+// slice-collected set — charter §2.10 — but are not required). The rows live HERE
+// (not in leaf-boot) so the macro references one stable `::leaf_core::<SLICE>` path
+// and a contributing crate needs ONLY a `leaf-core` dependency.
+//
+// Every field is `Copy` (`ContractId`, a `fn` pointer, or a `&'static` ref / const
+// `InjectionPlan`) so the row is const-constructible into its slice and the one
+// `collect_slice` read idiom applies uniformly.
+
+/// The runner-upcast thunk a `#[runner]` bean emits (`__leaf_runner_upcast_<Ident>`):
+/// recovers a callable `Arc<dyn Runner>` from the resolved [`ErasedBean`]. Mirrors
+/// leaf-boot's `RunnerUpcast` (the `fn` type is identical regardless of where the
+/// alias lives), kept here so the [`RunnerPairingRow`] is a leaf-core type.
+pub type RunnerUpcastFn =
+    fn(ErasedBean) -> Option<std::sync::Arc<dyn crate::Runner>>;
+
+/// One macro-emitted bean → [`ProviderSeed`] pairing (the const twin of leaf-boot's
+/// `SeedPairing`), keyed by the bean's stable [`ContractId`]. Emitted by every
+/// `#[component]`/`#[bean]`/`#[service]`/… beside its `Descriptor` and auto-collected
+/// into [`SEED_PAIRINGS`]; leaf-boot's `from_slices` JOINs each `COMPONENTS` row to
+/// its construction recipe by `contract`.
+#[derive(Clone, Copy)]
+pub struct SeedPairingRow {
+    /// The stable cross-build identity of the bean this seed constructs.
+    pub contract: ContractId,
+    /// The const fn-pointer that BUILDS the bean's `Provider`
+    /// (the macro-emitted `__leaf_seed_<Ident>`).
+    pub seed: ProviderSeed,
+}
+
+/// One macro-emitted bean → [`InjectionPlan`] pairing (the per-bean construction-edge
+/// plan), keyed by [`ContractId`] and auto-collected into [`INJECTION_PLAN_PAIRINGS`].
+/// leaf-boot's wave planner consults it (defaulting to [`InjectionPlan::EMPTY`] — the
+/// no-collaborator POJO case) to order construction.
+#[derive(Clone, Copy)]
+pub struct InjectionPlanPairingRow {
+    /// The stable cross-build identity of the bean this plan constructs.
+    pub contract: ContractId,
+    /// The const per-bean injection plan (one `InjectionPoint` per dependency).
+    pub plan: InjectionPlan,
+}
+
+/// One macro-emitted gated-element → [`CondExpr`] guard pairing (the const twin of
+/// leaf-boot's `GuardPairing`), keyed by [`ContractId`] and auto-collected into
+/// [`GUARD_PAIRINGS`]. Emitted by `#[conditional]`/`#[profile]` beside the gated
+/// element's `Descriptor`; leaf-boot's condition routing JOINs each by `contract`.
+///
+/// NOTE the row carries the guard tree but NOT a `TypeId` (`TypeId::of` is fine in an
+/// inline `const {}` block, but the row stays minimal — the `ContractId` is the JOIN
+/// key and leaf-boot recovers the element `TypeId` from its frozen `Descriptor`).
+#[derive(Clone, Copy)]
+pub struct GuardPairingRow {
+    /// The gated element's stable cross-build identity (the JOIN + report key).
+    pub contract: ContractId,
+    /// The const guard tree (the macro-emitted `__leaf_guard_<Ident>`).
+    pub guard: &'static CondExpr,
+}
+
+/// One macro-emitted advisable-bean → [`BeanJoinPointsSpec`] pairing (the const twin
+/// of leaf-boot's `JoinPointPairing`), keyed by [`ContractId`] and auto-collected into
+/// [`JOINPOINT_PAIRINGS`]. Emitted by `#[advisable]`/`#[aspect]` beside the bean's
+/// `Descriptor`; the proxy-assembly pass reifies it into the runtime join points the
+/// `ProxyPlan` runs pointcuts over.
+#[derive(Clone, Copy)]
+pub struct JoinPointPairingRow {
+    /// The advisable bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: ContractId,
+    /// The macro-emitted const per-bean join-point spec (`__leaf_joinpoints_<Ident>`).
+    pub spec: &'static BeanJoinPointsSpec,
+}
+
+/// One macro-emitted advised-bean → [`MethodTable`] pairing (the const twin of
+/// leaf-boot's `MethodTablePairing`), keyed by [`ContractId`] and auto-collected into
+/// [`METHOD_TABLE_PAIRINGS`]. Emitted by `#[advisable]`/`#[aspect]` beside the bean's
+/// `Descriptor`; the auto-proxy install JOINs each by `contract` so an advised call
+/// terminates in the matching downcast-and-invoke thunk.
+#[derive(Clone, Copy)]
+pub struct MethodTablePairingRow {
+    /// The advised bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: ContractId,
+    /// The macro-emitted const per-bean method table (`__leaf_methods_<Ident>`).
+    pub table: &'static MethodTable,
+}
+
+/// One macro-emitted runner-bean → [`RunnerUpcastFn`] pairing (the const twin of
+/// leaf-boot's `RunnerPairing`), keyed by [`ContractId`] and auto-collected into
+/// [`RUNNER_PAIRINGS`]. Emitted by `#[runner]` beside the bean's `Descriptor`; the run
+/// pipeline auto-collects the live `dyn Runner` candidates, JOINs each by `contract`,
+/// and upcasts the resolved bean — so a `#[runner]` runs with NO explicit `with_runner`.
+#[derive(Clone, Copy)]
+pub struct RunnerPairingRow {
+    /// The runner bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: ContractId,
+    /// The macro-emitted upcast thunk (`__leaf_runner_upcast_<Ident>`).
+    pub upcast: RunnerUpcastFn,
+    /// The runner's stream order (lower-value-first; the `cmp_order` sort key).
+    pub order: OrderKey,
+}
+
+/// One macro-emitted config-bean → [`ConfigBindThunk`] pairing (the const twin of
+/// leaf-boot's `ConfigPairing`), keyed by [`ContractId`] and auto-collected into
+/// [`CONFIG_BIND_PAIRINGS`]. Emitted by `#[config_properties]` beside the bean's
+/// `Descriptor`; the C2 validate sub-pass JOINs each by `contract` and threads the
+/// thunk as the real bind recipe (pre-materializing the bean into its slot).
+#[derive(Clone, Copy)]
+pub struct ConfigBindPairingRow {
+    /// The config bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: ContractId,
+    /// The macro-emitted pure-projection bind+JSR thunk (`__leaf_config_bind_<Ident>`).
+    pub thunk: ConfigBindThunk,
+}
+
+/// One macro-emitted advisor → runtime-advice pairing (the const twin of leaf-boot's
+/// `AdvisorPairing`), keyed by [`ContractId`] and auto-collected into
+/// [`ADVISOR_PAIRINGS`]. Emitted by `#[aspect]` beside the aspect bean's `Descriptor`;
+/// the run pipeline auto-collects it, reifies each into a live `AdvisorDescriptor`, and
+/// installs the proxy at R4 — so an `#[aspect]` advises with NO hand-assembled
+/// `.with_advisors`.
+///
+/// Unlike the `ADVISORS` anti-DCE IDENTITY row (which carries only `contract`+`order`),
+/// THIS row also carries the `&'static dyn Pointcut` + the [`MakeInterceptor`] bean
+/// bridge — both const-constructible at macro time: the pointcut is a const
+/// combinator ([`Anything`](crate::Anything)/[`within`](crate::within)-style), and the
+/// `make_interceptor` is a const `fn` that resolves the aspect bean by `ContractId` and
+/// upcasts it to `Arc<dyn Interceptor>` (the aspect bean IS the interceptor).
+#[derive(Clone, Copy)]
+pub struct AdvisorPairingRow {
+    /// The advisor's stable cross-build identity (the JOIN + chain tie-break key).
+    pub contract: ContractId,
+    /// The chain order (lower = outermost; the `cmp_chain` sort key).
+    pub order: OrderKey,
+    /// Framework-vs-application provenance (the `RoleTier` source).
+    pub role: Role,
+    /// The const typed-combinator pointcut predicate.
+    pub pointcut: &'static dyn Pointcut,
+    /// The const bean bridge that resolves this advisor's interceptor at refresh
+    /// (the aspect bean, resolved by `ContractId` + upcast to `Arc<dyn Interceptor>`).
+    pub make_interceptor: MakeInterceptor,
+}
+
 // ───────────────────────── the distributed slices ───────────────────────────
 //
 // THE channel family. `COMPONENTS`/`AUTO_CONFIGS` reuse the const `Descriptor`
@@ -330,6 +492,52 @@ pub static RESOURCES: [ResourceRow] = [..];
 /// The `@ConfigurationProperties` metadata channel (config-metadata).
 #[linkme::distributed_slice]
 pub static CONFIG_METADATA: [ConfigMetadataRow] = [..];
+
+// ── the per-bean WIRING-PAIRING channels (the COMPONENTS auto-collect substrate,
+// extended to every per-bean wiring kind so a normal annotated app needs no
+// hand-assembled `.with_*` calls; discovery-codegen phase3/02) ──
+
+/// The bean → [`ProviderSeed`] pairing channel: a `#[component]`/`#[bean]`/… emits
+/// one [`SeedPairingRow`] (`__leaf_seed_<Ident>`) here beside its `COMPONENTS` row.
+#[linkme::distributed_slice]
+pub static SEED_PAIRINGS: [SeedPairingRow] = [..];
+
+/// The bean → [`InjectionPlan`] pairing channel: one [`InjectionPlanPairingRow`] per
+/// bean (the per-bean construction-edge plan), beside the `COMPONENTS` row.
+#[linkme::distributed_slice]
+pub static INJECTION_PLAN_PAIRINGS: [InjectionPlanPairingRow] = [..];
+
+/// The gated-element → [`CondExpr`] guard pairing channel: `#[conditional]`/`#[profile]`
+/// emits one [`GuardPairingRow`] (`__leaf_guard_<Ident>`) per gated element.
+#[linkme::distributed_slice]
+pub static GUARD_PAIRINGS: [GuardPairingRow] = [..];
+
+/// The advisable-bean → [`BeanJoinPointsSpec`] pairing channel: `#[advisable]`/`#[aspect]`
+/// emits one [`JoinPointPairingRow`] (`__leaf_joinpoints_<Ident>`) per advisable bean.
+#[linkme::distributed_slice]
+pub static JOINPOINT_PAIRINGS: [JoinPointPairingRow] = [..];
+
+/// The advised-bean → [`MethodTable`] pairing channel: `#[advisable]`/`#[aspect]` emits
+/// one [`MethodTablePairingRow`] (`__leaf_methods_<Ident>`) per advised bean.
+#[linkme::distributed_slice]
+pub static METHOD_TABLE_PAIRINGS: [MethodTablePairingRow] = [..];
+
+/// The runner-bean → [`RunnerUpcastFn`] pairing channel: `#[runner]` emits one
+/// [`RunnerPairingRow`] (`__leaf_runner_upcast_<Ident>`) per runner bean.
+#[linkme::distributed_slice]
+pub static RUNNER_PAIRINGS: [RunnerPairingRow] = [..];
+
+/// The config-bean → [`ConfigBindThunk`] pairing channel: `#[config_properties]` emits
+/// one [`ConfigBindPairingRow`] (`__leaf_config_bind_<Ident>`) per config bean.
+#[linkme::distributed_slice]
+pub static CONFIG_BIND_PAIRINGS: [ConfigBindPairingRow] = [..];
+
+/// The advisor → runtime-advice pairing channel: `#[aspect]` emits one
+/// [`AdvisorPairingRow`] (carrying the const pointcut + `make_interceptor`) per aspect
+/// bean, so the run pipeline auto-collects the live advisor with no hand-assembled
+/// `.with_advisors`. (The separate [`ADVISORS`] slice stays the anti-DCE identity row.)
+#[linkme::distributed_slice]
+pub static ADVISOR_PAIRINGS: [AdvisorPairingRow] = [..];
 
 /// The failure-analyzer channel (bootstrap-diagnostics phase3/14, ADR-12) — a
 /// `&'static dyn FailureAnalyzer` per analyzer, `cmp_order`-sorted,

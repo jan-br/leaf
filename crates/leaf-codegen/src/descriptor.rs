@@ -315,6 +315,13 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
     // its construction recipe; the rest of the helper items stay private-mangled.
     let seed_ident = format_ident!("__leaf_seed_{}", mangled);
     let desc_ident = format_ident!("__LEAF_DESCRIPTOR_{}", mangled);
+    // The per-bean pairing-channel submission rows: the `__leaf_seed_<Ident>`
+    // ProviderSeed and the per-bean `InjectionPlan` are auto-collected into the
+    // `SEED_PAIRINGS`/`INJECTION_PLAN_PAIRINGS` slices (the COMPONENTS auto-collect
+    // substrate, extended) so a normal annotated app needs no hand-assembled
+    // `.with_seeds`/`.with_injection_plans` calls.
+    let seed_row_ident = format_ident!("__LEAF_SEED_PAIRING_{}", mangled);
+    let plan_row_ident = format_ident!("__LEAF_PLAN_PAIRING_{}", mangled);
 
     let points = emit_injection_points(&input.deps);
     let provider_impl = emit_provider(
@@ -382,9 +389,27 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
                 crate_name: ::core::option::Option::Some(::core::env!("CARGO_PKG_NAME")),
             },
         };
-        // Bind the plan const so it is not dead-code-eliminated before the
-        // assembly pass can read it (the seed already references the provider).
-        const _: ::leaf_core::InjectionPlan = #plan_ident;
+        // ── the per-bean wiring-pairing submissions (auto-collect substrate) ──
+        // Submit the `__leaf_seed_<Ident>` ProviderSeed and the per-bean
+        // `InjectionPlan` into their `::leaf_core` distributed slices via the SAME
+        // re-export pattern as the COMPONENTS row above, so leaf-boot's
+        // `from_slices`/wave-planner auto-collect them by ContractId — no
+        // hand-assembled `.with_seeds`/`.with_injection_plans` required. Binding the
+        // plan const through the row also keeps it from being DCE'd before the
+        // assembly pass can read it.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
+            contract: #contract,
+            seed: #seed_ident,
+        };
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
+            ::leaf_core::InjectionPlanPairingRow {
+                contract: #contract,
+                plan: #plan_ident,
+            };
     })
 }
 
@@ -709,6 +734,30 @@ mod tests {
             "got: {s}"
         );
         assert!(s.contains("#[linkme(crate=::leaf_core::linkme)]"), "got: {s}");
+    }
+
+    #[test]
+    fn seed_and_injection_plan_are_submitted_into_their_pairing_slices() {
+        // Beside the COMPONENTS row, the macro auto-collects the bean's
+        // `__leaf_seed_<Ident>` ProviderSeed + per-bean InjectionPlan into the
+        // SEED_PAIRINGS / INJECTION_PLAN_PAIRINGS channels (the COMPONENTS
+        // auto-collect substrate, extended) — so a normal annotated app needs no
+        // hand-assembled `.with_seeds`/`.with_injection_plans`. Same re-export
+        // pattern as COMPONENTS (no direct linkme dep in the contributing crate).
+        let s = flat(&emit(&foo_with_bar()).expect("emits"));
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::SeedPairingRow{contract:"), "got: {s}");
+        assert!(s.contains("seed:__leaf_seed_Foo"), "got: {s}");
+        assert!(
+            s.contains(
+                "#[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]"
+            ),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::InjectionPlanPairingRow{contract:"), "got: {s}");
     }
 
     #[test]

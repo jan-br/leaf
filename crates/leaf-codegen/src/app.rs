@@ -209,11 +209,18 @@ pub fn emit_runner(item: &syn::ItemStruct) -> Result<TokenStream, EmitError> {
 pub fn emit_runner_upcast(ident: &str) -> TokenStream {
     let mangled = mangle(ident);
     let upcast_ident = format_ident!("__leaf_runner_upcast_{}", mangled);
+    let upcast_row_ident = format_ident!("__LEAF_RUNNER_PAIRING_{}", mangled);
     let ty: syn::Ident = syn::Ident::new(ident, proc_macro2::Span::call_site());
+    // The runner bean's module-qualified contract (the RUNNER_PAIRINGS JOIN key),
+    // built at the use site exactly like the bean's Descriptor contract.
+    let contract = quote! {
+        ::leaf_core::ContractId::of(
+            ::core::concat!(::core::module_path!(), "::", #ident)
+        )
+    };
     quote! {
         // The PUBLIC per-runner upcast thunk: downcast the erased bean to the concrete
-        // runner, re-wrap as Arc<dyn Runner>. `#[leaf::main]` pairs it with the runner's
-        // ContractId as a ::leaf_boot::RunnerPairing; the run pipeline applies it to the
+        // runner, re-wrap as Arc<dyn Runner>. The run pipeline applies it to the
         // resolved erased bean to auto-collect the runner from the live Context.
         #[allow(non_upper_case_globals, non_snake_case)]
         pub fn #upcast_ident(
@@ -221,6 +228,17 @@ pub fn emit_runner_upcast(ident: &str) -> TokenStream {
         ) -> ::core::option::Option<::std::sync::Arc<dyn ::leaf_core::Runner>> {
             __bean.downcast::<#ty>().ok().map(|__a| __a as ::std::sync::Arc<dyn ::leaf_core::Runner>)
         }
+        // Submit the upcast into RUNNER_PAIRINGS (the auto-collect substrate) keyed by
+        // ContractId, so the run pipeline auto-collects the runner with no
+        // hand-assembled `.with_runner_beans`. The order defaults to implicit
+        // (declaration order); same re-export pattern as COMPONENTS.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::RUNNER_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #upcast_row_ident: ::leaf_core::RunnerPairingRow = ::leaf_core::RunnerPairingRow {
+            contract: #contract,
+            upcast: #upcast_ident,
+            order: ::leaf_core::OrderKey::implicit(),
+        };
     }
 }
 
@@ -414,6 +432,21 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(s.contains("__leaf_runner_upcast_MigrateRunner"), "got: {s}");
+    }
+
+    #[test]
+    fn runner_upcast_is_submitted_into_the_runner_pairings_slice() {
+        // The upcast is ALSO auto-collected into RUNNER_PAIRINGS keyed by ContractId
+        // (the COMPONENTS auto-collect substrate, extended) so the run pipeline
+        // auto-collects the runner with no hand-assembled `.with_runner_beans`.
+        let s = flat(&emit_runner_upcast("MigrateRunner"));
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::RUNNER_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::RunnerPairingRow{contract:"), "got: {s}");
+        assert!(s.contains("upcast:__leaf_runner_upcast_MigrateRunner"), "got: {s}");
+        assert!(s.contains("order:::leaf_core::OrderKey::implicit()"), "got: {s}");
     }
 
     // ── #[failure_analyzer] ──────────────────────────────────────────────────

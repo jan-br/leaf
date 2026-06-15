@@ -138,10 +138,14 @@ pub use provider::{FactoryBean, Provider, ProviderSeed, ResolveCtx, ScopeStores}
 // `::leaf_core::linkme`, never a bare `::linkme`.
 
 pub use discovery::{
-    collect_slice, linkme, origin_of, AdvisorRow, CatalogRow, ConditionRow, ConfigMetadataRow,
-    EventListenerRow, Registrar, RegistrarCtx, ResourceRow, ScheduledRow, SourceTag, StereotypeRow,
-    ADVISORS, AUTO_CONFIGS, CATALOGS, COMPONENTS, CONDITIONS, CONFIG_METADATA, EVENT_LISTENERS,
-    FAILURE_ANALYZERS, REGISTRARS, RESOURCES, SCHEDULED, SOURCES, STEREOTYPES,
+    collect_slice, linkme, origin_of, AdvisorPairingRow, AdvisorRow, CatalogRow, ConditionRow,
+    ConfigBindPairingRow, ConfigMetadataRow, EventListenerRow, GuardPairingRow,
+    InjectionPlanPairingRow, JoinPointPairingRow, MethodTablePairingRow, Registrar, RegistrarCtx,
+    ResourceRow, RunnerPairingRow, RunnerUpcastFn, ScheduledRow, SeedPairingRow, SourceTag,
+    StereotypeRow, ADVISORS, ADVISOR_PAIRINGS, AUTO_CONFIGS, CATALOGS, COMPONENTS, CONDITIONS,
+    CONFIG_BIND_PAIRINGS, CONFIG_METADATA, EVENT_LISTENERS, FAILURE_ANALYZERS, GUARD_PAIRINGS,
+    INJECTION_PLAN_PAIRINGS, JOINPOINT_PAIRINGS, METHOD_TABLE_PAIRINGS, REGISTRARS, RESOURCES,
+    RUNNER_PAIRINGS, SCHEDULED, SEED_PAIRINGS, SOURCES, STEREOTYPES,
 };
 
 // ── UNIT 5 — the frozen registry, its builder, and the singleton store ──

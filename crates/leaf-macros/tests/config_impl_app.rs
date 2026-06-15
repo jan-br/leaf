@@ -152,6 +152,18 @@ impl AuditAspect {
     }
 }
 
+// An `#[aspect]` struct IS the interceptor: the macro's auto-collected ADVISOR_PAIRINGS
+// `make_interceptor` resolves the aspect bean + upcasts it to `Arc<dyn Interceptor>`.
+impl leaf_core::Interceptor for AuditAspect {
+    fn intercept<'a>(
+        &'a self,
+        call: &'a leaf_core::Call<'a>,
+        mut next: leaf_core::Next<'a>,
+    ) -> leaf_core::BoxFuture<'a, Result<leaf_core::ErasedRet, leaf_core::AdviceError>> {
+        Box::pin(async move { next.proceed(call).await })
+    }
+}
+
 // The per-method advice form: `#[aspect]` on the IMPL block iterates the
 // `#[advice]`/`#[pointcut]` methods and emits ONE AdvisorRow per method.
 #[aspect]

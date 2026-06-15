@@ -337,10 +337,16 @@ pub fn emit_config_properties(
     // pure-projection bind+JSR recipe (the same shape as the `__leaf_seed_<Ident>`
     // ProviderSeed pairing the assembly pass joins).
     let bind_thunk_ident = format_ident!("__leaf_config_bind_{}", mangled);
+    let bind_row_ident = format_ident!("__LEAF_CONFIG_BIND_PAIRING_{}", mangled);
 
     let prefix = &args.prefix;
     let ident_str = ident.to_string();
     let bind_thunk = emit_config_bind_thunk(ident, prefix, &bind_thunk_ident);
+
+    // The config bean's AUTO_CONFIGS registration (the Descriptor + seed + the
+    // SEED_PAIRINGS row), so the bean auto-registers from the slices alone — no
+    // hand-written `AutoConfigCandidate`/descriptor/seed/provider in the binary.
+    let bean_registration = emit_config_bean_registration(ident, &ident_str, &mangled);
 
     // The const ContractId, module-qualified at the use site (same as components).
     let contract = quote! {
@@ -394,7 +400,127 @@ pub fn emit_config_properties(
             contract: #contract,
             prefix: #prefix,
         };
+
+        // ── the bind-thunk pairing on CONFIG_BIND_PAIRINGS (auto-collect substrate) ──
+        // Submit the `__leaf_config_bind_<Ident>` thunk keyed by ContractId so the C2
+        // validate sub-pass finds it with no hand-assembled `.with_config_properties`.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::CONFIG_BIND_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #bind_row_ident: ::leaf_core::ConfigBindPairingRow =
+            ::leaf_core::ConfigBindPairingRow {
+                contract: #contract,
+                thunk: #bind_thunk_ident,
+            };
+
+        // ── the AUTO_CONFIGS Descriptor + seed so the config bean auto-registers ──
+        #bean_registration
     })
+}
+
+/// Emit the config bean's AUTO_CONFIGS REGISTRATION — the const `Descriptor` (at
+/// `CandidateRole::FALLBACK`, so a user `@Component` of the same type supersedes), the
+/// default-returning `Provider` + `ProviderSeed`, and the `SEED_PAIRINGS` row — so a
+/// `#[config_properties]` bean is a registered, resolvable bean from the slices ALONE
+/// (no hand-written `AutoConfigCandidate`/descriptor/seed in the binary).
+///
+/// The provider yields `<Ident as Default>::default()`: the REAL bound value is
+/// PRE-BOUND into the slot by the C2 `__leaf_config_bind_<Ident>` thunk at validate
+/// (before refresh R5), so this `provide` is the never-invoked fallback that only
+/// makes the row constructible (the seed JOIN is total).
+fn emit_config_bean_registration(
+    ident: &syn::Ident,
+    ident_str: &str,
+    mangled: &syn::Ident,
+) -> TokenStream {
+    let meta_ident = format_ident!("__LEAF_CONFIG_BEAN_META_{}", mangled);
+    let provider_ident = format_ident!("__LeafConfigProvider_{}", mangled);
+    let desc_ident = format_ident!("__LEAF_CONFIG_DESCRIPTOR_{}", mangled);
+    let seed_ident = format_ident!("__leaf_seed_{}", mangled);
+    let seed_row_ident = format_ident!("__LEAF_CONFIG_SEED_PAIRING_{}", mangled);
+    let declared_name = leaf_core::derive_default_name(ident_str).into_owned();
+    let contract = quote! {
+        ::leaf_core::ContractId::of(
+            ::core::concat!(::core::module_path!(), "::", #ident_str)
+        )
+    };
+    quote! {
+        // The config bean's flat AnnotationMetadata at CandidateRole::FALLBACK (the
+        // auto-config soft override — a user bean of the same type wins).
+        static #meta_ident: ::leaf_core::AnnotationMetadata = ::leaf_core::AnnotationMetadata {
+            qualifiers: &[],
+            markers: &[],
+            depends_on: &[],
+            candidate_role: ::leaf_core::CandidateRole::FALLBACK,
+            autowire_candidate: true,
+        };
+
+        // The default-returning Provider (the C2 thunk pre-binds the real value before
+        // R5, so this is the never-invoked fallback making the row constructible).
+        #[allow(non_camel_case_types)]
+        struct #provider_ident(::leaf_core::Descriptor);
+        impl ::leaf_core::Provider for #provider_ident {
+            fn descriptor(&self) -> &::leaf_core::Descriptor {
+                &self.0
+            }
+            fn provide<'a>(
+                &'a self,
+                _cx: &'a ::leaf_core::ResolveCtx<'a>,
+            ) -> ::leaf_core::BoxFuture<'a, ::core::result::Result<::leaf_core::Published, ::leaf_core::LeafError>>
+            {
+                ::std::boxed::Box::pin(async move {
+                    ::core::result::Result::Ok(::leaf_core::Published::shared_value(
+                        <#ident as ::core::default::Default>::default(),
+                    ))
+                })
+            }
+        }
+
+        #[allow(non_upper_case_globals)]
+        pub const #seed_ident: ::leaf_core::ProviderSeed = || {
+            ::std::sync::Arc::new(#provider_ident(::leaf_core::Descriptor {
+                contract: #contract,
+                self_type: const { ::core::any::TypeId::of::<#ident>() },
+                provides: &[],
+                declared_name: ::core::option::Option::Some(#declared_name),
+                aliases: &[],
+                scope: ::leaf_core::ScopeDef::SINGLETON,
+                role: ::leaf_core::Role::Application,
+                meta: &#meta_ident,
+                parent: ::core::option::Option::None,
+                origin: ::leaf_core::Origin::Native {
+                    crate_name: ::core::option::Option::Some(::core::env!("CARGO_PKG_NAME")),
+                },
+            }))
+        };
+
+        // The const Descriptor into the SEPARATE AUTO_CONFIGS slice (the config-properties
+        // default lane — never COMPONENTS, so component-scanning never picks it up).
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #desc_ident: ::leaf_core::Descriptor = ::leaf_core::Descriptor {
+            contract: #contract,
+            self_type: const { ::core::any::TypeId::of::<#ident>() },
+            provides: &[],
+            declared_name: ::core::option::Option::Some(#declared_name),
+            aliases: &[],
+            scope: ::leaf_core::ScopeDef::SINGLETON,
+            role: ::leaf_core::Role::Application,
+            meta: &#meta_ident,
+            parent: ::core::option::Option::None,
+            origin: ::leaf_core::Origin::Native {
+                crate_name: ::core::option::Option::Some(::core::env!("CARGO_PKG_NAME")),
+            },
+        };
+
+        // The seed pairing so from_slices JOINs the AUTO_CONFIGS row to its seed (the
+        // anti-DCE per-bean JOIN — an unconstructible bean must never silently vanish).
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
+            contract: #contract,
+            seed: #seed_ident,
+        };
+    }
 }
 
 /// Emit the PUBLIC C2 bind+JSR thunk for a `#[config_properties]` bean: a const
@@ -657,6 +783,37 @@ mod tests {
     }
 
     #[test]
+    fn config_properties_auto_registers_the_bean_into_auto_configs_with_a_seed() {
+        // The auto-collect closure: a #[config_properties] type ALSO emits its OWN
+        // AUTO_CONFIGS Descriptor (at CandidateRole::FALLBACK) + a default-returning
+        // ProviderSeed + the SEED_PAIRINGS row — so the bean registers + binds purely
+        // from the slices, with no hand-written AutoConfigCandidate/descriptor/seed.
+        let args = ConfigPropertiesArgs { prefix: "app".into() };
+        let ts = emit_config_properties(&derive("struct AppProps { name: String }"), &args)
+            .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The Descriptor rides the SEPARATE AUTO_CONFIGS slice (never COMPONENTS).
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::AUTO_CONFIGS)]"),
+            "got: {s}"
+        );
+        // …at CandidateRole::FALLBACK (a user @Component of the same type supersedes).
+        assert!(s.contains("candidate_role:::leaf_core::CandidateRole::FALLBACK"), "got: {s}");
+        // The PUBLIC __leaf_seed_<Ident> ProviderSeed (the assembly JOIN key).
+        assert!(s.contains("pubconst__leaf_seed_AppProps:::leaf_core::ProviderSeed"), "got: {s}");
+        // …yielding the JavaBean default (the C2 thunk pre-binds the real value at validate).
+        assert!(s.contains("<AppPropsas::core::default::Default>::default()"), "got: {s}");
+        // …JOINed by the SEED_PAIRINGS row (so from_slices wires it, no `.with_seeds`).
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::SeedPairingRow{contract:"), "got: {s}");
+        assert!(s.contains("seed:__leaf_seed_AppProps"), "got: {s}");
+    }
+
+    #[test]
     fn config_properties_also_emits_the_bind_target_and_a_config_group() {
         let args = ConfigPropertiesArgs { prefix: "app".into() };
         let s = flat(
@@ -701,6 +858,17 @@ mod tests {
         // opted into the engine-resolvability seam so Published::shared_value applies.
         assert!(s.contains("::leaf_core::Published::shared_value"), "got: {s}");
         assert!(s.contains("impl::leaf_core::BeanforAppProps{}"), "got: {s}");
+        // The thunk is ALSO auto-collected into CONFIG_BIND_PAIRINGS keyed by
+        // ContractId (the COMPONENTS auto-collect substrate, extended) so the C2
+        // validate sub-pass finds it with no hand-assembled `.with_config_properties`.
+        assert!(
+            s.contains(
+                "#[::leaf_core::linkme::distributed_slice(::leaf_core::CONFIG_BIND_PAIRINGS)]"
+            ),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::ConfigBindPairingRow{contract:"), "got: {s}");
+        assert!(s.contains("thunk:__leaf_config_bind_AppProps"), "got: {s}");
     }
 
     // ── #[value("...")] ────────────────────────────────────────────────────────

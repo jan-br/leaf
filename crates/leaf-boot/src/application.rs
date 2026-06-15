@@ -246,10 +246,16 @@ impl std::process::Termination for RunningApp {
 
 /// The opinionated bootstrap application (the `SpringApplication` analogue).
 ///
-/// The binary (`#[leaf::main]`) builds an `Application` over the macro-emitted
-/// JOIN tables (seeds, guards, auto-config candidates, advisors, listeners,
-/// scheduled tasks, the per-bean injection/lifecycle plans) then awaits
-/// [`run`](Application::run). The defaults make a minimal app work with no tables.
+/// A real annotated app needs NOTHING but `Application::new().run()`: [`run`](Application::run)
+/// AUTO-COLLECTS every per-bean wiring channel from its macro-emitted `linkme`
+/// distributed slice (seeds, guards, join-points, method-tables, runner-upcasts,
+/// config-binds, injection-plans, advisors — plus the `COMPONENTS`/`AUTO_CONFIGS`
+/// bean channels lifted by [`from_slices`](crate::from_slices)) and JOINs each by
+/// `ContractId` (the `collect_from_slices` fold at the head of `run`).
+///
+/// The `.with_*` builder methods STAY as explicit ESCAPE HATCHES (charter §2.10) that
+/// ADD TO / OVERRIDE the slice-collected set per `ContractId` — they are NOT required
+/// for a normal annotated app. The defaults make a minimal app work with no tables.
 pub struct Application {
     seeds: Vec<SeedPairing>,
     guards: Vec<GuardPairing>,
@@ -321,8 +327,9 @@ impl Application {
         self
     }
 
-    /// The macro→runtime bean seed JOIN table (the `COMPONENTS`/`AUTO_CONFIGS`
-    /// `Descriptor`→`ProviderSeed` pairings `#[leaf::main]` emits).
+    /// ESCAPE HATCH — ADD seed pairings to the slice-collected `SEED_PAIRINGS` set
+    /// (a seed for the SAME `ContractId` OVERRIDES the slice row). A normal annotated
+    /// app needs none of these: `#[component]`/`#[bean]`/… auto-collect their seeds.
     #[must_use]
     pub fn with_seeds(mut self, seeds: Vec<SeedPairing>) -> Self {
         self.seeds = seeds;
@@ -350,7 +357,11 @@ impl Application {
         self
     }
 
-    /// The advisor JOIN table (the R4 auto-proxy `after_init` install).
+    /// ESCAPE HATCH — ADD advisors to the slice-collected `ADVISOR_PAIRINGS` set (the
+    /// R4 auto-proxy `after_init` install; an advisor for the SAME `ContractId`
+    /// OVERRIDES the slice row). A normal app needs none: an `#[aspect]` auto-collects
+    /// its live advisor (pointcut + make_interceptor). Use this for an advisor whose
+    /// pointcut/interceptor is not const-emittable (a hand-built `&'static dyn Pointcut`).
     #[must_use]
     pub fn with_advisors(mut self, advisors: Vec<AdvisorPairing>) -> Self {
         self.advisors = advisors;
@@ -513,6 +524,116 @@ impl Application {
         self
     }
 
+    /// AUTO-COLLECT every per-bean wiring pairing from its `linkme` distributed slice
+    /// and FOLD it into the run tables (discovery-codegen phase3/02): the macro emits
+    /// one pairing row per bean beside its `Descriptor`, `linkme` auto-collects them at
+    /// link time exactly like `COMPONENTS`/`AUTO_CONFIGS`, and this folds each channel
+    /// in so a normal annotated app wires itself with NO hand-assembled `.with_*`.
+    ///
+    /// Every channel: seeds (`SEED_PAIRINGS`), guards (`GUARD_PAIRINGS`), join-points
+    /// (`JOINPOINT_PAIRINGS`), method-tables (`METHOD_TABLE_PAIRINGS`), runner-upcasts
+    /// (`RUNNER_PAIRINGS`), config-binds (`CONFIG_BIND_PAIRINGS`), advisors
+    /// (`ADVISOR_PAIRINGS`); the injection plans (`INJECTION_PLAN_PAIRINGS`) fold in
+    /// through [`Application::auto_injection_resolver`] keyed by `ContractId`.
+    /// (`COMPONENTS`/`AUTO_CONFIGS` themselves already auto-collect inside
+    /// [`from_slices`](crate::from_slices).)
+    ///
+    /// The explicit `.with_*` builder calls STAY as escape hatches (charter §2.10) that
+    /// ADD TO / OVERRIDE the slice-collected set: a slice row is the BASE, and an
+    /// explicit pairing for the SAME `ContractId` overrides it (so a binary can still
+    /// hand-tune a single bean's wiring). The fold is idempotent + order-independent.
+    fn collect_from_slices(&mut self) {
+        // seeds — explicit overrides slice on a ContractId collision.
+        self.seeds = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::SEED_PAIRINGS)
+                .into_iter()
+                .map(|r| SeedPairing::new(r.contract, r.seed)),
+            std::mem::take(&mut self.seeds),
+            |p| p.contract,
+        );
+
+        // condition guards (the gated-element CondExpr leaves). The slice row carries no
+        // `self_type` (the report's secondary key); leaf-boot recovers it from the
+        // frozen Descriptor, so `None` here is sound.
+        self.guards = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::GUARD_PAIRINGS)
+                .into_iter()
+                .map(|r| GuardPairing::new(r.contract, None, r.guard)),
+            std::mem::take(&mut self.guards),
+            |p| p.contract,
+        );
+
+        // per-bean join-points (the ProxyPlan pointcut input).
+        self.join_points = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::JOINPOINT_PAIRINGS)
+                .into_iter()
+                .map(|r| JoinPointPairing::new(r.contract, r.spec)),
+            std::mem::take(&mut self.join_points),
+            |p| p.contract,
+        );
+
+        // per-bean method tables (the transparent downcast-thunk index).
+        self.method_tables = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::METHOD_TABLE_PAIRINGS)
+                .into_iter()
+                .map(|r| MethodTablePairing::new(r.contract, r.table)),
+            std::mem::take(&mut self.method_tables),
+            |p| p.contract,
+        );
+
+        // #[runner] beans (the upcast thunks, ordered by the row's OrderKey).
+        self.runner_beans = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::RUNNER_PAIRINGS)
+                .into_iter()
+                .map(|r| RunnerPairing::with_order(r.contract, r.upcast, r.order)),
+            std::mem::take(&mut self.runner_beans),
+            |p| p.contract,
+        );
+
+        // @ConfigurationProperties bind thunks (the C2 Tier-2 pre-materialize recipe).
+        self.config_pairings = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::CONFIG_BIND_PAIRINGS)
+                .into_iter()
+                .map(|r| ConfigPairing::new(r.contract, r.thunk)),
+            std::mem::take(&mut self.config_pairings),
+            |p| p.contract,
+        );
+
+        // advisors (the #[aspect] live advice: pointcut + make_interceptor bean bridge).
+        self.advisors = merge_by_contract(
+            leaf_core::collect_slice(&leaf_core::ADVISOR_PAIRINGS).into_iter().map(|r| {
+                AdvisorPairing::new(r.contract, r.order, r.role, r.pointcut, r.make_interceptor)
+            }),
+            std::mem::take(&mut self.advisors),
+            |p| p.contract,
+        );
+    }
+
+    /// The slice-collected per-bean [`InjectionPlan`] resolver: JOIN each
+    /// [`INJECTION_PLAN_PAIRINGS`](leaf_core::INJECTION_PLAN_PAIRINGS) row to its frozen
+    /// [`BeanId`](leaf_core::BeanId) by `ContractId` (via the now-frozen registry),
+    /// COMPOSED UNDER the explicit `.with_injection_plans` resolver: the explicit
+    /// resolver runs first and a non-[`EMPTY`](InjectionPlan::EMPTY) plan WINS; otherwise
+    /// the slice-collected plan applies. So `#[component]`-emitted plans auto-collect
+    /// while an explicit override still takes precedence.
+    fn auto_injection_resolver(&self, registry: &leaf_core::Registry) -> InjectionResolver {
+        let mut by_id: std::collections::HashMap<leaf_core::BeanId, InjectionPlan> =
+            std::collections::HashMap::new();
+        for row in leaf_core::collect_slice(&leaf_core::INJECTION_PLAN_PAIRINGS) {
+            if let Some(id) = registry.by_contract(row.contract) {
+                by_id.insert(id, row.plan);
+            }
+        }
+        let explicit = Arc::clone(&self.inj_of);
+        Arc::new(move |id: leaf_core::BeanId| -> InjectionPlan {
+            let from_explicit = explicit(id);
+            if !from_explicit.points.is_empty() {
+                return from_explicit;
+            }
+            by_id.get(&id).copied().unwrap_or(InjectionPlan::EMPTY)
+        })
+    }
+
     /// Run the FULL pipeline: the typestate walk + the named run-event sequence +
     /// runners in the readiness-gate window + banner + failure analysis.
     ///
@@ -524,6 +645,9 @@ impl Application {
         args: SealInputs,
         overlay: RunOverlay,
     ) -> Result<RunningApp, RunFailure> {
+        // AUTO-COLLECT every per-bean wiring channel from its linkme slice + fold it
+        // into the run tables (the explicit `.with_*` escape hatches add/override).
+        self.collect_from_slices();
         // Move the non-Clone refresh tables out of `self` so `run_inner` can borrow
         // `&self` for the rest of the pipeline while still feeding the RunUnit.
         let movable = MovableTables {
@@ -589,8 +713,14 @@ impl Application {
             .iter()
             .filter_map(|p| p.to_config_bean(app.registry()))
             .collect();
-        let inj_of = Arc::clone(&self.inj_of);
-        let plan_lookup = move |id: leaf_core::BeanId| -> InjectionPlan { inj_of(id) };
+        // The injection-plan resolver: the slice-collected per-bean plans (JOINed to
+        // their frozen BeanIds by ContractId) UNDER the explicit `.with_injection_plans`
+        // override (the registry is now frozen, so the ContractId→BeanId JOIN resolves).
+        let inj_of = self.auto_injection_resolver(app.registry());
+        let plan_lookup = {
+            let inj_of = Arc::clone(&inj_of);
+            move |id: leaf_core::BeanId| -> InjectionPlan { inj_of(id) }
+        };
         let validation = ValidationInputs::new()
             .with_plans(&plan_lookup)
             .with_config_beans(&config_beans);
@@ -600,7 +730,7 @@ impl Application {
 
         // (11) Context::refresh() — R0..R8. Refreshed/Started fire DURING via the
         // now-live EventPublisher; the runner window opens after.
-        let unit = self.build_run_unit(app, movable)?;
+        let unit = self.build_run_unit(app, movable, inj_of)?;
         let unit = unit.refresh().await?;
         *phase = RunMilestone::Refreshed;
 
@@ -625,12 +755,20 @@ impl Application {
 
     /// Build the [`RunUnit`] from the frozen `App<Wired>` + the macro-emitted plans
     /// + the JOINed advisors/listeners/scheduled tables (the run-engine glue).
-    fn build_run_unit(&self, app: App<Wired>, movable: MovableTables) -> Result<RunUnit, LeafError> {
+    ///
+    /// `inj_of` is the resolver built in `run_inner` AFTER seal (the slice-collected
+    /// per-bean plans JOINed by `ContractId` under the explicit override), threaded
+    /// here so the run unit + the validate pass see the SAME plans.
+    fn build_run_unit(
+        &self,
+        app: App<Wired>,
+        movable: MovableTables,
+        inj_of: InjectionResolver,
+    ) -> Result<RunUnit, LeafError> {
         let proxy_plan = self.frozen_proxy_plan(app.registry())?;
         let (registry, env, settings) = app.into_run_parts();
 
         let plan_of = Arc::clone(&self.plan_of);
-        let inj_of = Arc::clone(&self.inj_of);
         let advisors: Vec<leaf_core::AdvisorDescriptor> =
             self.advisors.iter().map(advisor_descriptor).collect();
 
@@ -881,6 +1019,26 @@ fn runner_upcast_failed(contract: leaf_core::ContractId) -> LeafError {
              than the resolved bean)"
         ),
     ))
+}
+
+/// Fold the slice-collected `base` pairings UNDER the explicit `over` pairings, keyed
+/// by `ContractId` (the `key` projection): the `base` (slice) rows are the foundation,
+/// and an explicit `over` row for the SAME `ContractId` OVERRIDES its `base` row (the
+/// `.with_*` escape-hatch semantics — charter §2.10). The result is ordering-stable
+/// (base rows first in their slice order, then any explicit-only rows) and total.
+fn merge_by_contract<T, K>(
+    base: impl IntoIterator<Item = T>,
+    over: Vec<T>,
+    key: K,
+) -> Vec<T>
+where
+    K: Fn(&T) -> leaf_core::ContractId,
+{
+    let overridden: std::collections::HashSet<leaf_core::ContractId> =
+        over.iter().map(&key).collect();
+    let mut merged: Vec<T> = base.into_iter().filter(|b| !overridden.contains(&key(b))).collect();
+    merged.extend(over);
+    merged
 }
 
 /// Highest-magnitude-wins exit-code aggregation (max-of-positives or

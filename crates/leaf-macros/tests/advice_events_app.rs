@@ -122,6 +122,18 @@ impl AuditAspect {
     }
 }
 
+// An `#[aspect]` struct IS the interceptor (the auto-collected ADVISOR_PAIRINGS
+// `make_interceptor` resolves it + upcasts to `Arc<dyn Interceptor>`).
+impl leaf_core::Interceptor for AuditAspect {
+    fn intercept<'a>(
+        &'a self,
+        call: &'a leaf_core::Call<'a>,
+        mut next: leaf_core::Next<'a>,
+    ) -> leaf_core::BoxFuture<'a, Result<leaf_core::ErasedRet, leaf_core::AdviceError>> {
+        Box::pin(async move { next.proceed(call).await })
+    }
+}
+
 #[test]
 fn aspect_reaches_the_advisors_slice_and_components_slice() {
     // The aspect emitted an AdvisorRow into ADVISORS (the advice side)...

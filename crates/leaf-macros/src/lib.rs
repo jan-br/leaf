@@ -569,7 +569,14 @@ pub fn aspect(attr: TokenStream, item: TokenStream) -> TokenStream {
             // per-bean join-point spec pairing const too (bean_type + markers), so the
             // proxy plan can match pointcuts to the aspect bean.
             let join_points = emit_struct_join_points(&parsed);
-            quote! { #parsed #component #advisor_rows #join_points }.into()
+            // The LIVE advisor pairing (ADVISOR_PAIRINGS): the const pointcut + the
+            // make_interceptor that resolves THIS aspect bean as the interceptor, so the
+            // run pipeline auto-collects the advisor with no `.with_advisors`.
+            let self_ty: syn::Type =
+                syn::parse_str(&parsed.ident.to_string()).expect("a bean ident is a valid type");
+            let advisor_pairing =
+                advisor::emit_advisor_pairing(&parsed.ident.to_string(), &self_ty, &args);
+            quote! { #parsed #component #advisor_rows #join_points #advisor_pairing }.into()
         }
         Err(err) => {
             let error = compile_error(&err);

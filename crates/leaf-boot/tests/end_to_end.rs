@@ -18,19 +18,17 @@
 //!    `Ready`+`AcceptingTraffic`);
 //! 4. `shutdown()` DRAINED cleanly (the container `TeardownLedger` LIFO).
 
-#![allow(non_upper_case_globals)]
-
 use std::any::TypeId;
 use std::sync::{Arc, Mutex};
 
 use leaf_boot::{
-    AdvisorPairing, Application, InstalledProxies, RunOverlay, SealInputs, SeedPairing,
+    AdvisorPairing, Application, InstalledProxies, RunOverlay, SealInputs,
 };
 use leaf_core::{
     AdviceError, AnnotationMetadata, Anything, Bean, BeanKey, BoxFuture, Call, Container,
-    ContractId, CreatorPolicy, Descriptor, ErasedArgs, ErasedRet, FixedTarget, InjectionPlan,
-    Interceptor, LeafError, MethodJoinPoint, MethodKey, Next, OrderKey, Origin, Provider,
-    ProviderSeed, ProxyPlan, Published, Ref, ResolveCtx, Role, RunState, Runner, ScopeDef, Tail,
+    ContractId, CreatorPolicy, Descriptor, ErasedArgs, ErasedRet, FixedTarget, Interceptor,
+    LeafError, MethodJoinPoint, MethodKey, Next, OrderKey, Origin, Provider, ProviderSeed,
+    ProxyPlan, Published, Ref, ResolveCtx, Role, RunState, Runner, ScopeDef, Tail,
 };
 use leaf_macros::{component, config_properties, register_component};
 
@@ -74,79 +72,19 @@ impl OrderService {
 }
 
 /// A leaf `@ConfigurationProperties` type — derives `BindTarget` so the binder can
-/// project `app.*` onto it; bound + registered as a resolvable bean.
+/// project `app.*` onto it; AUTO-REGISTERED + bound + resolvable.
 ///
 /// `#[config_properties]` emits — beside the BindTarget — the PUBLIC C2 bind thunk
-/// (`__leaf_config_bind_AppProps`) AND the `impl ::leaf_core::Bean for AppProps {}`
-/// engine-resolvability marker, so the bean binds + pre-materializes through the REAL
-/// macro-emitted thunk (the C2 Tier-2 path) — never a hand-mirrored provider.
+/// (`__leaf_config_bind_AppProps`, auto-collected into `CONFIG_BIND_PAIRINGS`), the
+/// `impl ::leaf_core::Bean for AppProps {}` engine-resolvability marker, AND the bean's
+/// own AUTO_CONFIGS `Descriptor` + seed (auto-collected into `AUTO_CONFIGS`/`SEED_PAIRINGS`
+/// at `CandidateRole::FALLBACK`) — so the bean registers + binds + pre-materializes
+/// purely from the slices, with NO hand-written provider/descriptor/seed.
 #[config_properties(prefix = "app")]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AppProps {
     title: String,
     workers: u16,
-}
-
-// ───────────────────────── the config-properties bean ───────────────────────
-
-/// A FALLBACK provider for the `AppProps` slot that yields the JavaBean default.
-///
-/// The C2 Tier-2 validate pass PRE-BINDS the REAL bound value (via the macro-emitted
-/// `__leaf_config_bind_AppProps` thunk) into the slot `OnceCell` BEFORE refresh R5, so
-/// R5 publishes the already-bound Arc and this `provide` is never called — it exists
-/// only so the bean is a registered, constructible row (the seed JOIN is total).
-struct AppPropsProvider {
-    descriptor: Descriptor,
-}
-
-impl Provider for AppPropsProvider {
-    fn descriptor(&self) -> &Descriptor {
-        &self.descriptor
-    }
-
-    fn provide<'a>(&'a self, _cx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Published, LeafError>> {
-        Box::pin(async move { Ok(Published::shared_value(AppProps::default())) })
-    }
-}
-
-/// The AppProps bean descriptor (a config-properties bean is registered via the
-/// auto-config ladder — `#[config_properties]` emits the BindTarget + metadata + the
-/// C2 bind thunk, not a COMPONENTS row, so the bean itself is registered as an
-/// auto-config default and pre-materialized at validate via its macro-emitted thunk).
-fn app_props_descriptor() -> Descriptor {
-    Descriptor {
-        contract: ContractId::of(concat!(module_path!(), "::AppProps")),
-        self_type: TypeId::of::<AppProps>(),
-        provides: &[],
-        declared_name: Some("appProps"),
-        aliases: &[],
-        scope: ScopeDef::SINGLETON,
-        role: Role::Application,
-        meta: &AnnotationMetadata::EMPTY,
-        parent: None,
-        origin: Origin::Native { crate_name: Some("leaf-boot::e2e") },
-    }
-}
-
-/// The AppProps fallback seed (mints the default-returning provider; the real value
-/// is pre-bound by the C2 thunk before R5, so this is never invoked at runtime).
-const fn app_props_seed() -> ProviderSeed {
-    || {
-        Arc::new(AppPropsProvider {
-            descriptor: Descriptor {
-                contract: ContractId::of(concat!(module_path!(), "::AppProps")),
-                self_type: TypeId::of::<AppProps>(),
-                provides: &[],
-                declared_name: Some("appProps"),
-                aliases: &[],
-                scope: ScopeDef::SINGLETON,
-                role: Role::Application,
-                meta: &AnnotationMetadata::EMPTY,
-                parent: None,
-                origin: Origin::Native { crate_name: Some("leaf-boot::e2e") },
-            },
-        })
-    }
 }
 
 // ─────────────────────────────── the runner ─────────────────────────────────
@@ -208,66 +146,19 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
     leaf_tokio::install_ambient_store().ok();
 
     let module = module_path!();
-    let repo_contract = ContractId::of(&format!("{module}::Repository"));
     let service_contract = ContractId::of(&format!("{module}::OrderService"));
-    let props_contract = ContractId::of(&format!("{module}::AppProps"));
-
-    // ── the macro→runtime JOIN tables `#[leaf::main]` would emit ──
-    // The seed JOIN: the macro-emitted `__leaf_seed_<Ident>` consts (pub) for the
-    // two #[component]s. AppProps is registered via the auto-config ladder below.
-    let seeds = vec![
-        SeedPairing::new(repo_contract, __leaf_seed_Repository),
-        SeedPairing::new(service_contract, __leaf_seed_OrderService),
-    ];
-
-    // The auto-config candidate for the config-properties bean (registered at
-    // Fallback by the run_autoconfig ladder — the config-properties default lane).
-    let autoconfig = vec![leaf_boot::AutoConfigCandidate::new(
-        app_props_descriptor(),
-        app_props_seed(),
-        None,
-    )];
-
-    // The C2 config-bean JOIN: the REAL macro-emitted bind thunk
-    // (`__leaf_config_bind_AppProps`), keyed by ContractId. App<Wired>::validate JOINs
-    // it to AppProps' frozen BeanId and PRE-MATERIALIZES the bound value into the slot
-    // BEFORE refresh — not a hand-mirrored provider that re-binds at R5.
-    let config_properties = vec![leaf_boot::ConfigPairing::new(
-        props_contract,
-        __leaf_config_bind_AppProps,
-    )];
-
-    // The per-bean injection-plan table (the macro-emitted `__LEAF_PLAN_<Ident>`
-    // consts), keyed by BeanId via the frozen registry's by_contract lookup. The
-    // run lifts the SAME seeds (plus the framework executor) so by_contract over
-    // the stable ContractId yields the matching BeanId.
-    let probe_registry = leaf_boot::App::<leaf_boot::Define>::from_slices(&seeds)
-        .expect("lift")
-        .into_builder()
-        .freeze()
-        .expect("freeze probe");
-    let repo_id = probe_registry.by_contract(repo_contract);
-    let service_id = probe_registry.by_contract(service_contract);
-    let inj = move |id: leaf_core::BeanId| -> InjectionPlan {
-        if Some(id) == service_id {
-            __LEAF_PLAN_OrderService
-        } else if Some(id) == repo_id {
-            __LEAF_PLAN_Repository
-        } else {
-            InjectionPlan::EMPTY
-        }
-    };
 
     // ── the execution facility (the force-linked tokio runtime) ──
     let spawner: Arc<dyn leaf_core::Spawner> = Arc::new(leaf_tokio::TokioExecutionFacility::new());
 
-    // ── drive the FULL run pipeline ──
+    // ── drive the FULL run pipeline — every per-bean wiring channel AUTO-COLLECTS
+    // from the macro-emitted linkme slices (seeds, injection plans, the AppProps
+    // AUTO_CONFIGS Descriptor + seed, its C2 bind thunk). The only explicit input is
+    // the embedder's spawner (a runtime handle, not a pairing table) + the explicit
+    // `.with_runner` handle (the programmatic Runner escape hatch this test exercises
+    // alongside the auto-collected wiring). ──
     let running = Application::new()
         .with_name("orders-app")
-        .with_seeds(seeds)
-        .with_autoconfig(autoconfig)
-        .with_config_properties(config_properties)
-        .with_injection_plans(inj)
         .with_spawner(spawner)
         .with_runner(Arc::new(StartupRunner))
         .run(
@@ -451,36 +342,14 @@ async fn the_run_pipeline_fires_the_started_lifecycle_fact_to_a_bound_listener()
         adapter: started_adapter,
     };
 
-    let _ = watcher_seed; // (the seed const is used via the candidate below)
-    // ALL #[component]s in the test crate are link-collected into COMPONENTS, so the
-    // seed JOIN table must cover the OTHER test's components too (the anti-DCE JOIN:
-    // a COMPONENTS row with no matching SeedPairing is a loud AntiDce error).
-    let repo_contract = ContractId::of(&format!("{module}::Repository"));
-    let service_contract = ContractId::of(&format!("{module}::OrderService"));
-    let seeds = vec![
-        SeedPairing::new(repo_contract, __leaf_seed_Repository),
-        SeedPairing::new(service_contract, __leaf_seed_OrderService),
-    ];
-    // The OrderService injection plan (its Repository dep) must be supplied so the
-    // wave plan + the eager construction resolve the edge.
-    let probe = leaf_boot::App::<leaf_boot::Define>::from_slices(&seeds)
-        .unwrap()
-        .into_builder()
-        .freeze()
-        .unwrap();
-    let svc_id = probe.by_contract(service_contract);
-    let inj = move |id: leaf_core::BeanId| -> InjectionPlan {
-        if Some(id) == svc_id {
-            __LEAF_PLAN_OrderService
-        } else {
-            InjectionPlan::EMPTY
-        }
-    };
-
+    // The other test's `#[component]`s (OrderService/Repository) + the AppProps
+    // config bean AUTO-COLLECT their seeds + injection plans from the macro-emitted
+    // slices — no hand seed/plan table here. The Watcher host is registered via the
+    // `.with_autoconfig` ESCAPE HATCH (an autoconfig candidate with no slice row),
+    // proving the escape hatch still ADDS to the slice-collected set; the listener
+    // rides the `.with_listeners` escape hatch.
     let running = Application::new()
         .with_name("watcher-app")
-        .with_seeds(seeds)
-        .with_injection_plans(inj)
         .with_autoconfig(vec![leaf_boot::AutoConfigCandidate::new(
             watcher_desc,
             watcher_seed(),

@@ -683,7 +683,15 @@ fn render_profile_grouped(expr: &ProfileExpr) -> String {
 pub fn emit_guard(ident: &str, expr: &CondExpr) -> TokenStream {
     let mangled = mangle(ident);
     let guard_ident = format_ident!("__leaf_guard_{}", mangled);
+    let guard_row_ident = format_ident!("__LEAF_GUARD_PAIRING_{}", mangled);
     let tree = expr.lower();
+    // The gated element's module-qualified contract (the GUARD_PAIRINGS JOIN key),
+    // built at the use site exactly like a bean's contract.
+    let contract = quote! {
+        ::leaf_core::ContractId::of(
+            ::core::concat!(::core::module_path!(), "::", #ident)
+        )
+    };
 
     // One CONDITIONS anti-DCE anchor per distinct referenced kind, named off both
     // the gated element and the kind so two kinds (or two elements) never collide.
@@ -707,6 +715,15 @@ pub fn emit_guard(ident: &str, expr: &CondExpr) -> TokenStream {
     quote! {
         #[allow(non_upper_case_globals)]
         pub const #guard_ident: ::leaf_core::CondExpr = #tree;
+        // Submit the guard into GUARD_PAIRINGS (the auto-collect substrate) keyed by
+        // the gated element's ContractId — so leaf-boot's condition routing finds it
+        // with no hand-assembled `.with_guards`. Same re-export pattern as COMPONENTS.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #guard_row_ident: ::leaf_core::GuardPairingRow = ::leaf_core::GuardPairingRow {
+            contract: #contract,
+            guard: &#guard_ident,
+        };
         #(#anchors)*
     }
 }
@@ -995,6 +1012,15 @@ mod tests {
             "got: {s}"
         );
         assert!(s.contains("::leaf_core::ConditionRow"), "got: {s}");
+        // The guard is ALSO auto-collected into GUARD_PAIRINGS keyed by the gated
+        // element's ContractId (the COMPONENTS auto-collect substrate, extended) so
+        // leaf-boot's condition routing finds it with no hand-assembled `.with_guards`.
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::GuardPairingRow{contract:"), "got: {s}");
+        assert!(s.contains("guard:&__leaf_guard_MyBean"), "got: {s}");
     }
 
     #[test]

@@ -84,9 +84,13 @@ fn contract_here(ident: &str) -> ContractId {
 /// Lift the test crate's `#[advisable]`/`#[runner]` `#[component]` rows into a frozen
 /// registry through the genuine `from_slices` JOIN (the SeedPairing pattern).
 fn frozen_registry() -> leaf_core::Registry {
+    // The #[config_properties] SvcProps now auto-registers an AUTO_CONFIGS Descriptor
+    // + seed too (`__leaf_seed_SvcProps`), so the bare from_slices JOIN must cover it
+    // (a lifted row with no matching SeedPairing is a loud AntiDce error).
     let seeds = vec![
         SeedPairing::new(contract_here("OrderService"), __leaf_seed_OrderService),
         SeedPairing::new(contract_here("MigrateRunner"), __leaf_seed_MigrateRunner),
+        SeedPairing::new(contract_here("SvcProps"), __leaf_seed_SvcProps),
     ];
     App::<Define>::from_slices(&seeds)
         .expect("from_slices lifts the COMPONENTS rows")

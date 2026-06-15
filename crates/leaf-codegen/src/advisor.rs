@@ -246,6 +246,92 @@ pub fn emit_advisor(
     })
 }
 
+/// Emit the PUBLIC advisor → runtime-advice pairing for an `#[aspect]` STRUCT bean:
+/// one const `::leaf_core::AdvisorPairingRow` submitted into the auto-collect
+/// `ADVISOR_PAIRINGS` slice, so the run pipeline auto-collects the LIVE advisor (the
+/// pointcut + the `make_interceptor` bean bridge) with NO hand-assembled
+/// `.with_advisors`.
+///
+/// Unlike [`emit_advisor`] (which emits only the anti-DCE `ADVISORS` IDENTITY row +
+/// the chain-order const), this row carries the two pieces leaf-boot's hand-written
+/// `AdvisorPairing` used to supply — both const-constructible for an aspect bean:
+///
+/// - **the pointcut** — `::leaf_core::Anything` (the aspect advises every matched join
+///   point; a finer pointcut is the `#[advice]`-method form's future concern), a unit
+///   struct usable as a `&'static dyn Pointcut`;
+/// - **the `make_interceptor`** — a const `fn(&dyn Container) -> BoxFuture<Arc<dyn
+///   Interceptor>>` that RESOLVES the aspect bean by its `ContractId` and downcasts it
+///   to `Arc<dyn Interceptor>` (the aspect bean IS the interceptor). The user writes
+///   `impl Interceptor for <Aspect>`; this wires its discovery + resolution.
+///
+/// The `order`/`role` mirror the `ADVISORS` identity row (`order = args.order` else
+/// the around floor; `role = Application` — a user aspect).
+#[must_use]
+pub fn emit_advisor_pairing(ident: &str, self_ty: &syn::Type, args: &AdvisorArgs) -> TokenStream {
+    let mangled = mangle(ident);
+    let pairing_row_ident = format_ident!("__LEAF_ADVISOR_PAIRING_{}", mangled);
+    let order = match args.order {
+        Some(n) => quote! {
+            ::leaf_core::OrderKey {
+                value: #n,
+                source: ::leaf_core::OrderSource::Annotation,
+            }
+        },
+        None => AdviceKind::Around.order_tokens(),
+    };
+    // The aspect's module-qualified contract (the ADVISOR_PAIRINGS JOIN key + the
+    // ContractId the make_interceptor resolves the aspect bean by), built at the use
+    // site exactly like the bean's Descriptor contract.
+    let contract = quote! {
+        ::leaf_core::ContractId::of(
+            ::core::concat!(::core::module_path!(), "::", #ident)
+        )
+    };
+    quote! {
+        // Submit the LIVE advisor pairing into ADVISOR_PAIRINGS (the auto-collect
+        // substrate) keyed by ContractId, so the run pipeline reifies it into an
+        // AdvisorDescriptor with no hand-assembled `.with_advisors`. Same re-export
+        // pattern as COMPONENTS.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #pairing_row_ident: ::leaf_core::AdvisorPairingRow =
+            ::leaf_core::AdvisorPairingRow {
+                contract: #contract,
+                order: #order,
+                role: ::leaf_core::Role::Application,
+                // The aspect advises every matched join point (the const pointcut).
+                pointcut: &::leaf_core::Anything,
+                // The bean bridge: resolve the aspect bean by ContractId + upcast it to
+                // Arc<dyn Interceptor> (the aspect bean IS the interceptor). The
+                // resolved Published carries the engine-resolvable Arc<#self_ty>; we
+                // downcast it and re-wrap as the trait object.
+                make_interceptor: |__c: &dyn ::leaf_core::Container| {
+                    ::std::boxed::Box::pin(async move {
+                        let __published = __c
+                            .resolve(
+                                ::leaf_core::BeanKey::ByContract(#contract),
+                                ::leaf_core::Strictness::Strict,
+                                ::leaf_core::Cardinality::Single,
+                            )
+                            .await?;
+                        let __mismatch = || ::leaf_core::LeafError::new(
+                            ::leaf_core::ErrorKind::ConstructionFailed,
+                        );
+                        let __erased = __published.into_shared().ok_or_else(__mismatch)?;
+                        match __erased.downcast::<#self_ty>() {
+                            ::core::result::Result::Ok(__aspect) => ::core::result::Result::Ok(
+                                __aspect as ::std::sync::Arc<dyn ::leaf_core::Interceptor>,
+                            ),
+                            ::core::result::Result::Err(_) => {
+                                ::core::result::Result::Err(__mismatch())
+                            }
+                        }
+                    })
+                },
+            };
+    }
+}
+
 /// One advisable method's join-point spec the macro emits (the const input
 /// [`emit_join_points`] lowers to a `::leaf_core::MethodJoinPointSpec`).
 ///
@@ -300,8 +386,16 @@ impl MethodSpec {
 pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]) -> TokenStream {
     let mangled = mangle(ident);
     let spec_ident = format_ident!("__leaf_joinpoints_{}", mangled);
+    let spec_row_ident = format_ident!("__LEAF_JOINPOINT_PAIRING_{}", mangled);
     let meta_ident = format_ident!("__LEAF_META_{}", mangled);
     let bean_type = quote! { const { ::core::any::TypeId::of::<#self_ty>() } };
+    // The advisable bean's module-qualified contract (the JOINPOINT_PAIRINGS JOIN
+    // key), built at the use site exactly like the bean's Descriptor contract.
+    let contract = quote! {
+        ::leaf_core::ContractId::of(
+            ::core::concat!(::core::module_path!(), "::", #ident)
+        )
+    };
 
     let method_rows = methods.iter().map(|m| {
         let path = &m.method_path;
@@ -328,6 +422,16 @@ pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]
             markers: &#meta_ident,
             methods: &[ #(#method_rows),* ],
         };
+        // Submit the spec into JOINPOINT_PAIRINGS (the auto-collect substrate) keyed
+        // by ContractId, so the proxy-assembly pass finds it with no hand-assembled
+        // `.with_join_points`. Same re-export pattern as COMPONENTS.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::JOINPOINT_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #spec_row_ident: ::leaf_core::JoinPointPairingRow =
+            ::leaf_core::JoinPointPairingRow {
+                contract: #contract,
+                spec: &#spec_ident,
+            };
     }
 }
 
@@ -364,6 +468,14 @@ pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]
 pub fn emit_method_table(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]) -> TokenStream {
     let mangled = mangle(ident);
     let table_ident = format_ident!("__leaf_methods_{}", mangled);
+    let table_row_ident = format_ident!("__LEAF_METHOD_TABLE_PAIRING_{}", mangled);
+    // The advised bean's module-qualified contract (the METHOD_TABLE_PAIRINGS JOIN
+    // key), built at the use site exactly like the bean's Descriptor contract.
+    let contract = quote! {
+        ::leaf_core::ContractId::of(
+            ::core::concat!(::core::module_path!(), "::", #ident)
+        )
+    };
 
     // One generated downcast-thunk fn per advised method + the MethodEntry row that
     // points at it. The thunk fn is named off the bean + method so two methods on one
@@ -436,6 +548,16 @@ pub fn emit_method_table(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec
         #[allow(non_upper_case_globals)]
         pub static #table_ident: &::leaf_core::MethodTable =
             &::leaf_core::MethodTable(&[ #entries ]);
+        // Submit the table into METHOD_TABLE_PAIRINGS (the auto-collect substrate)
+        // keyed by ContractId, so the auto-proxy install finds it with no
+        // hand-assembled `.with_method_tables`. Same re-export pattern as COMPONENTS.
+        #[::leaf_core::linkme::distributed_slice(::leaf_core::METHOD_TABLE_PAIRINGS)]
+        #[linkme(crate = ::leaf_core::linkme)]
+        static #table_row_ident: ::leaf_core::MethodTablePairingRow =
+            ::leaf_core::MethodTablePairingRow {
+                contract: #contract,
+                table: #table_ident,
+            };
     }
 }
 
@@ -508,6 +630,41 @@ mod tests {
 
     fn flat(ts: &TokenStream) -> String {
         ts.to_string().split_whitespace().collect::<String>()
+    }
+
+    #[test]
+    fn emits_a_live_advisor_pairing_into_the_advisor_pairings_slice() {
+        // The headline auto-collect closure: an #[aspect] struct ALSO emits a LIVE
+        // ::leaf_core::AdvisorPairingRow into ADVISOR_PAIRINGS — the const pointcut +
+        // the make_interceptor bean bridge the hand `.with_advisors` table used to
+        // supply, so the run pipeline auto-collects the advisor with no `.with_advisors`.
+        let ty: syn::Type = syn::parse_str("AuditAspect").expect("a type");
+        let ts = emit_advisor_pairing("AuditAspect", &ty, &AdvisorArgs::default());
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]"),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::AdvisorPairingRow{"), "got: {s}");
+        // The const pointcut is `Anything` (the aspect advises every matched join point).
+        assert!(s.contains("pointcut:&::leaf_core::Anything"), "got: {s}");
+        // The make_interceptor RESOLVES the aspect bean + upcasts it to Arc<dyn Interceptor>.
+        assert!(s.contains("make_interceptor:"), "got: {s}");
+        assert!(s.contains("BeanKey::ByContract"), "got: {s}");
+        assert!(s.contains(".downcast::<AuditAspect>()"), "got: {s}");
+        assert!(s.contains("dyn::leaf_core::Interceptor"), "got: {s}");
+        // A user aspect is Application-role at the around-order floor by default.
+        assert!(s.contains("role:::leaf_core::Role::Application"), "got: {s}");
+    }
+
+    #[test]
+    fn an_explicit_aspect_order_rides_the_advisor_pairing_row() {
+        let args = AdvisorArgs { order: Some(50) };
+        let ty: syn::Type = syn::parse_str("A").expect("a type");
+        let s = flat(&emit_advisor_pairing("A", &ty, &args));
+        assert!(s.contains("value:50i32"), "got: {s}");
+        assert!(s.contains("source:::leaf_core::OrderSource::Annotation"), "got: {s}");
     }
 
     #[test]
@@ -647,6 +804,17 @@ mod tests {
         // A bare struct form has no enumerable methods (the struct attr cannot see
         // them — an honest empty spec; the impl-aware form / binary supplies methods).
         assert!(s.contains("methods:&[]"), "got: {s}");
+        // The spec is ALSO auto-collected into JOINPOINT_PAIRINGS keyed by ContractId
+        // (the COMPONENTS auto-collect substrate, extended) so the proxy-assembly pass
+        // finds it with no hand-assembled `.with_join_points`.
+        assert!(
+            s.contains(
+                "#[::leaf_core::linkme::distributed_slice(::leaf_core::JOINPOINT_PAIRINGS)]"
+            ),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::JoinPointPairingRow{contract:"), "got: {s}");
+        assert!(s.contains("spec:&__leaf_joinpoints_OrderService"), "got: {s}");
     }
 
     #[test]
@@ -716,6 +884,17 @@ mod tests {
             "got: {s}"
         );
         assert!(s.contains("invoke:__leaf_invoke_OrderService_place_order"), "got: {s}");
+        // The table is ALSO auto-collected into METHOD_TABLE_PAIRINGS keyed by
+        // ContractId (the COMPONENTS auto-collect substrate, extended) so the
+        // auto-proxy install finds it with no hand-assembled `.with_method_tables`.
+        assert!(
+            s.contains(
+                "#[::leaf_core::linkme::distributed_slice(::leaf_core::METHOD_TABLE_PAIRINGS)]"
+            ),
+            "got: {s}"
+        );
+        assert!(s.contains("::leaf_core::MethodTablePairingRow{contract:"), "got: {s}");
+        assert!(s.contains("table:__leaf_methods_OrderService"), "got: {s}");
     }
 
     #[test]
