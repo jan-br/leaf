@@ -421,21 +421,20 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         // hand-assembled `.with_seeds`/`.with_injection_plans` required. Binding the
         // plan const through the row also keeps it from being DCE'd before the
         // assembly pass can read it.
+        // The struct stereotype / `#[bean]` / config-method recipe is the
+        // FIELD-DEFAULT (`from_constructor: false`): if an `#[inject]` constructor row
+        // also rides the slice for this contract, leaf-boot's merge selects IT over
+        // this one (the constructor-over-field-default precedence).
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
-        static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
-            contract: #contract,
-            seed: #seed_ident,
-        };
+        static #seed_row_ident: ::leaf_core::SeedPairingRow =
+            ::leaf_core::SeedPairingRow::field_default(#contract, #seed_ident);
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
-            ::leaf_core::InjectionPlanPairingRow {
-                contract: #contract,
-                plan: #plan_ident,
-            };
+            ::leaf_core::InjectionPlanPairingRow::field_default(#contract, #plan_ident);
     })
 }
 
@@ -512,23 +511,19 @@ pub fn emit_wiring_only(input: &BeanInput) -> Result<TokenStream, EmitError> {
             || ::std::sync::Arc::new(#provider_ident);
 
         // ── the wiring-pairing submissions, keyed by the bean ContractId ──
-        // Both rows carry the SAME contract as the stereotype's field-default rows;
-        // leaf-boot's merge selects the constructor over the field-default (Task 5).
+        // Both rows carry the SAME contract as the stereotype's field-default rows AND
+        // are tagged `from_constructor` (the precedence flag): leaf-boot's merge
+        // selects the constructor over the field-default (Task 5).
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
-        static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
-            contract: #contract,
-            seed: #seed_ident,
-        };
+        static #seed_row_ident: ::leaf_core::SeedPairingRow =
+            ::leaf_core::SeedPairingRow::from_constructor(#contract, #seed_ident);
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
         static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
-            ::leaf_core::InjectionPlanPairingRow {
-                contract: #contract,
-                plan: #plan_ident,
-            };
+            ::leaf_core::InjectionPlanPairingRow::from_constructor(#contract, #plan_ident);
     })
 }
 
@@ -914,15 +909,24 @@ mod tests {
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
             "got: {s}"
         );
-        assert!(s.contains("::leaf_core::SeedPairingRow{contract:"), "got: {s}");
-        assert!(s.contains("seed:__leaf_seed_Foo"), "got: {s}");
+        // The struct field-default path mints its rows through the FIELD-DEFAULT const
+        // constructors (the `from_constructor: false` precedence — the `#[inject]`
+        // constructor row, if any, wins over it in leaf-boot's merge).
+        assert!(
+            s.contains("::leaf_core::SeedPairingRow::field_default("),
+            "the field-default seed row uses the field_default precedence ctor: {s}"
+        );
+        assert!(s.contains("__leaf_seed_Foo"), "got: {s}");
         assert!(
             s.contains(
                 "#[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]"
             ),
             "got: {s}"
         );
-        assert!(s.contains("::leaf_core::InjectionPlanPairingRow{contract:"), "got: {s}");
+        assert!(
+            s.contains("::leaf_core::InjectionPlanPairingRow::field_default("),
+            "the field-default plan row uses the field_default precedence ctor: {s}"
+        );
     }
 
     #[test]

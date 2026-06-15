@@ -567,9 +567,12 @@ impl Application {
     /// explicit pairing for the SAME `ContractId` overrides it (so a binary can still
     /// hand-tune a single bean's wiring). The fold is idempotent + order-independent.
     fn collect_from_slices(&mut self) {
-        // seeds — explicit overrides slice on a ContractId collision.
+        // seeds — explicit overrides slice on a ContractId collision. The slice base is
+        // first reduced by `dedup_seed_rows` so a contract with BOTH a struct
+        // field-default row and an `#[inject]`-constructor row collapses to the
+        // CONSTRUCTOR row (the merge precedence — Task 5); the field-default is dropped.
         self.seeds = merge_by_contract(
-            leaf_core::collect_slice(&leaf_core::SEED_PAIRINGS)
+            dedup_seed_rows(leaf_core::collect_slice(&leaf_core::SEED_PAIRINGS))
                 .into_iter()
                 .map(|r| SeedPairing::new(r.contract, r.seed)),
             std::mem::take(&mut self.seeds),
@@ -669,11 +672,25 @@ impl Application {
     /// the slice-collected plan applies. So `#[component]`-emitted plans auto-collect
     /// while an explicit override still takes precedence.
     fn auto_injection_resolver(&self, registry: &leaf_core::Registry) -> InjectionResolver {
+        // The CONSTRUCTOR-OVER-FIELD-DEFAULT precedence (Task 5), mirroring the seed
+        // merge: a contract with BOTH a struct field-default plan and an
+        // `#[inject]`-constructor plan resolves to the CONSTRUCTOR plan (its points are
+        // the ctor PARAMETERS, not the struct fields). Tracked by BeanId alongside the
+        // winning row's precedence so a field-default never demotes a held constructor,
+        // regardless of slice order.
         let mut by_id: std::collections::HashMap<leaf_core::BeanId, InjectionPlan> =
+            std::collections::HashMap::new();
+        let mut from_ctor: std::collections::HashMap<leaf_core::BeanId, bool> =
             std::collections::HashMap::new();
         for row in leaf_core::collect_slice(&leaf_core::INJECTION_PLAN_PAIRINGS) {
             if let Some(id) = registry.by_contract(row.contract) {
-                by_id.insert(id, row.plan);
+                let held_is_ctor = from_ctor.get(&id).copied().unwrap_or(false);
+                // Insert when there is no winner yet, or when a constructor row
+                // supersedes a held field-default. A held constructor is never demoted.
+                if !by_id.contains_key(&id) || (row.from_constructor && !held_is_ctor) {
+                    by_id.insert(id, row.plan);
+                    from_ctor.insert(id, row.from_constructor);
+                }
             }
         }
         let explicit = Arc::clone(&self.inj_of);
@@ -1084,6 +1101,31 @@ fn runner_upcast_failed(contract: leaf_core::ContractId) -> LeafError {
              than the resolved bean)"
         ),
     ))
+}
+
+/// Reduce the link-collected [`SeedPairingRow`](leaf_core::SeedPairingRow)s to ONE row
+/// per `ContractId`, applying the CONSTRUCTOR-OVER-FIELD-DEFAULT precedence (Task 5): a
+/// stateful/mixed bean wears BOTH a struct stereotype (the field-default seed) AND an
+/// `#[inject]` constructor (the constructor seed), so two rows share one contract; the
+/// `from_constructor` row WINS and the field-default is dropped. Two rows of the SAME
+/// precedence for one contract (a true double-emit) collapse here too — the loud
+/// double-emit guard re-fires downstream in `assembly::slice_seed_index` (which sees the
+/// unreduced slice), so this stays infallible. Order-independent (a constructor row
+/// arriving before OR after the field-default still wins).
+fn dedup_seed_rows(rows: Vec<leaf_core::SeedPairingRow>) -> Vec<leaf_core::SeedPairingRow> {
+    let mut by_contract: std::collections::HashMap<leaf_core::ContractId, leaf_core::SeedPairingRow> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        match by_contract.get(&row.contract) {
+            // A constructor row supersedes a held field-default; a held constructor is
+            // never demoted by a later field-default. Same-precedence keeps the first.
+            Some(held) if held.from_constructor || !row.from_constructor => {}
+            _ => {
+                by_contract.insert(row.contract, row);
+            }
+        }
+    }
+    by_contract.into_values().collect()
 }
 
 /// Fold the slice-collected `base` pairings UNDER the explicit `over` pairings, keyed

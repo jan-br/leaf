@@ -551,13 +551,13 @@ fn emit_config_bean_registration(
 
         // The seed pairing so from_slices JOINs the AUTO_CONFIGS row to its seed (the
         // anti-DCE per-bean JOIN — an unconstructible bean must never silently vanish).
+        // A config-properties bean is bound from the env (no `#[inject]` ctor), so this
+        // is a FIELD-DEFAULT-class seed row.
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
-        static #seed_row_ident: ::leaf_core::SeedPairingRow = ::leaf_core::SeedPairingRow {
-            contract: #contract,
-            seed: #seed_ident,
-        };
+        static #seed_row_ident: ::leaf_core::SeedPairingRow =
+            ::leaf_core::SeedPairingRow::field_default(#contract, #seed_ident);
     }
 }
 
@@ -933,8 +933,13 @@ mod tests {
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
             "got: {s}"
         );
-        assert!(s.contains("::leaf_core::SeedPairingRow{contract:"), "got: {s}");
-        assert!(s.contains("seed:__leaf_seed_AppProps"), "got: {s}");
+        // A config-properties bean is env-bound (no `#[inject]` ctor), so its seed row
+        // is a FIELD-DEFAULT-class row.
+        assert!(
+            s.contains("::leaf_core::SeedPairingRow::field_default("),
+            "got: {s}"
+        );
+        assert!(s.contains("__leaf_seed_AppProps"), "got: {s}");
     }
 
     #[test]

@@ -357,6 +357,30 @@ pub struct SeedPairingRow {
     /// The const fn-pointer that BUILDS the bean's `Provider`
     /// (the macro-emitted `__leaf_seed_<Ident>`).
     pub seed: ProviderSeed,
+    /// `true` iff this row is the recipe an `#[inject]` CONSTRUCTOR emits (the
+    /// `#[advisable] impl { #[inject] fn new(..) }` path), as opposed to the struct
+    /// stereotype's FIELD-DEFAULT recipe (`false`). The two can ride this slice for
+    /// the SAME `contract` (a stateful/mixed bean wears both); leaf-boot's seed-index
+    /// selects the constructor row over the field-default (the merge precedence).
+    pub from_constructor: bool,
+}
+
+impl SeedPairingRow {
+    /// The struct stereotype's FIELD-DEFAULT seed row (the recipe that injects every
+    /// field). The `from_constructor` precedence flag is `false` — the constructor
+    /// row, if present for this contract, wins the merge.
+    #[must_use]
+    pub const fn field_default(contract: ContractId, seed: ProviderSeed) -> Self {
+        SeedPairingRow { contract, seed, from_constructor: false }
+    }
+
+    /// The `#[inject]` CONSTRUCTOR's seed row (its parameters are the injection
+    /// points; its body seeds state). `from_constructor` is `true`, so it WINS the
+    /// merge over the struct field-default row for the same `contract`.
+    #[must_use]
+    pub const fn from_constructor(contract: ContractId, seed: ProviderSeed) -> Self {
+        SeedPairingRow { contract, seed, from_constructor: true }
+    }
 }
 
 /// One macro-emitted bean → [`InjectionPlan`] pairing (the per-bean construction-edge
@@ -369,6 +393,26 @@ pub struct InjectionPlanPairingRow {
     pub contract: ContractId,
     /// The const per-bean injection plan (one `InjectionPoint` per dependency).
     pub plan: InjectionPlan,
+    /// `true` iff this plan is the `#[inject]` CONSTRUCTOR's (its parameters are the
+    /// points), as opposed to the struct stereotype's FIELD-DEFAULT plan (`false`).
+    /// Mirrors [`SeedPairingRow::from_constructor`]: leaf-boot's injection-plan
+    /// resolver selects the constructor plan over the field-default for one `contract`.
+    pub from_constructor: bool,
+}
+
+impl InjectionPlanPairingRow {
+    /// The struct stereotype's FIELD-DEFAULT injection plan (one point per field).
+    #[must_use]
+    pub const fn field_default(contract: ContractId, plan: InjectionPlan) -> Self {
+        InjectionPlanPairingRow { contract, plan, from_constructor: false }
+    }
+
+    /// The `#[inject]` CONSTRUCTOR's injection plan (one point per ctor parameter),
+    /// which WINS the merge over the struct field-default for the same `contract`.
+    #[must_use]
+    pub const fn from_constructor(contract: ContractId, plan: InjectionPlan) -> Self {
+        InjectionPlanPairingRow { contract, plan, from_constructor: true }
+    }
 }
 
 /// One macro-emitted gated-element → [`CondExpr`] guard pairing (the const twin of

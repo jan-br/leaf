@@ -187,10 +187,11 @@ pub const REDIS_CLIENT_SEED: leaf_core::ProviderSeed =
 #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
 #[linkme(crate = ::leaf_core::linkme)]
 #[doc(hidden)]
-pub static REDIS_CLIENT_SEED_PAIRING: leaf_core::SeedPairingRow = leaf_core::SeedPairingRow {
-    contract: leaf_core::ContractId::of(REDIS_CLIENT_CONTRACT),
-    seed: REDIS_CLIENT_SEED,
-};
+pub static REDIS_CLIENT_SEED_PAIRING: leaf_core::SeedPairingRow =
+    leaf_core::SeedPairingRow::field_default(
+        leaf_core::ContractId::of(REDIS_CLIENT_CONTRACT),
+        REDIS_CLIENT_SEED,
+    );
 
 #[cfg(test)]
 mod tests {

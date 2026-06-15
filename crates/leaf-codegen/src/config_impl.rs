@@ -1454,9 +1454,12 @@ mod tests {
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
             "got: {s}"
         );
+        // The `#[inject]` constructor's rows are minted through the `from_constructor`
+        // precedence ctors — keyed on the bean contract — so leaf-boot's merge selects
+        // them OVER the struct stereotype's field-default rows for the same ContractId.
         assert!(
-            s.contains(&format!("::leaf_core::SeedPairingRow{{contract:{contract}")),
-            "the seed row must key on the bean contract: {s}"
+            s.contains(&format!("::leaf_core::SeedPairingRow::from_constructor({contract}")),
+            "the seed row must be a from_constructor row keyed on the bean contract: {s}"
         );
         assert!(
             s.contains(
@@ -1465,8 +1468,10 @@ mod tests {
             "got: {s}"
         );
         assert!(
-            s.contains(&format!("::leaf_core::InjectionPlanPairingRow{{contract:{contract}")),
-            "the plan row must key on the bean contract: {s}"
+            s.contains(&format!(
+                "::leaf_core::InjectionPlanPairingRow::from_constructor({contract}"
+            )),
+            "the plan row must be a from_constructor row keyed on the bean contract: {s}"
         );
     }
 
