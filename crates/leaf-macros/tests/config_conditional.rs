@@ -282,9 +282,11 @@ fn profile_lowers_to_a_single_on_profile_cond_leaf() {
     match guard {
         leaf_core::CondExpr::Leaf(id, attrs) => {
             assert_eq!(id, leaf_core::ON_PROFILE, "a profile rides the ON_PROFILE leaf");
-            // The rendered expression rides a `profiles` attr the runtime re-parses.
-            let has_profiles = attrs.iter().any(|a| a.key() == "profiles");
-            assert!(has_profiles, "the profile expression rides a `profiles` attr");
+            // The rendered expression rides the `expr` attr the runtime `OnProfile`
+            // re-parses (the runtime reads `"expr"`, not `"profiles"` — emitting it
+            // under the wrong key made every #[profile] guard vacuously active).
+            let has_expr = attrs.iter().any(|a| a.key() == "expr");
+            assert!(has_expr, "the profile expression rides an `expr` attr");
         }
         other => panic!("expected an ON_PROFILE leaf, got {other:?}"),
     }

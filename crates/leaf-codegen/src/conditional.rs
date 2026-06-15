@@ -635,15 +635,18 @@ pub fn parse_profile_attr(attr: TokenStream) -> Result<ProfileExpr, EmitError> {
 }
 
 /// Lower a [`ProfileExpr`] to the equivalent profile [`CondExpr`] leaf — a
-/// `Leaf(ON_PROFILE, [profile = "<rendered>"])`. Profiles are a PRESET: the whole
+/// `Leaf(ON_PROFILE, [expr = "<rendered>"])`. Profiles are a PRESET: the whole
 /// expression rides ONE `ON_PROFILE` leaf whose attr carries the rendered
 /// expression string the runtime `OnProfile` condition re-parses via
-/// `accepts_profiles`.
+/// `accepts_profiles`. The runtime reads it from the `"expr"` attr
+/// (`leaf_conditions::profile`), so the macro emits it under `"expr"` — NOT
+/// `"profiles"` (the same align-codegen-to-the-runtime-attr rule `on_property`
+/// follows for `"name"`; a mismatched key made the guard vacuously active).
 #[must_use]
 pub fn profile_to_cond(expr: &ProfileExpr) -> CondExpr {
     CondExpr::Leaf {
         kind: "leaf::condition::OnProfile".into(),
-        attrs: vec![CondAttr::Str("profiles".into(), render_profile(expr))],
+        attrs: vec![CondAttr::Str("expr".into(), render_profile(expr))],
     }
 }
 
@@ -1109,7 +1112,10 @@ mod tests {
             s.contains(r#"::leaf_core::contract_hash("leaf::condition::OnProfile")"#),
             "got: {s}"
         );
-        assert!(s.contains(r#"::leaf_core::Attr::Str("profiles","prod&eu")"#), "got: {s}");
+        // The runtime OnProfile reads the rendered expression from the `"expr"` attr
+        // (NOT `"profiles"` — a prior mismatch made every #[profile] guard vacuously
+        // active until the guard verdict was enforced).
+        assert!(s.contains(r#"::leaf_core::Attr::Str("expr","prod&eu")"#), "got: {s}");
     }
 
     #[test]

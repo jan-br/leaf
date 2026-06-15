@@ -433,6 +433,42 @@ impl RegistryBuilder {
         Ok(())
     }
 
+    /// Remove every pending bean whose [`ContractId`] is in `contracts`, returning
+    /// the number actually removed.
+    ///
+    /// A PRE-FREEZE prune of the append-only builder — the only mutation other than
+    /// `register`/`alias`. It is sound here because the dense `BeanId` slot space is
+    /// minted at [`freeze`](RegistryBuilder::freeze) (from the FINAL `beans` order),
+    /// so no `BeanId` exists yet that a removal could dangle. The `name_index` (the
+    /// only pre-freeze structure carrying a `BeanId`, used purely for the eager
+    /// duplicate-name guard) is rebuilt from the surviving beans, so a later
+    /// `register` still sees the correct collision set.
+    ///
+    /// The condition-routing pass uses this to drop a `#[component]` whose
+    /// `#[conditional]` / `#[profile]` guard did NOT match — the registry-level
+    /// analogue of holding an auto-config back from `from_slices`. A contract not in
+    /// the builder (e.g. a held-back auto-config's contract) is simply not matched
+    /// (a harmless no-op for that contract).
+    pub fn remove_by_contract(&mut self, contracts: &std::collections::HashSet<ContractId>) -> usize {
+        if contracts.is_empty() {
+            return 0;
+        }
+        let before = self.beans.len();
+        self.beans.retain(|b| !contracts.contains(&b.descriptor.contract));
+        let removed = before - self.beans.len();
+        if removed > 0 {
+            // Rebuild the name index: the surviving beans take fresh dense indices,
+            // so the old `BeanName → BeanId` mapping is stale. (No external pre-freeze
+            // `BeanId` is held in the boot pipeline — `alias` is the Registrar SPI path
+            // and is not driven between `register` and `freeze` there.)
+            self.name_index.clear();
+            for (i, bean) in self.beans.iter().enumerate() {
+                self.name_index.insert(bean.canonical_name.clone(), BeanId(i as u32));
+            }
+        }
+        removed
+    }
+
     /// Consume the builder, materializing the immutable [`Registry`] in one pass.
     ///
     /// Builds the dense `rows`/`providers`/`singletons` arrays and ALL indices
@@ -609,6 +645,8 @@ fn alias_shadows_name(alias: &str) -> LeafError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
     use crate::definition::{
         AnnotationMetadata, Role, ScopeDef, TypeRow, UpcastFn,
     };
@@ -739,6 +777,52 @@ mod tests {
         assert_eq!(id0, BeanId(0));
         assert_eq!(id1, BeanId(1));
         assert_eq!(b.len(), 2);
+    }
+
+    #[test]
+    fn remove_by_contract_prunes_pre_freeze_and_keeps_indices_coherent() {
+        let mut b = RegistryBuilder::new();
+        let (d0, p0, _) = alpha_provider("crate::A", 1);
+        let d1 = descriptor("crate::B", TypeId::of::<Beta>(), Some("beta"), &[], &[]);
+        let p1: Arc<dyn Provider> = Arc::new(BetaProvider { descriptor: d1 });
+        let d2 = descriptor("crate::C", TypeId::of::<Beta>(), Some("gamma"), &[], &[]);
+        let p2: Arc<dyn Provider> = Arc::new(BetaProvider { descriptor: d2 });
+        b.register(d0, p0).expect("register A");
+        b.register(d1, p1).expect("register B");
+        b.register(d2, p2).expect("register C");
+        assert_eq!(b.len(), 3);
+
+        // Empty set is a no-op (returns 0, count unchanged).
+        assert_eq!(b.remove_by_contract(&HashSet::new()), 0);
+        assert_eq!(b.len(), 3);
+
+        // Remove the FIRST bean (the dense-index shift the rebuild must absorb) +
+        // a contract that is NOT present (a harmless miss, like a held-back
+        // auto-config's contract).
+        let mut to_remove = HashSet::new();
+        to_remove.insert(ContractId::of("crate::A"));
+        to_remove.insert(ContractId::of("crate::NOT_PRESENT"));
+        assert_eq!(b.remove_by_contract(&to_remove), 1, "only the present match is removed");
+        assert_eq!(b.len(), 2);
+
+        // The name_index was rebuilt over the survivors: re-registering the removed
+        // bean's NAME no longer collides (the stale BeanId is gone), and B/C still
+        // collide-guard correctly.
+        let (d0b, p0b, _) = alpha_provider("crate::A", 9);
+        b.register(d0b, p0b).expect("re-register A after its prune");
+        let dup = descriptor("crate::D", TypeId::of::<Beta>(), Some("beta"), &[], &[]);
+        let pd: Arc<dyn Provider> = Arc::new(BetaProvider { descriptor: dup });
+        assert_eq!(
+            b.register(dup, pd).expect_err("the surviving `beta` name still guards").kind,
+            ErrorKind::NoUniqueBean
+        );
+
+        // Freeze the survivors: dense ids are minted fresh, all three resolve.
+        let reg = b.freeze().expect("freeze after prune");
+        assert_eq!(reg.len(), 3);
+        assert!(reg.by_contract(ContractId::of("crate::A")).is_some());
+        assert!(reg.by_contract(ContractId::of("crate::B")).is_some());
+        assert!(reg.by_contract(ContractId::of("crate::C")).is_some());
     }
 
     #[test]

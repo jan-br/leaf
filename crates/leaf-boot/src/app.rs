@@ -296,6 +296,38 @@ impl App<Resolve> {
         Ok(outcome.matched)
     }
 
+    /// Prune from the builder every COMPONENT whose `#[conditional]`/`#[profile]`
+    /// guard did NOT match — the registry-level analogue of holding an auto-config
+    /// back from `from_slices`.
+    ///
+    /// `from_slices` registers EVERY `COMPONENTS` row unconditionally; the guard
+    /// verdict is only known AFTER [`route_conditions`](App::<Resolve>::route_conditions).
+    /// This consumes that verdict: a contract that is GUARDED (named in `guards` /
+    /// `GUARD_PAIRINGS`) but is NOT in `matched` is dropped from the builder BEFORE
+    /// the [`seal`](App::<Resolve>::seal) freeze mints any `BeanId`.
+    ///
+    /// Only COMPONENTS are affected: auto-config contracts are held back from the
+    /// builder by `from_slices` (the ladder is their registrar), so removing them
+    /// here is a no-op for those contracts. An UNGUARDED component has no row in
+    /// `guards`, so it is never a removal candidate. Returns the number pruned.
+    pub fn prune_unmatched_components(
+        &mut self,
+        guards: &[GuardPairing],
+        matched: &[leaf_core::ContractId],
+    ) -> usize {
+        use std::collections::HashSet;
+        let matched: HashSet<leaf_core::ContractId> = matched.iter().copied().collect();
+        // Guarded-but-not-matched: every guard's contract whose verdict was not a
+        // match. (A contract may carry several merged guard leaves; `matched` already
+        // reflects the conjunction, so a single `!matched` membership is the verdict.)
+        let to_remove: HashSet<leaf_core::ContractId> = guards
+            .iter()
+            .map(|g| g.contract)
+            .filter(|c| !matched.contains(c))
+            .collect();
+        self.builder.remove_by_contract(&to_remove)
+    }
+
     /// Run the auto-config ladder (`exclude > back-off > default`) over
     /// `candidates` (see [`run_autoconfig`](crate::run_autoconfig)), registering
     /// survivors INCREMENTALLY at [`CandidateRole::FALLBACK`] into the builder and

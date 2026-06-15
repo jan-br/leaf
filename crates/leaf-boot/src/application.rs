@@ -752,8 +752,16 @@ impl Application {
         // The parsed ApplicationArguments (the shared runner arg).
         let run_args = app.args().clone();
 
-        // (10) route_conditions + run_autoconfig → seal() → validate().
-        app.route_conditions(&self.guards)?;
+        // (10) route_conditions + prune unmatched components + run_autoconfig →
+        // seal() → validate(). `from_slices` registered EVERY component
+        // unconditionally; route_conditions evaluates each component's
+        // `#[conditional]`/`#[profile]` guard and returns the contracts that MATCHED,
+        // so a guarded-but-unmatched COMPONENT is pruned from the builder BEFORE the
+        // seal freeze (the registry-level analogue of holding an auto-config back).
+        // Auto-config contracts aren't in the builder (held back here too), so the
+        // prune is a no-op for them — they are gated by run_autoconfig below.
+        let matched = app.route_conditions(&self.guards)?;
+        app.prune_unmatched_components(&self.guards, &matched);
         app.run_autoconfig(&self.autoconfig, &self.exclusions)?;
         let app = app.seal()?;
         *phase = RunMilestone::Prepared;
