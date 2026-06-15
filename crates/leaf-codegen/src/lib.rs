@@ -59,6 +59,7 @@ pub mod config_impl;
 pub mod constfold;
 pub mod descriptor;
 pub mod forcelink;
+pub mod holder;
 pub mod listener;
 pub mod parsers;
 pub mod rollup;

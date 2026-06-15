@@ -15,28 +15,23 @@
 //! collision guard over `CxKey` declarations; `LocaleKey` reserves the canonical
 //! `"locale"` name (matching the leaf-tokio/leaf-smol ambient probes).
 
-use leaf_core::{Cx, CxKey, Holder, Locale, Propagation};
+use leaf_core::{Cx, Locale};
+use leaf_macros::holder;
 
-/// The canonical "current locale" ambient key (i18n).
+/// The canonical "current locale" ambient key (i18n) + its [`LOCALE`] accessor.
 ///
 /// `POLICY = Inherit`: the locale is request/user-scoped presentation state, so
 /// it is auto-captured across a spawn hop by the facility's `CxDecorator` — a
 /// scheduled/`@Async` body renders in the same locale as the request that armed
 /// it. `NAME = "locale"` is the canonical bundle-schema name read by
 /// [`MessageSource`](leaf_core::MessageSource) when no explicit locale is passed.
-pub struct LocaleKey;
-
-impl CxKey for LocaleKey {
-    type Value = Locale;
-    const NAME: &'static str = "locale";
-    const POLICY: Propagation = Propagation::Inherit;
-}
-
-/// The typed accessor over [`LocaleKey`] — `#[holder]`-shaped sugar.
 ///
-/// `LOCALE.scope(locale, fut)` binds the locale for the duration of `fut`;
-/// `LOCALE.get()` reads the ambient locale; `LOCALE.with(|l| ..)` borrows it.
-pub static LOCALE: Holder<LocaleKey> = Holder::new();
+/// `#[holder]` emits the `impl CxKey for LocaleKey` + the const-constructed
+/// [`LOCALE`] accessor `static` (`LOCALE.scope(locale, fut)` binds the locale for
+/// the duration of `fut`; `LOCALE.get()` reads it; `LOCALE.with(|l| ..)` borrows
+/// it) — the same hand pattern this declaration used to spell out, now sugared.
+#[holder(name = "locale", policy = inherit, value = leaf_core::Locale)]
+pub struct LocaleKey;
 
 /// Read the ambient [`Locale`] from the current [`Cx`], if one is bound.
 ///
@@ -83,6 +78,9 @@ pub fn fallback_chain(locale: &Locale) -> Vec<Locale> {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    // `CxKey`/`Propagation` are read ONLY by these tests now (the `#[holder]` macro
+    // emits absolute `::leaf_core` paths), so they live here, not at module scope.
+    use leaf_core::{CxKey, Propagation};
 
     #[test]
     fn locale_key_is_inherit_and_named_locale() {

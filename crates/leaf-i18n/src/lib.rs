@@ -30,21 +30,22 @@
 //! [`ErrorKind::NoSuchMessage`](leaf_core::ErrorKind::NoSuchMessage) diagnostic
 //! node. No external i18n/ICU dependency; only `leaf-core`.
 //!
-//! ## Deferred (honest NOTEs)
+//! ## `#[holder]` (WIRED) + deferred catalog CONSUMPTION (honest NOTEs)
 //!
-//! - **`#[holder]` macro.** leaf-macros does not yet ship the `#[holder]`
-//!   attribute, so [`LocaleKey`] is the hand-written `impl CxKey` + `const`
-//!   [`Holder`](leaf_core::Holder) `static` the macro would expand to (the same
-//!   hand pattern leaf-tx uses for its key). The design's
-//!   "declare-once-enforced at freeze" is the kernel's per-`NAME` `CxKey`
+//! - **`#[holder]` macro — WIRED.** [`LocaleKey`] now declares the canonical
+//!   `"locale"` key via `#[holder(name = "locale", policy = inherit, value =
+//!   leaf_core::Locale)]`: the macro emits the `impl CxKey for LocaleKey` + the
+//!   const-constructed [`LOCALE`](leaf_core::Holder) accessor `static` (the same
+//!   hand pattern this crate used to spell out, now sugared). The design's
+//!   "declare-once-enforced at freeze" remains the kernel's per-`NAME` `CxKey`
 //!   collision guard, not enforced in this crate.
-//! - **`register_catalog!` / `.ftl`/`.properties` build.rs codegen + the
-//!   `CATALOGS` linkme self-check.** Catalog DISCOVERY (a `CatalogDescriptor`
-//!   into the `CATALOGS` slice, the `ExpectedManifest` anti-DCE check, and the
-//!   `messageSource` magic-name-or-`DelegatingMessageSource` install) is
-//!   leaf-codegen/leaf-boot's concern (per the phase3/11 crate hints). This crate
-//!   ships the RUNTIME shapes ([`StaticCatalog`]/[`HierarchicalMessageSource`])
-//!   those fronts target; a catalog is built explicitly via its builder here.
+//! - **Catalog CONSUMPTION + the `CATALOGS` self-check.** The `#[catalog]` macro
+//!   (the emission side) is wired in leaf-macros; what is still deferred is catalog
+//!   CONSUMPTION: the `ExpectedManifest`/`CATALOGS`-linkme anti-DCE self-check and
+//!   the `messageSource` magic-name-or-`DelegatingMessageSource` install are
+//!   leaf-boot's concern (per the phase3/11 crate hints). This crate ships the
+//!   RUNTIME shapes ([`StaticCatalog`]/[`HierarchicalMessageSource`]) those fronts
+//!   target; a catalog is built explicitly via its builder here.
 //! - **Locale-sensitive formatting.** `{n}` substitution ([`format`]) is the
 //!   POSITIONAL, locale-insensitive subset; locale-aware number/date/plural
 //!   formatting is delegated to the type-conversion neighbour (phase3/11) and is

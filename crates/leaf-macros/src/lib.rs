@@ -33,6 +33,7 @@ use leaf_codegen::conditional;
 use leaf_codegen::config;
 use leaf_codegen::config_impl;
 use leaf_codegen::descriptor::EmitError;
+use leaf_codegen::holder;
 use leaf_codegen::listener;
 use leaf_codegen::scheduling;
 use leaf_codegen::stereotype::{self, Stereotype};
@@ -885,6 +886,32 @@ pub fn catalog(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     let rows = scheduling::emit_catalog(&parsed.ident.to_string(), &args);
+    quote! { #parsed #rows }.into()
+}
+
+/// `#[holder(name = "locale", policy = inherit, value = leaf_core::Locale)]` — declare
+/// an ambient context key (a `CxKey`) + its typed `Holder` accessor. Applied to a unit
+/// struct whose ident names the key. Emits ONLY the `impl ::leaf_core::CxKey` + a
+/// `pub static` const-constructed `::leaf_core::Holder` accessor (NO `linkme` row — a
+/// `CxKey` is plain data, not a registered bean). `policy` is `inherit`/`isolate`
+/// (default `isolate`); `accessor` overrides the derived SCREAMING_SNAKE name
+/// (`LocaleKey` -> `LOCALE`). The concept-owning crate declares its key here (locale in
+/// leaf-i18n, request attrs in a web crate) — never hardcoded in core.
+#[proc_macro_attribute]
+pub fn holder(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as ItemStruct);
+    if let Err(err) = holder::validate_holder_struct(&parsed) {
+        let error = compile_error(&err);
+        return quote! { #parsed #error }.into();
+    }
+    let args = match holder::parse_holder_args(attr.into()) {
+        Ok(a) => a,
+        Err(err) => {
+            let error = compile_error(&err);
+            return quote! { #parsed #error }.into();
+        }
+    };
+    let rows = holder::emit_holder(&parsed.ident.to_string(), &args);
     quote! { #parsed #rows }.into()
 }
 

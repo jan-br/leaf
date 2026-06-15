@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+# The thin proc-macro crate: `#[holder]` declares the canonical `LocaleKey`/`LOCALE`
+# ambient key (emitting the `impl CxKey` + const `Holder` accessor through absolute
+# `::leaf_core` paths — no extra dep beyond leaf-core). No cycle: leaf-macros ->
+# leaf-codegen -> leaf-core; leaf-i18n -> leaf-core + leaf-macros.
+leaf-macros.workspace = true
 
 [dev-dependencies]
 # Tests drive the async MessageSource ABI (BoxFuture seam) to completion with a

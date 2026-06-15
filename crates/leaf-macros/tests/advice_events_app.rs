@@ -23,8 +23,8 @@ use leaf_core::{
     ADVISORS, CATALOGS, COMPONENTS, EVENT_LISTENERS, FAILURE_ANALYZERS, RESOURCES, SCHEDULED,
 };
 use leaf_macros::{
-    advisable, aspect, catalog, component, event_listener, failure_analyzer, runner, scheduled,
-    transactional_event_listener,
+    advisable, aspect, catalog, component, event_listener, failure_analyzer, holder, runner,
+    scheduled, transactional_event_listener,
 };
 
 /// The module-qualified contract a macro mints for `ident` in THIS module (the
@@ -212,6 +212,38 @@ fn catalog_reaches_the_catalogs_slice_with_its_descriptor() {
     // The richer descriptor pairing const carries the basename + locales.
     assert_eq!(__leaf_catalog_AppMessages.basename, "messages");
     assert_eq!(__leaf_catalog_AppMessages.locales, &["en", "de"]);
+}
+
+// ─────────────────────────────── #[holder] ──────────────────────────────────
+
+/// An ambient context key declared via `#[holder]` — the same shape leaf-i18n's
+/// `LocaleKey`/`LOCALE` migrate onto. `inherit` policy + a derived `LOCALE` accessor
+/// (`LocaleKey` -> SCREAMING_SNAKE-with-`Key`-stripped).
+#[holder(name = "locale", policy = inherit, value = leaf_core::Locale)]
+pub struct LocaleKey;
+
+#[test]
+fn holder_emits_the_cxkey_impl_and_accessor() {
+    use leaf_core::{CxKey, Propagation};
+    // The trait-const path resolves to the args (NO linkme row — a CxKey is plain data).
+    assert_eq!(<LocaleKey as CxKey>::NAME, "locale");
+    assert_eq!(<LocaleKey as CxKey>::POLICY, Propagation::Inherit);
+    // The derived accessor static exposes the same facts.
+    assert_eq!(LOCALE.name(), "locale");
+    assert_eq!(LOCALE.policy(), Propagation::Inherit);
+}
+
+#[test]
+fn holder_accessor_round_trips_through_scope_and_get() {
+    use futures::executor::block_on;
+    use leaf_core::Locale;
+    // No ambient binding => None.
+    assert!(LOCALE.get().is_none());
+    // Inside a holder scope => the bound value.
+    let seen = block_on(LOCALE.scope(Locale::new("fr-FR"), async { LOCALE.get() }));
+    assert_eq!(seen.map(|l| l.tag().to_string()), Some("fr-FR".to_string()));
+    // Restored after the scope.
+    assert!(LOCALE.get().is_none());
 }
 
 // ─────────────────────────────── #[resource] ────────────────────────────────
