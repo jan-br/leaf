@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use leaf_core::{
-    sort_listener_entries, BeanKey, CoreDispatch, DispatchErrorMode, DispatchInterceptor,
-    DispatchOutcome, Engine, ErasedEvent, LeafError, ListenerDescriptor, ListenerEntry, ListenerSeq,
-    Multicaster, PipelineMulticaster,
+    detached_dispatch_body, sort_listener_entries, BeanKey, CoreDispatch, CxDecorator,
+    CxFutureExt, DetachedTaskRegistry, DispatchErrorMode, DispatchInterceptor, DispatchOutcome,
+    DropPolicy, Engine, ErasedEvent, LeafError, ListenerDescriptor, ListenerEntry, ListenerSeq,
+    Multicaster, PipelineMulticaster, Spawner,
 };
 
 // ─────────────────────────────── EventPublisher ─────────────────────────────
@@ -37,6 +38,21 @@ pub struct EventPublisher {
     channels: HashMap<TypeId, Vec<ListenerEntry>>,
     /// The container identity (the event origin).
     origin: leaf_core::ContainerId,
+    /// The dispatch error policy (re-used by the detached fire-and-forget path so
+    /// a detached fan-out honors the same per-dispatch error model).
+    mode: DispatchErrorMode,
+    /// The OWNING async-dispatch seam, wired iff true fire-and-forget `@Async`
+    /// dispatch is enabled: the `Spawner` to detach onto, the `CxDecorator` to
+    /// capture the ambient `Cx` with, and the per-app drain registry the detached
+    /// handles register into. `None` => no async-dispatch facility is wired.
+    async_dispatch: Option<AsyncDispatch>,
+}
+
+/// The wired async-dispatch facility (the OWNING detached seam's collaborators).
+struct AsyncDispatch {
+    spawner: Arc<dyn Spawner>,
+    decorator: Arc<dyn CxDecorator>,
+    registry: Arc<DetachedTaskRegistry>,
 }
 
 impl EventPublisher {
@@ -76,12 +92,12 @@ impl EventPublisher {
         }
 
         let multicaster: Box<dyn Multicaster> = if chain.is_empty() {
-            Box::new(PipelineMulticaster::bare(CoreDispatch::new(mode)))
+            Box::new(PipelineMulticaster::bare(CoreDispatch::new(mode.clone())))
         } else {
-            Box::new(PipelineMulticaster::new(CoreDispatch::new(mode), chain))
+            Box::new(PipelineMulticaster::new(CoreDispatch::new(mode.clone()), chain))
         };
 
-        Ok(EventPublisher { multicaster, channels, origin })
+        Ok(EventPublisher { multicaster, channels, origin, mode, async_dispatch: None })
     }
 
     /// A bare publisher with no listeners + an inline `IsolateEach` dispatch (the
@@ -94,7 +110,86 @@ impl EventPublisher {
             ))),
             channels: HashMap::new(),
             origin,
+            mode: DispatchErrorMode::IsolateEach,
+            async_dispatch: None,
         }
+    }
+
+    /// Wire the OWNING async-dispatch facility (the true fire-and-forget `@Async`
+    /// seam): the `spawner` detached tasks run on, the `decorator` capturing the
+    /// ambient `Cx` to propagate onto each spawn, and the per-app `registry` the
+    /// detached [`SpawnHandle`](leaf_core::SpawnHandle)s register into for the
+    /// shutdown drain. After this, [`publish_detached`](Self::publish_detached)
+    /// schedules a fan-out on a detached task and returns
+    /// [`DispatchOutcome::Scheduled`] immediately.
+    #[must_use]
+    pub fn with_async_dispatch(
+        mut self,
+        spawner: Arc<dyn Spawner>,
+        decorator: Arc<dyn CxDecorator>,
+        registry: Arc<DetachedTaskRegistry>,
+    ) -> Self {
+        self.async_dispatch = Some(AsyncDispatch { spawner, decorator, registry });
+        self
+    }
+
+    /// The per-app detached-task drain registry, if the async-dispatch facility is
+    /// wired (so the container's shutdown can reactively drain in-flight detached
+    /// fire-and-forget async-event tasks).
+    #[must_use]
+    pub fn detached_registry(&self) -> Option<&Arc<DetachedTaskRegistry>> {
+        self.async_dispatch.as_ref().map(|a| &a.registry)
+    }
+
+    /// TRUE fire-and-forget `@Async` publish — the OWNING detached seam at the
+    /// `EventPublisher` layer (where the event + listener set CAN be snapshotted
+    /// into `'static`, unlike the borrowed [`DispatchInterceptor::intercept`]).
+    ///
+    /// Snapshots the event's channel into an owned `'static` listener set (cloning
+    /// each `Arc<host>` entry, chaining forced off), captures the ambient `Cx` on
+    /// the CALLER'S task, spawns the [`detached_dispatch_body`] `.scoped(cx)` onto
+    /// the wired `Spawner` with [`DropPolicy::Detach`], REGISTERS the handle for the
+    /// shutdown drain, and returns [`DispatchOutcome::Scheduled`] WITHOUT awaiting.
+    ///
+    /// If no async-dispatch facility is wired
+    /// ([`with_async_dispatch`](Self::with_async_dispatch)), this is a silent
+    /// [`DispatchOutcome::Scheduled`] no-op (nothing to spawn onto) — the wiring is
+    /// the boot's responsibility.
+    #[must_use]
+    pub fn publish_detached<E: Any + Send + Sync>(&self, event: E) -> DispatchOutcome {
+        let Some(async_dispatch) = self.async_dispatch.as_ref() else {
+            // No facility wired: nothing to detach onto. (A boot that registers an
+            // async listener wires the facility; this guards the un-wired case.)
+            return DispatchOutcome::Scheduled;
+        };
+        let ev = ErasedEvent::new(event, self.origin);
+        // Snapshot the per-event-type listener set into an owned 'static set: clone
+        // each Arc<host> entry's handle + adapter + order + condition (chains is
+        // forced OFF by detached_dispatch_body — a detached listener never chains).
+        let entries: Vec<ListenerEntry> = self
+            .channels
+            .get(&ev.type_id)
+            .map(|chan| {
+                chan.iter()
+                    .map(|e| {
+                        ListenerEntry::new(Arc::clone(&e.host), e.adapter, e.order, e.chains)
+                            .with_condition(e.condition)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Capture the ambient Cx ON THE CALLER'S TASK, then scope the owning body so
+        // the detached fan-out observes it across the work-stealing spawn hop.
+        let cx = async_dispatch.decorator.capture();
+        let body = detached_dispatch_body(ev, entries, self.mode.clone()).scoped(cx);
+        let handle = async_dispatch
+            .spawner
+            .spawn(Box::pin(body))
+            .with_policy(DropPolicy::Detach);
+        // REGISTER the handle (an unregistered detach escapes the shutdown drain).
+        async_dispatch.registry.register(handle);
+        DispatchOutcome::Scheduled
     }
 
     /// Publish a typed event over its channel (resolving the channel by
@@ -297,5 +392,135 @@ mod tests {
         ))
         .expect_err("an absent host is loud, never a silently-dropped listener");
         assert_eq!(err.kind, leaf_core::ErrorKind::NoSuchBean);
+    }
+
+    // ── true fire-and-forget @Async publish (the detached seam) ────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_detached_returns_scheduled_and_mutates_the_host_after_the_task_runs() {
+        use leaf_core::{Bean, DetachedTaskRegistry};
+        use leaf_tokio::{CaptureCurrentCx, TokioExecutionFacility};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc as StdArc;
+
+        let _ = leaf_tokio::install_ambient_store();
+
+        // A host whose async listener mutates a running total then signals done.
+        #[derive(Debug)]
+        struct AsyncSink {
+            total: AtomicI64,
+            done: StdArc<AtomicBool>,
+            signal: StdArc<tokio::sync::Notify>,
+        }
+        impl Bean for AsyncSink {}
+
+        // The done/signal handles are shared with the test via the provider closure.
+        let done = StdArc::new(AtomicBool::new(false));
+        let signal = StdArc::new(tokio::sync::Notify::new());
+        let done_p = StdArc::clone(&done);
+        let signal_p = StdArc::clone(&signal);
+
+        struct SinkProv {
+            desc: Descriptor,
+            done: StdArc<AtomicBool>,
+            signal: StdArc<tokio::sync::Notify>,
+        }
+        impl Provider for SinkProv {
+            fn descriptor(&self) -> &Descriptor {
+                &self.desc
+            }
+            fn provide<'a>(
+                &'a self,
+                _cx: &'a ResolveCtx<'a>,
+            ) -> BoxFuture<'a, Result<Published, LeafError>> {
+                let done = StdArc::clone(&self.done);
+                let signal = StdArc::clone(&self.signal);
+                Box::pin(async move {
+                    Ok(Published::shared_value(AsyncSink {
+                        total: AtomicI64::new(0),
+                        done,
+                        signal,
+                    }))
+                })
+            }
+        }
+
+        fn async_adapter<'a>(
+            host: ErasedBean,
+            event: &'a (dyn std::any::Any + Send + Sync),
+        ) -> BoxFuture<'a, Result<ListenerOutcome, LeafError>> {
+            Box::pin(async move {
+                let h = host.downcast::<AsyncSink>().expect("AsyncSink");
+                let e = event.downcast_ref::<OrderPlaced>().expect("OrderPlaced");
+                // A real yield so the caller observes Scheduled before completion.
+                tokio::task::yield_now().await;
+                h.total.fetch_add(e.amount, Ordering::SeqCst);
+                h.done.store(true, Ordering::SeqCst);
+                h.signal.notify_one();
+                Ok(ListenerOutcome::None)
+            })
+        }
+
+        let d = Descriptor {
+            contract: ContractId::of("test::AsyncSink"),
+            self_type: TypeId::of::<AsyncSink>(),
+            provides: &[],
+            declared_name: Some("asyncSink"),
+            aliases: &[],
+            scope: ScopeDef::SINGLETON,
+            role: Role::Application,
+            meta: &AnnotationMetadata::EMPTY,
+            parent: None,
+            origin: Origin::Native { crate_name: Some("test") },
+        };
+        let mut builder = RegistryBuilder::new();
+        builder
+            .register(d, Arc::new(SinkProv { desc: d, done: done_p, signal: signal_p }))
+            .unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        let host = engine.get::<AsyncSink>().await.unwrap();
+
+        // An async (chains=false) listener descriptor.
+        let listener = ListenerDescriptor {
+            host: ContractId::of("test::AsyncSink"),
+            event_type: TypeId::of::<OrderPlaced>(),
+            supports: None,
+            order: OrderKey::implicit(),
+            condition: None,
+            chains: false,
+            adapter: async_adapter,
+        };
+
+        // Install, then WIRE the async-dispatch facility (spawner + decorator +
+        // drain registry) into the publisher.
+        let facility: Arc<dyn leaf_core::Spawner> = Arc::new(TokioExecutionFacility::new());
+        let decorator: Arc<dyn leaf_core::CxDecorator> = Arc::new(CaptureCurrentCx);
+        let registry = Arc::new(DetachedTaskRegistry::new());
+        let publisher = EventPublisher::install(
+            &engine,
+            &[listener],
+            Vec::new(),
+            DispatchErrorMode::AbortAndPropagate,
+            ContractId::of("test::Container"),
+        )
+        .await
+        .unwrap()
+        .with_async_dispatch(facility, decorator, Arc::clone(&registry));
+
+        // Publish on the detached path: returns Scheduled IMMEDIATELY, the host is
+        // NOT yet mutated, and the handle is registered for the drain.
+        let outcome = publisher.publish_detached(OrderPlaced { amount: 9 });
+        assert!(matches!(outcome, DispatchOutcome::Scheduled));
+        assert!(!done.load(Ordering::SeqCst), "the listener has not run yet");
+        assert_eq!(registry.len(), 1, "the detached handle registered");
+
+        // Await the listener's completion signal: the host IS mutated AFTER the run.
+        signal.notified().await;
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(host.total.load(Ordering::SeqCst), 9, "the detached listener mutated the host");
+
+        // The drain reactively joins the (now-complete) detached task.
+        registry.drain_all().await;
+        assert!(registry.is_empty());
     }
 }

@@ -23,9 +23,51 @@
 use std::sync::Arc;
 
 use leaf_core::{
-    ChainKey, ContractId, CxDecorator, CxFutureExt, DispatchInterceptor, DispatchOutcome,
-    ErasedEvent, ListenerNext, ListenerSeq, OrderKey, OrderSource, RoleTier, ASYNC_DISPATCH_ORDER,
+    detached_dispatch_body, ChainKey, ContractId, CxDecorator, CxFutureExt, DetachedTaskRegistry,
+    DispatchErrorMode, DispatchInterceptor, DispatchOutcome, DropPolicy, ErasedEvent, ListenerEntry,
+    ListenerNext, ListenerSeq, OrderKey, OrderSource, RoleTier, Spawner, ASYNC_DISPATCH_ORDER,
 };
+
+/// TRUE fire-and-forget `@Async` event dispatch — the OWNING detached seam.
+///
+/// This is the multicaster/`EventPublisher`-layer seam the borrowed
+/// [`DispatchInterceptor::intercept`] (`BoxFuture<'a>` over a `&ErasedEvent`) could
+/// NOT host: the event + listener set are already snapshotted into owned `'static`
+/// values by the caller, so a `'static` detached task is spawnable here.
+///
+/// The steps (matching the [`DispatchOutcome::Scheduled`] contract):
+/// 1. Capture the ambient `Cx` via `decorator` ON THE CALLER'S TASK (so the bundle
+///    bound in the caller's `Cx` region is the one propagated).
+/// 2. Build the owning `'static` dispatch body
+///    ([`detached_dispatch_body`], chaining forced off) and `.scoped(cx)` it so the
+///    listener fan-out observes the captured `Cx` across the work-stealing spawn
+///    hop (the [`ambient_cx_propagates_across_a_spawn_hop`] property, via events).
+/// 3. `spawner.spawn(..).with_policy(Detach).detach()` the body (fire-and-forget),
+///    REGISTERING the handle in `registry` so clean shutdown can drain it.
+/// 4. Return [`DispatchOutcome::Scheduled`] WITHOUT awaiting — the caller returns
+///    immediately while the listeners run detached.
+///
+/// [`ambient_cx_propagates_across_a_spawn_hop`]: crate
+pub fn detached_dispatch(
+    spawner: &dyn Spawner,
+    decorator: &dyn CxDecorator,
+    registry: &DetachedTaskRegistry,
+    ev: ErasedEvent,
+    entries: Vec<ListenerEntry>,
+    mode: DispatchErrorMode,
+) -> DispatchOutcome {
+    // (1) Capture the ambient bundle ON THE CALLER'S TASK (before the spawn hop).
+    let cx = decorator.capture();
+    // (2) The owning 'static body (chains forced off), scoped to the captured Cx so
+    // the detached fan-out sees the ambient bundle across the work-stealing hop.
+    let body = detached_dispatch_body(ev, entries, mode).scoped(cx);
+    // (3) Spawn DETACHED and REGISTER the handle for the shutdown drain (an
+    // unregistered detach would escape the drain — a contract violation).
+    let handle = spawner.spawn(Box::pin(body)).with_policy(DropPolicy::Detach);
+    registry.register(handle);
+    // (4) Return immediately; the listeners run on the detached task.
+    DispatchOutcome::Scheduled
+}
 
 /// The default [`CxDecorator`]: capture the whole ambient bundle (a real,
 /// Inherit-filtering decorator can refine this). Used when no explicit decorator
@@ -171,6 +213,106 @@ mod tests {
             futures::executor::block_on(probe.scoped(Cx::current_or_empty()))
         });
         assert_eq!(observed.as_deref(), Some("nl-NL"));
+    }
+
+    // ── true fire-and-forget @Async dispatch (the detached seam) ──────────────
+
+    struct ReqKey;
+    impl CxKey for ReqKey {
+        type Value = String;
+        const NAME: &'static str = "request.id";
+        const POLICY: Propagation = Propagation::Inherit;
+    }
+
+    // The keystone composite: enter a Cx region, dispatch a SLOW listener through
+    // the detached fire-and-forget seam, and prove (a) the caller observes
+    // `Scheduled` IMMEDIATELY — the slow listener's flag is still UNSET at return —
+    // and (b) the listener body, on a multi-thread runtime spawn, observes the
+    // captured ambient Cx via `Cx::current` (the ambient-Cx-across-a-spawn-hop
+    // property reproduced through the events path).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_dispatch_returns_scheduled_before_a_slow_listener_finishes() {
+        use leaf_core::{
+            DetachedTaskRegistry, DispatchErrorMode, ErasedBean, ListenerEntry, ListenerOutcome,
+            OrderKey,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let _ = crate::install_ambient_store();
+
+        // A host that flips a flag AFTER a delay, recording the Cx it observed.
+        struct SlowHost {
+            done: Arc<AtomicBool>,
+            seen_cx: Arc<std::sync::Mutex<Option<String>>>,
+            started: Arc<tokio::sync::Notify>,
+        }
+        impl leaf_core::Bean for SlowHost {}
+
+        fn slow_adapter<'a>(
+            host: ErasedBean,
+            _event: &'a (dyn std::any::Any + Send + Sync),
+        ) -> leaf_core::BoxFuture<'a, Result<ListenerOutcome, leaf_core::LeafError>> {
+            Box::pin(async move {
+                let host = host.downcast::<SlowHost>().expect("SlowHost");
+                // Observe the ambient Cx that rode the spawn hop (forced re-polls).
+                host.started.notify_one();
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                let seen = Cx::current().and_then(|c| c.get::<ReqKey>().cloned());
+                *host.seen_cx.lock().unwrap() = seen;
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                host.done.store(true, Ordering::SeqCst);
+                Ok(ListenerOutcome::None)
+            })
+        }
+
+        let done = Arc::new(AtomicBool::new(false));
+        let seen_cx = Arc::new(std::sync::Mutex::new(None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let host = Arc::new(SlowHost {
+            done: Arc::clone(&done),
+            seen_cx: Arc::clone(&seen_cx),
+            started: Arc::clone(&started),
+        });
+
+        let facility = crate::TokioExecutionFacility::new();
+        let decorator = CaptureCurrentCx;
+        let registry = DetachedTaskRegistry::new();
+
+        // Snapshot the owned-into-'static event + listener-set (chains forced off).
+        let cx = Cx::empty().with::<ReqKey>("req-async".to_string());
+        let outcome = cx.enter(|| {
+            let ev = ErasedEvent::new(7u32, origin());
+            let entries = vec![ListenerEntry::new(
+                Arc::clone(&host) as ErasedBean,
+                slow_adapter,
+                OrderKey::implicit(),
+                // chains=false for the detached path.
+                false,
+            )];
+            super::detached_dispatch(
+                &facility,
+                &decorator,
+                &registry,
+                ev,
+                entries,
+                DispatchErrorMode::AbortAndPropagate,
+            )
+        });
+
+        // (a) The caller sees Scheduled, and the slow listener has NOT finished.
+        assert!(matches!(outcome, DispatchOutcome::Scheduled));
+        assert!(!done.load(Ordering::SeqCst), "the listener must not have finished at return");
+        assert_eq!(registry.len(), 1, "the detached handle is registered for the drain");
+
+        // The detached task ran on the executor; drain it and assert it completed.
+        started.notified().await;
+        registry.drain_all().await;
+        assert!(done.load(Ordering::SeqCst), "the detached listener completed");
+        // (b) the listener observed the captured ambient Cx across the spawn hop.
+        assert_eq!(seen_cx.lock().unwrap().as_deref(), Some("req-async"));
     }
 
     #[test]

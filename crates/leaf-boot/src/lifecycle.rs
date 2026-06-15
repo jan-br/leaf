@@ -54,13 +54,15 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use leaf_core::{
-    cmp_chain, AdvisorDescriptor, AvailabilityHandle, BeanId, ChainKey, CloseReason, Closed, Context,
-    DispatchErrorMode, DispatchInterceptor, Engine, Env, EnvBuilder, ErrorKind, InjectionPlan,
-    LeafError, LifecyclePlan, ListenerDescriptor, LivenessState, Multiplicity, OrderKey,
-    ReadinessState, Refreshed, Registry, RegistryBuilder, ResolveCtx, Role, RoleTier, RunState,
-    RunStateReceiver, RunStateSender, SchedulerCore, ShutdownSettings, Spawner, Started,
-    StartupFailed, TeardownOutcome,
+    cmp_chain, AdvisorDescriptor, AvailabilityHandle, BeanId, BoxFuture, ChainKey, CloseReason,
+    Closed, Context, Cx, CxDecorator, DetachedTaskRegistry, DispatchErrorMode, DispatchInterceptor,
+    Engine, Env, EnvBuilder, ErrorKind, InjectionPlan, LeafError, LifecyclePlan, ListenerDescriptor,
+    LivenessState, Multiplicity, OrderKey, ReadinessState, Refreshed, Registry, RegistryBuilder,
+    ResolveCtx, Role, RoleTier, RunState, RunStateReceiver, RunStateSender, SchedulerCore,
+    ShutdownSettings, Spawner, Started, StartupFailed, TeardownOutcome,
 };
 
 use crate::events::EventPublisher;
@@ -76,6 +78,29 @@ type PlanResolver = Arc<dyn Fn(BeanId) -> LifecyclePlan + Send + Sync>;
 /// A per-bean [`InjectionPlan`] resolver ([`order_batch`]'s construction-edge
 /// source).
 type InjectionResolver = Arc<dyn Fn(BeanId) -> InjectionPlan + Send + Sync>;
+
+/// The reactive deadline-sleep seam the teardown drain races the in-flight
+/// detached async-event tasks against (a runtime-supplied `sleep(d)` future).
+///
+/// A closure (NOT a new trait dependency) so leaf-boot stays runtime-agnostic: the
+/// tokio boot wires `tokio::time::sleep`; an absent sleeper => an UNBOUNDED clean
+/// drain (the grace budget is honored as an upper bound only when a sleeper backs
+/// it). The future is reactive (parks on a timer) — NEVER a busy-poll.
+type DrainSleeper = Arc<dyn Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// The runtime-agnostic default events [`CxDecorator`]: snapshot the whole ambient
+/// bundle (`Cx::current_or_empty`) at submit time so a detached fire-and-forget
+/// async-event listener inherits the publisher's ambient `Cx`. Whether it actually
+/// rides a work-stealing hop depends on the installed ambient store (the tokio
+/// task-local backing); the capture itself is runtime-free.
+#[derive(Default)]
+struct CaptureCurrentCx;
+
+impl CxDecorator for CaptureCurrentCx {
+    fn capture(&self) -> Cx {
+        Cx::current_or_empty()
+    }
+}
 
 // ─────────────────────────── ShutdownReport ─────────────────────────────────
 
@@ -147,8 +172,21 @@ pub struct RunUnit {
     /// The live auto-proxy table, built at refresh R4 (`None` pre-refresh).
     proxies: Option<InstalledProxies>,
     /// The bootstrap [`Spawner`] (R2 facility) — HARD required at refresh if any
-    /// bean is `Bootstrap::Background`.
+    /// bean is `Bootstrap::Background`. ALSO the `Spawner` the R3 detached
+    /// fire-and-forget async-event seam spawns onto.
     spawner: Option<Arc<dyn Spawner>>,
+    /// The events [`CxDecorator`] the R3 async-dispatch seam captures the ambient
+    /// `Cx` with (propagated onto each detached fire-and-forget spawn). Defaults to
+    /// the whole-bundle [`CaptureCurrentCx`].
+    cx_decorator: Option<Arc<dyn CxDecorator>>,
+    /// The per-app drain registry for detached fire-and-forget async-event tasks
+    /// (the `DispatchOutcome::Scheduled` path). Owned HERE (per-app, NEVER a
+    /// process global) so [`shutdown`](RunUnit::shutdown) step (2) reactively
+    /// drains the in-flight detached tasks under the grace budget.
+    detached_registry: Arc<DetachedTaskRegistry>,
+    /// The reactive deadline-sleep seam the teardown drain races against (the
+    /// runtime-supplied `sleep`). `None` => an unbounded clean drain.
+    drain_sleeper: Option<DrainSleeper>,
     /// The two availability watch cells (`Liveness`/`Readiness`).
     availability: AvailabilityHandle,
     /// The ONE `watch<RunState>` cell publisher (the single RunState owner).
@@ -201,6 +239,9 @@ impl RunUnit {
             publisher: None,
             proxies: None,
             spawner: None,
+            cx_decorator: None,
+            detached_registry: Arc::new(DetachedTaskRegistry::new()),
+            drain_sleeper: None,
             availability: AvailabilityHandle::new(),
             run_state_tx: tx,
             run_state_rx: rx,
@@ -327,11 +368,40 @@ impl RunUnit {
     }
 
     /// Install the bootstrap [`Spawner`] (the R2 execution facility used for the
-    /// `Bootstrap::Background` eager lane).
+    /// `Bootstrap::Background` eager lane AND the R3 detached fire-and-forget
+    /// async-event seam).
     #[must_use]
     pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
         self.spawner = Some(spawner);
         self
+    }
+
+    /// Install the events [`CxDecorator`] the R3 async-dispatch seam captures the
+    /// ambient `Cx` with (propagated onto each detached fire-and-forget spawn).
+    #[must_use]
+    pub fn with_cx_decorator(mut self, decorator: Arc<dyn CxDecorator>) -> Self {
+        self.cx_decorator = Some(decorator);
+        self
+    }
+
+    /// Install the reactive deadline-sleep seam the teardown drain races the
+    /// in-flight detached async-event tasks against (the runtime-supplied `sleep`).
+    /// Absent => an unbounded clean drain of the detached tasks at shutdown.
+    #[must_use]
+    pub fn with_drain_sleeper(
+        mut self,
+        sleeper: impl Fn(Duration) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        self.drain_sleeper = Some(Arc::new(sleeper));
+        self
+    }
+
+    /// The per-app detached-task drain registry (the `DispatchOutcome::Scheduled`
+    /// async-event path) — the same registry the R3 publisher's detached spawns
+    /// register into and [`shutdown`](RunUnit::shutdown) drains.
+    #[must_use]
+    pub fn detached_registry(&self) -> &Arc<DetachedTaskRegistry> {
+        &self.detached_registry
     }
 
     /// Install the shutdown drain budgets (`[C1/C7]`).
@@ -437,7 +507,7 @@ impl RunUnit {
         // no-op; the listener channels bind to the live host beans published at R5).
         let listeners = std::mem::take(&mut self.listeners);
         let chain = std::mem::take(&mut self.dispatch_chain);
-        let publisher = EventPublisher::install(
+        let mut publisher = EventPublisher::install(
             self.context().engine(),
             &listeners,
             chain,
@@ -445,6 +515,22 @@ impl RunUnit {
             container_id(),
         )
         .await?;
+        // Wire the OWNING true fire-and-forget @Async seam onto the publisher iff a
+        // Spawner is present (the R2 facility): the detached fan-out spawns onto it,
+        // captures the ambient Cx via the decorator (default whole-bundle capture),
+        // and registers each detached handle into the per-app drain registry that
+        // shutdown step (2) drains.
+        if let Some(spawner) = self.spawner.as_ref() {
+            let decorator: Arc<dyn CxDecorator> = self
+                .cx_decorator
+                .clone()
+                .unwrap_or_else(|| Arc::new(CaptureCurrentCx));
+            publisher = publisher.with_async_dispatch(
+                Arc::clone(spawner),
+                decorator,
+                Arc::clone(&self.detached_registry),
+            );
+        }
         self.publisher = Some(publisher);
 
         // ── R4: the auto-proxy after_init install (ProxyPlan O(1) lookup → resolve
@@ -576,11 +662,21 @@ impl RunUnit {
         }
         self.transition(RunState::Stopping);
 
-        // (2) the C7 in-flight-request DRAIN under the two budgets. No
-        // RequestScopeRegistry is bound in this unit, so the bounded body-drain
-        // and the per-request finalize-grace ledger drain are no-ops over an
-        // already-quiesced set; the budgets are honored as upper bounds.
-        let _ = self.shutdown_settings;
+        // (2) the C7 in-flight-request DRAIN under the two budgets. REACTIVELY
+        // drain the in-flight DETACHED fire-and-forget async-event tasks (the
+        // `DispatchOutcome::Scheduled` path) via the per-app drain registry: race
+        // the held handles against the `grace` budget (a runtime-supplied reactive
+        // sleep — NO busy-poll), then ABORT whatever is still in flight past the
+        // deadline. (No RequestScopeRegistry is bound in this unit, so the
+        // per-request finalize-grace ledger drain is a no-op over a quiesced set.)
+        {
+            let deadline = self
+                .shutdown_settings
+                .grace
+                .as_duration()
+                .and_then(|d| self.drain_sleeper.as_ref().map(|sleep| sleep(d)));
+            let _drained = self.detached_registry.drain_with_deadline(deadline).await;
+        }
 
         // (3) publish Closed{reason} (IsolateEach — a listener fault never aborts).
         if let Some(publisher) = self.publisher.as_ref() {
@@ -739,9 +835,9 @@ mod tests {
     use std::sync::Mutex;
 
     use leaf_core::{
-        AnnotationMetadata, Bean, BoxFuture, CallbackError, ContractId, Cx, Descriptor, JoinError,
-        JoinSeam, LifecycleFn, LifecyclePhase, LifecycleStep, Origin, Provider, Published, Ref,
-        ScopeDef, StepId,
+        AnnotationMetadata, Bean, BoxFuture, CallbackError, ContractId, Cx, Descriptor,
+        DispatchOutcome, JoinError, JoinSeam, LifecycleFn, LifecyclePhase, LifecycleStep, Origin,
+        Provider, Published, Ref, ScopeDef, StepId,
     };
 
     fn block<F: std::future::Future>(f: F) -> F::Output {
@@ -1193,6 +1289,178 @@ mod tests {
         assert_eq!(report.run_state, RunState::Closed);
         // Teardown step 1 disarms FIRST.
         assert_eq!(*scheduler.armed.lock().unwrap(), vec!["arm", "disarm"]);
+    }
+
+    // ── true fire-and-forget @Async event dispatch (the detached seam) ─────────
+
+    // A test event + an async host whose listener mutates a total + signals done.
+    #[derive(Debug)]
+    struct AsyncEv {
+        n: i64,
+    }
+    #[derive(Debug)]
+    struct AsyncHost {
+        total: std::sync::atomic::AtomicI64,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        signal: Arc<tokio::sync::Notify>,
+        // When set, the listener parks forever (the "hung task" drain case).
+        hang: bool,
+    }
+    impl Bean for AsyncHost {}
+
+    struct AsyncHostProv {
+        desc: Descriptor,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        signal: Arc<tokio::sync::Notify>,
+        hang: bool,
+    }
+    impl Provider for AsyncHostProv {
+        fn descriptor(&self) -> &Descriptor {
+            &self.desc
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            let done = Arc::clone(&self.done);
+            let signal = Arc::clone(&self.signal);
+            let hang = self.hang;
+            Box::pin(async move {
+                Ok(Published::shared_value(AsyncHost {
+                    total: std::sync::atomic::AtomicI64::new(0),
+                    done,
+                    signal,
+                    hang,
+                }))
+            })
+        }
+    }
+
+    fn async_host_adapter<'a>(
+        host: leaf_core::ErasedBean,
+        event: &'a (dyn Any + Send + Sync),
+    ) -> BoxFuture<'a, Result<leaf_core::ListenerOutcome, LeafError>> {
+        Box::pin(async move {
+            let h = host.downcast::<AsyncHost>().expect("AsyncHost");
+            let e = event.downcast_ref::<AsyncEv>().expect("AsyncEv");
+            tokio::task::yield_now().await;
+            if h.hang {
+                // Park forever: only a shutdown abort frees this detached task.
+                std::future::pending::<()>().await;
+            }
+            h.total.fetch_add(e.n, Ordering::SeqCst);
+            h.done.store(true, Ordering::SeqCst);
+            h.signal.notify_one();
+            Ok(leaf_core::ListenerOutcome::None)
+        })
+    }
+
+    fn async_host_unit(
+        hang: bool,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        signal: Arc<tokio::sync::Notify>,
+    ) -> RunUnit {
+        let d = desc("asyncHost", "t::AsyncHost", TypeId::of::<AsyncHost>());
+        let mut builder = RegistryBuilder::new();
+        builder
+            .register(d, Arc::new(AsyncHostProv { desc: d, done, signal, hang }))
+            .unwrap();
+        let listener = ListenerDescriptor {
+            host: ContractId::of("t::AsyncHost"),
+            event_type: TypeId::of::<AsyncEv>(),
+            supports: None,
+            order: OrderKey::implicit(),
+            condition: None,
+            // chains=false: the async/spawn-dispatched listener.
+            chains: false,
+            adapter: async_host_adapter,
+        };
+        RunUnit::from_builder(builder)
+            .unwrap()
+            .with_listeners(vec![listener])
+            .with_spawner(Arc::new(leaf_tokio::TokioExecutionFacility::new()))
+    }
+
+    // R3 wires the async-dispatch seam; publish_detached returns Scheduled and the
+    // host is mutated AFTER the detached task runs (await the completion signal).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_wires_async_dispatch_and_publish_detached_runs_the_listener() {
+        let _ = leaf_tokio::install_ambient_store();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let unit = async_host_unit(false, Arc::clone(&done), Arc::clone(&signal))
+            .refresh()
+            .await
+            .expect("refresh wires async dispatch");
+
+        let publisher = unit.publisher().expect("publisher live");
+        let outcome = publisher.publish_detached(AsyncEv { n: 5 });
+        assert!(matches!(outcome, DispatchOutcome::Scheduled));
+        assert!(!done.load(Ordering::SeqCst), "the detached listener has not run yet");
+        assert_eq!(unit.detached_registry().len(), 1, "the handle registered for the drain");
+
+        signal.notified().await;
+        let host = unit.context().get::<AsyncHost>().await.unwrap();
+        assert_eq!(host.total.load(Ordering::SeqCst), 5, "the detached listener mutated the host");
+    }
+
+    // Clean shutdown REACTIVELY drains an in-flight detached async-event task: the
+    // task completes during the drain (RunState reaches Closed, registry emptied).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_an_in_flight_detached_async_event_task() {
+        let _ = leaf_tokio::install_ambient_store();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let unit = async_host_unit(false, Arc::clone(&done), Arc::clone(&signal))
+            .refresh()
+            .await
+            .expect("refresh");
+
+        // Schedule an in-flight detached listener, then shut down. The clean drain
+        // (no deadline fires) awaits it to completion.
+        let _ = unit.publisher().unwrap().publish_detached(AsyncEv { n: 3 });
+        assert_eq!(unit.detached_registry().len(), 1);
+
+        let report = unit.shutdown().await;
+        assert_eq!(report.run_state, RunState::Closed);
+        // The drain reactively completed the detached task before close.
+        assert!(done.load(Ordering::SeqCst), "the in-flight detached task drained on clean shutdown");
+        assert!(unit.detached_registry().is_empty(), "the registry drained empty");
+    }
+
+    // A HUNG detached async-event task is ABORTED past the deadline: with a real
+    // (short) grace budget + a tokio reactive sleeper, the drain races and aborts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_aborts_a_hung_detached_async_event_task_past_the_deadline() {
+        use leaf_core::{Deadline, ShutdownSettings};
+        let _ = leaf_tokio::install_ambient_store();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        // hang=true: the listener parks forever; only an abort frees it.
+        let unit = async_host_unit(true, Arc::clone(&done), Arc::clone(&signal))
+            .with_shutdown_settings(ShutdownSettings {
+                grace: Deadline::After(Duration::from_millis(50)),
+                finalize_grace: Deadline::Indefinite,
+            })
+            .with_drain_sleeper(|d| Box::pin(tokio::time::sleep(d)))
+            .refresh()
+            .await
+            .expect("refresh");
+
+        let _ = unit.publisher().unwrap().publish_detached(AsyncEv { n: 1 });
+        assert_eq!(unit.detached_registry().len(), 1);
+
+        // The drain races the hung task against the 50ms grace; the deadline fires
+        // and the task is aborted. Shutdown still reaches Closed promptly.
+        let start = std::time::Instant::now();
+        let report = unit.shutdown().await;
+        let elapsed = start.elapsed();
+        assert_eq!(report.run_state, RunState::Closed);
+        assert!(!done.load(Ordering::SeqCst), "the hung listener never completed");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown aborted the hung task past the deadline (elapsed {elapsed:?}), not hung"
+        );
     }
 
     // ── R6: a scheduled task with NO scheduler HARD-FAILS at R2 ──

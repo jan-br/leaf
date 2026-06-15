@@ -66,7 +66,7 @@ leaf_core::declare_source!("leaf-tokio");
 
 pub use ambient::TokioAmbient;
 pub use availability::availability;
-pub use dispatch::{AsyncDispatchInterceptor, CaptureCurrentCx};
+pub use dispatch::{detached_dispatch, AsyncDispatchInterceptor, CaptureCurrentCx};
 pub use exec::{
     TokioExecutionFacility, TokioExecutionFacilityProvider, APPLICATION_TASK_EXECUTOR,
     APPLICATION_TASK_EXECUTOR_CONTRACT, APPLICATION_TASK_EXECUTOR_DESCRIPTOR,

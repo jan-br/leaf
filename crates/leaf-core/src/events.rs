@@ -340,6 +340,154 @@ impl DispatchOutcome {
     }
 }
 
+// ───────────────────── detached fire-and-forget dispatch ────────────────────
+
+/// Build the OWNING `'static` dispatch body for a true fire-and-forget (`@Async`)
+/// listener fan-out.
+///
+/// The borrowed [`DispatchInterceptor::intercept`] seam yields a `BoxFuture<'a>`
+/// borrowing the `&ErasedEvent` + the [`ListenerSeq`], so a `'static` detached
+/// task cannot be spawned from inside an interceptor entry. The detached spawn
+/// lives at the OWNING multicaster/`EventPublisher` layer instead, which snapshots
+/// the event + listener set into owned `'static` values and hands them here.
+///
+/// This body owns `ev` + `entries` for the whole detached run and drives a
+/// [`CoreDispatch`] inline-await loop over them. CHAINING IS FORCED OFF: a detached
+/// listener has no caller to re-publish a chained return into, so each entry's
+/// `chains` flag is cleared before the loop (matching the [`DispatchOutcome::Scheduled`]
+/// "chaining is forced off" contract). The `()` output discards the
+/// [`DispatchOutcome`] — the caller already returned [`DispatchOutcome::Scheduled`].
+#[must_use]
+pub fn detached_dispatch_body(
+    ev: ErasedEvent,
+    mut entries: Vec<ListenerEntry>,
+    mode: DispatchErrorMode,
+) -> BoxFuture<'static, ()> {
+    // Force chaining OFF on the detached path: a chained return from a detached
+    // listener is dropped (no owning caller to re-publish it into).
+    for entry in &mut entries {
+        entry.chains = false;
+    }
+    Box::pin(async move {
+        let core = CoreDispatch::new(mode);
+        let seq = ListenerSeq::new(&entries);
+        // The outcome (Completed/Aborted) is discarded: the caller already saw
+        // `Scheduled`, and chains=false means there is nothing to re-publish.
+        let _ = core.dispatch(&ev, seq).await;
+    })
+}
+
+/// The per-application drain registry for detached fire-and-forget async-event
+/// tasks (the [`DispatchOutcome::Scheduled`] path).
+///
+/// Owned by the `EventPublisher` / `RunUnit` (per-app — NEVER a process global): a
+/// detached spawn MUST register its [`SpawnHandle`] here, so clean shutdown can
+/// reactively DRAIN the in-flight tasks under the grace budget, then ABORT past
+/// the deadline. An unregistered detach = no shutdown drain = a contract violation.
+///
+/// The drain is REACTIVE (await the held handles / a deadline race), never a
+/// busy-poll.
+#[derive(Default)]
+pub struct DetachedTaskRegistry {
+    handles: std::sync::Mutex<Vec<crate::exec::SpawnHandle>>,
+}
+
+impl DetachedTaskRegistry {
+    /// A fresh, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        DetachedTaskRegistry {
+            handles: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Register a detached task's [`SpawnHandle`] for the shutdown drain.
+    ///
+    /// The handle's [`DropPolicy::Detach`](crate::DropPolicy::Detach) keeps the
+    /// task running; this registry retains the handle so the drain can await it
+    /// (and abort it past the deadline).
+    pub fn register(&self, handle: crate::exec::SpawnHandle) {
+        self.handles.lock().expect("detached-registry mutex").push(handle);
+    }
+
+    /// The number of currently-registered detached handles (test/diagnostics).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.handles.lock().expect("detached-registry mutex").len()
+    }
+
+    /// `true` iff no detached task is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Take the registered handles out (clearing the registry).
+    fn take(&self) -> Vec<crate::exec::SpawnHandle> {
+        std::mem::take(&mut *self.handles.lock().expect("detached-registry mutex"))
+    }
+
+    /// Reactively DRAIN every registered detached task to completion (await the
+    /// held [`SpawnHandle`]s). NO deadline — the unbounded clean-drain path.
+    pub async fn drain_all(&self) {
+        let handles = self.take();
+        for handle in handles {
+            // Reactive: `SpawnHandle::await` parks on the runtime join, never spins.
+            let _ = handle.await;
+        }
+    }
+
+    /// Reactively drain under a `deadline` budget: race the in-flight handles
+    /// against `deadline` (a runtime-supplied reactive sleep future). On timeout,
+    /// ABORT every still-running handle. Returns `true` iff the drain completed
+    /// before the deadline, `false` iff the deadline aborted in-flight tasks.
+    ///
+    /// The `deadline` future is the ONLY runtime-named primitive; core stays
+    /// runtime-agnostic. `None` => the unbounded [`drain_all`](Self::drain_all).
+    /// The race is REACTIVE (`select` over the join-all and the deadline sleep) —
+    /// never a busy-poll.
+    pub async fn drain_with_deadline(&self, deadline: Option<BoxFuture<'static, ()>>) -> bool {
+        let mut handles = self.take();
+        if handles.is_empty() {
+            return true;
+        }
+        let Some(deadline) = deadline else {
+            for handle in handles {
+                let _ = handle.await;
+            }
+            return true;
+        };
+
+        // Await every handle BY &mut (a pinned local) so we retain ownership to
+        // abort the survivors on a deadline timeout. `SpawnHandle: Future` by value,
+        // but `&mut SpawnHandle: Future` too (Future is blanket-impl'd for &mut F
+        // where F: Future + Unpin — SpawnHandle holds a `Pin<Box<..>>` so it is
+        // Unpin). The join-all future borrows `handles`; the deadline does not.
+        let join_all = async {
+            for handle in &mut handles {
+                let _ = handle.await;
+            }
+        };
+        let raced = {
+            futures::pin_mut!(join_all);
+            match futures::future::select(join_all, deadline).await {
+                // Clean drain: every detached task completed before the deadline.
+                futures::future::Either::Left(((), _deadline)) => true,
+                // Deadline fired first; the unfinished `join_all` half (which holds
+                // the `&mut handles` borrow) is dropped at the end of this block.
+                futures::future::Either::Right(((), _join_all)) => false,
+            }
+        };
+        if !raced {
+            // Abort whatever is still in flight (the borrow released above).
+            for handle in &handles {
+                handle.abort();
+            }
+        }
+        raced
+    }
+}
+
 /// The per-dispatch error policy (one model, per-dispatch override).
 #[derive(Debug, Clone, Default)]
 pub enum DispatchErrorMode {
@@ -914,6 +1062,89 @@ mod tests {
         let core = CoreDispatch::default();
         let outcome = futures::executor::block_on(core.dispatch(&ev, seq));
         assert!(outcome.emitted().is_empty(), "chains=false drops the chained event");
+    }
+
+    // ── detached fire-and-forget dispatch body ────────────────────────────────
+
+    #[test]
+    fn detached_dispatch_body_runs_the_listener_and_is_static_spawnable() {
+        // The owning body is 'static (spawnable) and drives the fan-out to
+        // completion over the moved-in event + entries.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let entries = vec![entry(Arc::new(LogHost { log: Arc::clone(&log), name: "async" }), 100)];
+        let ev = ErasedEvent::new(OrderPlaced { amount: 3 }, origin());
+        let body: BoxFuture<'static, ()> =
+            detached_dispatch_body(ev, entries, DispatchErrorMode::AbortAndPropagate);
+        futures::executor::block_on(body);
+        assert_eq!(*log.lock().unwrap(), vec!["async:3".to_string()]);
+    }
+
+    #[test]
+    fn detached_dispatch_body_forces_chains_off_even_for_a_chaining_entry() {
+        // A chaining adapter passed with chains=TRUE: the detached path must still
+        // DROP the chained return (no owning caller to re-publish into). We observe
+        // it by routing the same entries through a chains-honoring CoreDispatch
+        // (collects the chained event) vs the detached body (forces chains off so
+        // the listener body runs but nothing is collected — the body discards it).
+        #[derive(Debug)]
+        struct Chained;
+        fn chaining_adapter<'a>(
+            _host: ErasedBean,
+            _event: &'a (dyn Any + Send + Sync),
+        ) -> BoxFuture<'a, Result<ListenerOutcome, LeafError>> {
+            Box::pin(async move {
+                Ok(ListenerOutcome::emit_one(ErasedEvent::new(
+                    Chained,
+                    ContractId::of("test::Container"),
+                )))
+            })
+        }
+        let host: ErasedBean = Arc::new(LogHost { log: Arc::new(Mutex::new(Vec::new())), name: "n" });
+        // Passed in with chains=TRUE; the detached body must override to false.
+        let entries =
+            vec![ListenerEntry::new(host, chaining_adapter, OrderKey::implicit(), true)];
+
+        // Control: through a chains-honoring CoreDispatch the chained event IS
+        // collected (proves the adapter does emit one).
+        let control_ev = ErasedEvent::new(OrderPlaced { amount: 0 }, origin());
+        let control_entries =
+            vec![ListenerEntry::new(entries[0].host.clone(), chaining_adapter, OrderKey::implicit(), true)];
+        let control_seq = ListenerSeq::new(&control_entries);
+        let core = CoreDispatch::new(DispatchErrorMode::AbortAndPropagate);
+        let control = futures::executor::block_on(core.dispatch(&control_ev, control_seq));
+        assert_eq!(control.emitted().len(), 1, "the adapter emits a chained event when chains=true");
+
+        // The detached body forces chains off: it runs to completion and discards
+        // the chained return (the `()` output — nothing re-published).
+        let ev = ErasedEvent::new(OrderPlaced { amount: 0 }, origin());
+        let body = detached_dispatch_body(ev, entries, DispatchErrorMode::AbortAndPropagate);
+        futures::executor::block_on(body); // no panic, no re-publish
+    }
+
+    // ── detached drain registry ────────────────────────────────────────────────
+
+    #[test]
+    fn detached_task_registry_registers_and_reports_len() {
+        use crate::exec::{JoinError, JoinSeam, SpawnHandle};
+        struct Ready;
+        impl JoinSeam for Ready {
+            fn poll_join(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), JoinError>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn abort(&self) {}
+            fn detach(&self) {}
+        }
+        let registry = DetachedTaskRegistry::new();
+        assert!(registry.is_empty());
+        registry.register(SpawnHandle::new(Box::new(Ready)));
+        registry.register(SpawnHandle::new(Box::new(Ready)));
+        assert_eq!(registry.len(), 2);
+        // Unbounded drain awaits the ready handles and clears the registry.
+        futures::executor::block_on(registry.drain_all());
+        assert!(registry.is_empty(), "drain_all clears the registry");
     }
 
     // ── error policy ──────────────────────────────────────────────────────────

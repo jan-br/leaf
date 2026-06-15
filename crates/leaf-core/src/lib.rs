@@ -345,12 +345,12 @@ pub use proxy::{
 //   (`AvailabilityHandle` + `LivenessState`/`ReadinessState`).
 
 pub use events::{
-    sort_listener_entries, ApplicationListener, AvailabilityChanged, AvailabilityHandle,
-    AvailabilityKind, AvailabilityState, CloseReason, Closed, ContainerId, CoreDispatch,
-    DispatchErrorMode, DispatchInterceptor, DispatchOutcome, ErasedAdapterFn, ErasedEvent,
-    ListenerDescriptor, ListenerEntry, ListenerNext, ListenerOutcome, ListenerSeq, LivenessState,
-    Multicaster, PipelineMulticaster, ReadinessState, Refreshed, Started, StartupFailed, Stopped,
-    SupportsFn,
+    detached_dispatch_body, sort_listener_entries, ApplicationListener, AvailabilityChanged,
+    AvailabilityHandle, AvailabilityKind, AvailabilityState, CloseReason, Closed, ContainerId,
+    CoreDispatch, DetachedTaskRegistry, DispatchErrorMode, DispatchInterceptor, DispatchOutcome,
+    ErasedAdapterFn, ErasedEvent, ListenerDescriptor, ListenerEntry, ListenerNext, ListenerOutcome,
+    ListenerSeq, LivenessState, Multicaster, PipelineMulticaster, ReadinessState, Refreshed,
+    Started, StartupFailed, Stopped, SupportsFn,
 };
 
 // ── UNIT 11 — conditions algebra + expr/i18n/advice/bootstrap ABI ──
