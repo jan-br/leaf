@@ -416,7 +416,7 @@ impl InstalledProxies {
         let cx = ResolveCtx::for_engine(engine);
         // `Call.args` is the empty pack; the real args ride a take-once cell so the
         // owned-args `MethodEntry.invoke` thunk can consume them on the (single)
-        // innermost proceed (a non-replaying around advisor — the common path).
+        // innermost proceed (the common, non-replaying around-advisor path).
         let call = Call::new(
             method,
             BeanKey::ByContract(registry.descriptor(bean).contract),
@@ -425,12 +425,26 @@ impl InstalledProxies {
             &cx,
         );
         let invoke = entry.invoke;
+        // Whether the advised method takes NO arguments (the caller packed the empty
+        // `()` carrier). For a no-arg method the carrier is reconstructible
+        // (`ErasedArgs::none()`), so a REPLAYING advisor — the retry advisor, which
+        // re-`proceed`s a fresh attempt per the substrate's REPLAYABLE `Next` — can
+        // re-run the real method. An args-bearing erased carrier is NOT cloneable, so
+        // a re-proceed for such a method stays a loud `DowncastMismatch` (the
+        // documented v1 limitation: declarative retry of an args-bearing advised
+        // method needs a per-method args re-pack the macro would emit).
+        let no_args = args.type_id_of() == std::any::TypeId::of::<()>();
         let args_cell: std::sync::Mutex<Option<ErasedArgs>> = std::sync::Mutex::new(Some(args));
         let tail: Box<Tail> = Box::new(move |call: &Call<'_>| {
             // Re-resolve the singleton per proceed, then drive the macro-emitted
-            // downcast thunk over it with the take-once args.
+            // downcast thunk over it with the take-once args (re-supplying the empty
+            // carrier on a replay of a no-arg method).
             let resolved = call.source.get(call.cx);
-            let taken = args_cell.lock().expect("args cell").take();
+            let taken = args_cell
+                .lock()
+                .expect("args cell")
+                .take()
+                .or_else(|| no_args.then(ErasedArgs::none));
             Box::pin(async move {
                 let bean = resolved.await.map_err(AdviceError::TargetResolution)?;
                 let args = taken.ok_or(AdviceError::DowncastMismatch { method })?;

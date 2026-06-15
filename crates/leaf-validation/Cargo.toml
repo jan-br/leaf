@@ -6,3 +6,13 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+
+[dev-dependencies]
+# The integration test drives a REAL annotated bean through Application::run, so it
+# needs the boot run-engine + a concrete async facility + the attribute macros (the
+# component/advisable derives), plus futures for the unit-test block_on.
+leaf-boot.workspace = true
+leaf-tokio.workspace = true
+leaf-macros.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

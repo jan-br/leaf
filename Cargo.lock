@@ -222,7 +222,12 @@ dependencies = [
 name = "leaf-cache"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "leaf-boot",
  "leaf-core",
+ "leaf-macros",
+ "leaf-tokio",
+ "tokio",
 ]
 
 [[package]]
@@ -309,8 +314,13 @@ dependencies = [
 name = "leaf-resilience"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "leaf-boot",
  "leaf-core",
  "leaf-cron",
+ "leaf-macros",
+ "leaf-tokio",
+ "tokio",
 ]
 
 [[package]]
@@ -357,14 +367,24 @@ dependencies = [
 name = "leaf-tx"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "leaf-boot",
  "leaf-core",
+ "leaf-macros",
+ "leaf-tokio",
+ "tokio",
 ]
 
 [[package]]
 name = "leaf-validation"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "leaf-boot",
  "leaf-core",
+ "leaf-macros",
+ "leaf-tokio",
+ "tokio",
 ]
 
 [[package]]
