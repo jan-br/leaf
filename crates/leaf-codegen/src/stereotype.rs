@@ -398,6 +398,11 @@ pub fn bean_input(
     input.ctor = Some(syn::parse_str(&fn_ident).map_err(|e| EmitError {
         message: format!("`{fn_ident}` is not a callable factory path: {e}"),
     })?);
+    // The `#[bean]` free-fn params route through `Injectable` (trait dispatch): each
+    // param carries its VERBATIM type and the emitter derives the injection point +
+    // resolution from `<ParamTy as ::leaf_core::Injectable>::{RESOLVABLE, inject}` —
+    // never a name-stripped `Ref<…>` TypeId (the design's no-type-names rule).
+    input.inject_via_trait = true;
     Ok(input)
 }
 
@@ -416,8 +421,10 @@ pub fn emit_bean(
 
 /// Lower a factory function's typed parameters to constructor injection points. A
 /// `self` receiver is rejected (the config-method form is deferred); each typed
-/// parameter keys on its binding ident (or `_<index>`), stripping a `Ref<…>`
-/// handle wrapper to the injected bean type exactly like a struct field.
+/// parameter keys on its binding ident (or `_<index>`) and carries its VERBATIM type
+/// (e.g. `Ref<T>`) — NEVER a name-stripped inner type. Resolution is the
+/// [`Injectable`](leaf_core::Injectable) trait's job (`bean_input` sets
+/// `inject_via_trait`), exactly like a struct field.
 fn sig_to_deps(func: &ItemFn) -> Result<Vec<Dependency>, EmitError> {
     let mut deps = Vec::new();
     for (i, arg) in func.sig.inputs.iter().enumerate() {
@@ -441,28 +448,11 @@ fn sig_to_deps(func: &ItemFn) -> Result<Vec<Dependency>, EmitError> {
                     Pat::Ident(p) => p.ident.to_string(),
                     _ => format!("_{i}"),
                 };
-                deps.push(Dependency { name, ty: strip_ref(&pat_ty.ty) });
+                deps.push(Dependency { name, ty: (*pat_ty.ty).clone() });
             }
         }
     }
     Ok(deps)
-}
-
-/// The bean type a `#[bean]` free-fn PARAMETER of type `ty` injects: `Ref<T>` → `T`,
-/// any other type → itself. The LEGACY name-stripped lowering for the `#[bean]`
-/// free-fn path, which Task 6 migrates onto the [`Injectable`](leaf_core::Injectable)
-/// trait (deleting this remaining `seg.ident == "Ref"` check). The struct
-/// field-default path already routes through the trait (see [`fields_to_deps`]).
-fn strip_ref(ty: &Type) -> Type {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "Ref"
-        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return inner.clone();
-    }
-    ty.clone()
 }
 
 /// Lower a struct's fields to constructor injection points. Named fields key on the
@@ -917,9 +907,40 @@ mod tests {
         // decapitalize (an already-lowercase snake_case ident is unchanged).
         assert!(s.contains("::core::any::TypeId::of::<DataSource>()"), "got: {s}");
         assert!(s.contains(r#"Some("data_source")"#), "got: {s}");
-        // The ctor is the free factory fn; the collaborator strips its Ref wrapper.
+        // The ctor is the free factory fn; the collaborator resolves via the trait.
         assert!(s.contains("data_source(__dep_cfg)"), "got: {s}");
-        assert!(s.contains("__engine.get::<Config>().await?"), "got: {s}");
+    }
+
+    #[test]
+    fn bean_factory_fn_param_resolves_through_the_injectable_trait_not_a_name_strip() {
+        // Task 6: a `#[bean]` FREE-FN parameter routes through `Injectable` (trait
+        // dispatch), NOT a name-stripped `Config` TypeId. For `#[bean] fn
+        // data_source(cfg: Ref<Config>) -> DataSource` the injection point is built from
+        // `<Ref<Config> as Injectable>::RESOLVABLE` and the provider resolves via
+        // `<Ref<Config> as Injectable>::inject` — the emitted tokens reference
+        // `Injectable`, never the legacy `__engine.get::<Config>()` name-strip.
+        let input = bean_input(
+            &func("fn data_source(cfg: leaf_core::Ref<Config>) -> DataSource { todo!() }"),
+            None,
+            Scope::Singleton,
+        )
+        .expect("a @bean fn lowers");
+        // The param carries the VERBATIM type (no `Ref<…>` strip) + routes via the trait.
+        assert_eq!(input.deps.len(), 1);
+        assert!(input.inject_via_trait, "the @bean free-fn param routes through the trait");
+        let s = flat(&input);
+        assert!(
+            s.contains("<leaf_core::Ref<Config>as::leaf_core::Injectable>::RESOLVABLE"),
+            "the injection point derives from `<ParamTy as Injectable>::RESOLVABLE`: {s}"
+        );
+        assert!(
+            s.contains("<leaf_core::Ref<Config>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "the provider resolves via `<ParamTy as Injectable>::inject`: {s}"
+        );
+        // The name-stripped legacy path is GONE: no `__engine.get::<Config>()`, no
+        // `InjectionPoint::single(... Config ...)`.
+        assert!(!s.contains("__engine.get::<Config>"), "no name-stripped engine resolve: {s}");
+        assert!(!s.contains("InjectionPoint::single"), "no name-stripped point: {s}");
     }
 
     #[test]

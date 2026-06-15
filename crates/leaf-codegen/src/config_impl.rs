@@ -566,6 +566,13 @@ fn config_method_input(
         message: format!("`{method_ident}` is not a callable method ident: {e}"),
     })?);
     input.receiver_ty = Some(self_ty.clone());
+    // The `#[bean]` config-method params route through `Injectable` (trait dispatch):
+    // each param carries its VERBATIM type and the emitter derives the injection point
+    // + resolution from `<ParamTy as ::leaf_core::Injectable>::{RESOLVABLE, inject}` —
+    // never a name-stripped `Ref<…>` TypeId (the design's no-type-names rule). The
+    // config RECEIVER still resolves through the `Engine::get` seam (it is not an
+    // injection point).
+    input.inject_via_trait = true;
     Ok(input)
 }
 
@@ -636,7 +643,10 @@ fn bean_attr_args(
 
 /// Lower a `#[bean]` method's typed parameters to injection points, requiring a
 /// `self` receiver (the config instance). Each typed param keys on its binding ident
-/// (or `_<index>`), stripping a `Ref<…>` handle wrapper exactly like a struct field.
+/// (or `_<index>`) and carries its VERBATIM type (e.g. `Ref<T>`) — NEVER a
+/// name-stripped inner type. Resolution is the [`Injectable`](leaf_core::Injectable)
+/// trait's job (`config_method_input` sets `inject_via_trait`), exactly like a struct
+/// field.
 fn method_deps(method: &ImplItemFn, method_ident: &str) -> Result<Vec<Dependency>, EmitError> {
     let mut deps = Vec::new();
     let mut saw_receiver = false;
@@ -648,7 +658,7 @@ fn method_deps(method: &ImplItemFn, method_ident: &str) -> Result<Vec<Dependency
                     Pat::Ident(p) => p.ident.to_string(),
                     _ => format!("_{i}"),
                 };
-                deps.push(Dependency { name, ty: strip_ref(&pat_ty.ty) });
+                deps.push(Dependency { name, ty: (*pat_ty.ty).clone() });
             }
         }
     }
@@ -663,23 +673,6 @@ fn method_deps(method: &ImplItemFn, method_ident: &str) -> Result<Vec<Dependency
         });
     }
     Ok(deps)
-}
-
-/// The bean type a `#[bean]` config-method PARAMETER of type `ty` injects: `Ref<T>` →
-/// `T`, any other type → itself. The LEGACY name-stripped lowering for the `#[bean]`
-/// method path, which Task 6 migrates onto the [`Injectable`](leaf_core::Injectable)
-/// trait (deleting this remaining `seg.ident == "Ref"` check). The struct field-default
-/// path already routes through the trait.
-fn strip_ref(ty: &Type) -> Type {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "Ref"
-        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return inner.clone();
-    }
-    ty.clone()
 }
 
 /// The intra-config `#[bean]`→`#[bean]` self-call lint: walk the method body and
@@ -1027,8 +1020,43 @@ mod tests {
             s.contains("let__recv:::leaf_core::Ref<AppConfig>=__engine.get::<AppConfig>().await?"),
             "got: {s}"
         );
-        assert!(s.contains("__engine.get::<DbConfig>().await?"), "got: {s}");
+        // The PARAM resolves through `Injectable` (Task 6); only the config RECEIVER
+        // still rides the `Engine::get` seam.
+        assert!(
+            s.contains("<leaf_core::Ref<DbConfig>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "got: {s}"
+        );
         assert!(s.contains("__recv.pool(__dep_cfg)"), "got: {s}");
+    }
+
+    #[test]
+    fn a_bean_method_param_resolves_through_the_injectable_trait_not_a_name_strip() {
+        // Task 6: a `#[bean]` config-METHOD parameter routes through `Injectable` (trait
+        // dispatch), NOT a name-stripped `Db` TypeId. For `#[bean] fn make(&self, dep:
+        // Ref<Db>) -> Pool` the injection point is built from `<Ref<Db> as
+        // Injectable>::RESOLVABLE` and the provider resolves via `<Ref<Db> as
+        // Injectable>::inject` — the emitted tokens reference `Injectable`, never the
+        // legacy `__engine.get::<Db>()` name-strip. (The config RECEIVER resolution
+        // stays on `Engine::get` — it is not an injection point.)
+        let item = impl_item(
+            "impl AppConfig {
+                #[bean]
+                fn make(&self, dep: leaf_core::Ref<Db>) -> Pool { todo!() }
+             }",
+        );
+        let s = flat(&emit_configuration_impl(&item).expect("emits"));
+        assert!(
+            s.contains("<leaf_core::Ref<Db>as::leaf_core::Injectable>::RESOLVABLE"),
+            "the injection point derives from `<ParamTy as Injectable>::RESOLVABLE`: {s}"
+        );
+        assert!(
+            s.contains("<leaf_core::Ref<Db>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "the provider resolves via `<ParamTy as Injectable>::inject`: {s}"
+        );
+        // The name-stripped legacy path is GONE for the PARAM: no `__engine.get::<Db>()`.
+        assert!(!s.contains("__engine.get::<Db>"), "no name-stripped engine resolve: {s}");
+        // No name-stripped `InjectionPoint::single` (the receiver is not a point).
+        assert!(!s.contains("InjectionPoint::single"), "no name-stripped point: {s}");
     }
 
     #[test]
