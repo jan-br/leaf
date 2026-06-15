@@ -553,6 +553,30 @@ pub fn bind_error(prefix: &CanonicalName, detail: impl Into<String>) -> LeafErro
     ))
 }
 
+/// The bound outcome of a `@ConfigurationProperties` pre-materialization thunk: the
+/// bound [`Published`](crate::Published) handle to PRE-BIND into the bean's slot, or
+/// the aggregated bind/convert/JSR faults (the C2 Tier-2 validate-time outcome).
+///
+/// The SAME shape leaf-boot's `validate()` C2 sub-pass folds — surfaced at the
+/// leaf-core seam so the `#[config_properties]` macro can emit a thunk of the
+/// matching type via an absolute `::leaf_core` path (the thin-macro rule).
+pub type ConfigBindOutcome = Result<crate::handle::Published, Vec<LeafError>>;
+
+/// The macro-emitted `@ConfigurationProperties` bind+JSR thunk (the C2 Tier-2 path).
+///
+/// `#[config_properties]` emits — beside the bean's `Descriptor` — one PUBLIC const
+/// of this type (`__leaf_config_bind_<Ident>`) that BINDS the bean from the sealed
+/// [`Env`](crate::Env) through the derived [`BindTarget`] (a pure-projection bind:
+/// `&Env` only, NO `ResolveCtx`, so it is safe to run before wiring is live) + the
+/// stock JSR validation, returning the bound [`Published`](crate::Published) to
+/// pre-bind into the slot or the aggregated faults. leaf-boot's `App<Wired>::validate`
+/// JOINs each thunk to its config bean's `BeanId` by `ContractId` and threads it as
+/// the real C2 [`ConfigBean`] thunk (the same pairing-const pattern as `SeedPairing`).
+///
+/// [`ConfigBean`]: crate::Published
+pub type ConfigBindThunk =
+    fn(&Env, crate::bootstrap::StartupValidation) -> ConfigBindOutcome;
+
 #[cfg(test)]
 mod tests {
     use super::*;

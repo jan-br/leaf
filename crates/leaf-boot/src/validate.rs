@@ -178,6 +178,57 @@ impl<'a> ValueDryRun<'a> {
     }
 }
 
+// ─────────────────────────── ConfigPairing ──────────────────────────────────
+
+/// The macro→runtime `@ConfigurationProperties` bind-thunk JOIN row (the C2 analogue
+/// of [`SeedPairing`](crate::SeedPairing)): pairs the macro-emitted config-bean
+/// IDENTITY (its `ContractId`) with the PUBLIC `::leaf_core::ConfigBindThunk` const
+/// (`__leaf_config_bind_<Ident>`) the `#[config_properties]` macro emits beside the
+/// bean's `Descriptor`.
+///
+/// leaf-core's frozen `Descriptor` carries no bind thunk, so — exactly like the
+/// `ProviderSeed`/`CondExpr`/advisor JOINs — the binary crate (`#[leaf::main]`)
+/// supplies one row per config bean and [`Application`](crate::Application) JOINs each
+/// to its frozen `BeanId` by `contract`, building the real [`ConfigBean`] inputs the
+/// C2 [`validate`] sub-pass threads (no hand-mirrored thunk).
+#[derive(Clone, Copy)]
+pub struct ConfigPairing {
+    /// The config bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: leaf_core::ContractId,
+    /// The macro-emitted pure-projection bind+JSR thunk (the C2 Tier-2 recipe).
+    pub thunk: leaf_core::ConfigBindThunk,
+}
+
+impl ConfigPairing {
+    /// Build a config-bean pairing from its identity + its macro-emitted bind thunk.
+    #[must_use]
+    pub fn new(contract: leaf_core::ContractId, thunk: leaf_core::ConfigBindThunk) -> Self {
+        ConfigPairing { contract, thunk }
+    }
+
+    /// JOIN this pairing to its frozen `BeanId` and build the [`ConfigBean`] the C2
+    /// pass folds. `None` iff the contract is not a registered bean (a config bean
+    /// gated off by a condition / never registered — silently skipped, not a fault).
+    ///
+    /// The borrowed thunk reference lives as long as `self`; the returned
+    /// [`ConfigBean`] borrows `self` (a `ConfigBindThunk` is a `fn` pointer, so it
+    /// coerces to the `&dyn Fn(&Env, StartupValidation) -> ConfigBindResult`
+    /// [`ConfigBean`] holds — `ConfigBindResult` IS `ConfigBindOutcome`).
+    #[must_use]
+    pub fn to_config_bean<'a>(&'a self, registry: &Registry) -> Option<ConfigBean<'a>> {
+        let id = registry.by_contract(self.contract)?;
+        Some(ConfigBean::new(id, &self.thunk))
+    }
+}
+
+impl std::fmt::Debug for ConfigPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigPairing")
+            .field("contract", &self.contract)
+            .finish_non_exhaustive()
+    }
+}
+
 // ─────────────────────────── the validate pass ──────────────────────────────
 
 /// The WHOLE-GRAPH validation pass (the body of [`App::<Wired>::validate`](crate::App)).

@@ -27,11 +27,10 @@ use leaf_boot::{
     AdvisorPairing, Application, InstalledProxies, RunOverlay, SealInputs, SeedPairing,
 };
 use leaf_core::{
-    AdviceError, AnnotationMetadata, Anything, Bean, BeanKey, Binder, BoxFuture, Call,
-    CanonicalName, Container, ContractId, ConversionService, CreatorPolicy, Descriptor, ErasedArgs,
-    ErasedRet, FixedTarget, InjectionPlan, Interceptor, LeafError, MethodJoinPoint, MethodKey, Next,
-    NoopBindHandler, OrderKey, Origin, Provider, ProviderSeed, ProxyPlan, Published, Ref,
-    ResolveCtx, Role, RunState, Runner, ScopeDef, StackCps, Tail,
+    AdviceError, AnnotationMetadata, Anything, Bean, BeanKey, BoxFuture, Call, Container,
+    ContractId, CreatorPolicy, Descriptor, ErasedArgs, ErasedRet, FixedTarget, InjectionPlan,
+    Interceptor, LeafError, MethodJoinPoint, MethodKey, Next, OrderKey, Origin, Provider,
+    ProviderSeed, ProxyPlan, Published, Ref, ResolveCtx, Role, RunState, Runner, ScopeDef, Tail,
 };
 use leaf_macros::{component, config_properties, register_component};
 
@@ -76,6 +75,11 @@ impl OrderService {
 
 /// A leaf `@ConfigurationProperties` type — derives `BindTarget` so the binder can
 /// project `app.*` onto it; bound + registered as a resolvable bean.
+///
+/// `#[config_properties]` emits — beside the BindTarget — the PUBLIC C2 bind thunk
+/// (`__leaf_config_bind_AppProps`) AND the `impl ::leaf_core::Bean for AppProps {}`
+/// engine-resolvability marker, so the bean binds + pre-materializes through the REAL
+/// macro-emitted thunk (the C2 Tier-2 path) — never a hand-mirrored provider.
 #[config_properties(prefix = "app")]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AppProps {
@@ -83,13 +87,14 @@ struct AppProps {
     workers: u16,
 }
 
-impl Bean for AppProps {}
+// ───────────────────────── the config-properties bean ───────────────────────
 
-// ───────────────────────── the config-properties provider ───────────────────
-
-/// A hand-written provider that BINDS `AppProps` from the sealed `Env` via the
-/// derived `BindTarget` (the bind a config-properties seed / the C2 validate pass
-/// performs). The sealed env is captured into `APP_ENV` before refresh.
+/// A FALLBACK provider for the `AppProps` slot that yields the JavaBean default.
+///
+/// The C2 Tier-2 validate pass PRE-BINDS the REAL bound value (via the macro-emitted
+/// `__leaf_config_bind_AppProps` thunk) into the slot `OnceCell` BEFORE refresh R5, so
+/// R5 publishes the already-bound Arc and this `provide` is never called — it exists
+/// only so the bean is a registered, constructible row (the seed JOIN is total).
 struct AppPropsProvider {
     descriptor: Descriptor,
 }
@@ -100,24 +105,14 @@ impl Provider for AppPropsProvider {
     }
 
     fn provide<'a>(&'a self, _cx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Published, LeafError>> {
-        Box::pin(async move {
-            let env = APP_ENV.lock().unwrap().clone().expect("env captured before refresh");
-            let cps = StackCps::new(env);
-            let conv = ConversionService::new();
-            let handler = NoopBindHandler;
-            let binder = Binder::new(&cps, &conv, &handler);
-            let prefix = CanonicalName::parse("app").expect("a valid prefix");
-            let props = binder.bind::<AppProps>(&prefix).bound().unwrap_or_default();
-            Ok(Published::shared_value(props))
-        })
+        Box::pin(async move { Ok(Published::shared_value(AppProps::default())) })
     }
 }
 
-static APP_ENV: Mutex<Option<leaf_core::Env>> = Mutex::new(None);
-
 /// The AppProps bean descriptor (a config-properties bean is registered via the
-/// auto-config ladder — `#[config_properties]` emits only the BindTarget + metadata,
-/// not a COMPONENTS row, so the bean itself is registered as an auto-config default).
+/// auto-config ladder — `#[config_properties]` emits the BindTarget + metadata + the
+/// C2 bind thunk, not a COMPONENTS row, so the bean itself is registered as an
+/// auto-config default and pre-materialized at validate via its macro-emitted thunk).
 fn app_props_descriptor() -> Descriptor {
     Descriptor {
         contract: ContractId::of(concat!(module_path!(), "::AppProps")),
@@ -133,8 +128,8 @@ fn app_props_descriptor() -> Descriptor {
     }
 }
 
-/// The AppProps config-properties seed (the const fn-ptr that mints the binding
-/// provider — the construction recipe a config-properties bean's seed carries).
+/// The AppProps fallback seed (mints the default-returning provider; the real value
+/// is pre-bound by the C2 thunk before R5, so this is never invoked at runtime).
 const fn app_props_seed() -> ProviderSeed {
     || {
         Arc::new(AppPropsProvider {
@@ -217,18 +212,9 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
     let service_contract = ContractId::of(&format!("{module}::OrderService"));
     let props_contract = ContractId::of(&format!("{module}::AppProps"));
 
-    // ── capture the sealed env for the AppProps provider (the binder reads it) ──
-    let sealed = leaf_boot::seal_environment(
-        SealInputs::new().with_args(["--app.title=Orders", "--app.workers=4"]),
-    )
-    .await
-    .expect("seal");
-    *APP_ENV.lock().unwrap() = Some(sealed.env.clone());
-
     // ── the macro→runtime JOIN tables `#[leaf::main]` would emit ──
     // The seed JOIN: the macro-emitted `__leaf_seed_<Ident>` consts (pub) for the
     // two #[component]s. AppProps is registered via the auto-config ladder below.
-    let _ = props_contract;
     let seeds = vec![
         SeedPairing::new(repo_contract, __leaf_seed_Repository),
         SeedPairing::new(service_contract, __leaf_seed_OrderService),
@@ -240,6 +226,15 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
         app_props_descriptor(),
         app_props_seed(),
         None,
+    )];
+
+    // The C2 config-bean JOIN: the REAL macro-emitted bind thunk
+    // (`__leaf_config_bind_AppProps`), keyed by ContractId. App<Wired>::validate JOINs
+    // it to AppProps' frozen BeanId and PRE-MATERIALIZES the bound value into the slot
+    // BEFORE refresh — not a hand-mirrored provider that re-binds at R5.
+    let config_properties = vec![leaf_boot::ConfigPairing::new(
+        props_contract,
+        __leaf_config_bind_AppProps,
     )];
 
     // The per-bean injection-plan table (the macro-emitted `__LEAF_PLAN_<Ident>`
@@ -271,6 +266,7 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
         .with_name("orders-app")
         .with_seeds(seeds)
         .with_autoconfig(autoconfig)
+        .with_config_properties(config_properties)
         .with_injection_plans(inj)
         .with_spawner(spawner)
         .with_runner(Arc::new(StartupRunner))

@@ -144,6 +144,46 @@ fn config_properties_emits_a_documenting_config_group() {
     assert_eq!(workers.ty, "u16");
 }
 
+#[test]
+fn config_properties_emits_a_public_c2_bind_thunk_that_binds_from_the_env() {
+    // The C2 Tier-2 path: a #[config_properties] type emits a PUBLIC const bind thunk
+    // (`__leaf_config_bind_<Ident>`) of the macro-emitted ::leaf_core::ConfigBindThunk
+    // type, so leaf-boot's App<Wired>::validate threads the REAL macro-emitted thunk
+    // (not a hand-mirrored one) keyed by ContractId. Exercise it end-to-end: a
+    // populated env binds; the bound value rides into the slot as a Published::Shared.
+    use leaf_core::{EnvBuilder, MapPropertySource, StartupValidation};
+    use std::sync::Arc;
+
+    let thunk: leaf_core::ConfigBindThunk = __leaf_config_bind_AppProps;
+
+    let mut b = EnvBuilder::new();
+    b.add_last(Arc::new(MapPropertySource::from_pairs(
+        "test",
+        [
+            ("app.name".to_string(), "orders".to_string()),
+            ("app.workers".to_string(), "4".to_string()),
+        ],
+    )));
+    let env = b.seal_env();
+
+    let published = thunk(&env, StartupValidation::Strict).expect("the bind thunk binds cleanly");
+    let bean = published.into_shared().expect("the bound config bean is a shared publication");
+    let props = bean.downcast_ref::<AppProps>().expect("downcasts to AppProps");
+    assert_eq!(*props, AppProps { name: "orders".into(), workers: 4 });
+}
+
+#[test]
+fn config_properties_bind_thunk_binds_the_default_when_the_env_is_absent() {
+    // Absent config is NOT an error — the thunk binds the JavaBean default-filled
+    // value (the C2 pure-projection bind never fails on absence).
+    use leaf_core::{EnvBuilder, StartupValidation};
+    let env = EnvBuilder::new().seal_env();
+    let published = __leaf_config_bind_AppProps(&env, StartupValidation::Strict)
+        .expect("an absent env binds the default");
+    let bean = published.into_shared().expect("shared");
+    assert_eq!(*bean.downcast_ref::<AppProps>().unwrap(), AppProps::default());
+}
+
 // ═══════════════════════════════ #[value] ═══════════════════════════════════
 
 #[value("${app.port:8080}")]

@@ -64,7 +64,7 @@ use leaf_core::{
 };
 
 use crate::events::EventPublisher;
-use crate::proxy::InstalledProxies;
+use crate::proxy::{InstalledProxies, MethodTablePairing};
 use crate::scheduling::{register_scheduled, CronTriggerFactory, ScheduledPairing};
 use crate::wiring::{order_batch, WiringPlan};
 
@@ -122,6 +122,10 @@ pub struct RunUnit {
     /// The JOINed advisor descriptors (R4): resolved into live interceptor chains
     /// at the `after_init` install. Taken at refresh.
     advisors: Vec<AdvisorDescriptor>,
+    /// The JOINed per-bean method tables (R4): the macro-emitted downcast invoke
+    /// thunks that make the auto-proxy install TRANSPARENT (a call by `MethodKey`
+    /// routes through the chain). Taken at refresh.
+    method_tables: Vec<MethodTablePairing>,
     /// The JOINed event-listener descriptors (R3): bound to live host beans +
     /// `cmp_order` channels at the multicaster install. Taken at refresh.
     listeners: Vec<ListenerDescriptor>,
@@ -187,6 +191,7 @@ impl RunUnit {
             inj_of: Arc::new(|_| InjectionPlan::EMPTY),
             proxy_plan: leaf_core::ProxyPlan::empty(),
             advisors: Vec::new(),
+            method_tables: Vec::new(),
             listeners: Vec::new(),
             dispatch_chain: Vec::new(),
             dispatch_mode: DispatchErrorMode::IsolateEach,
@@ -248,6 +253,16 @@ impl RunUnit {
     #[must_use]
     pub fn with_advisors(mut self, advisors: Vec<AdvisorDescriptor>) -> Self {
         self.advisors = advisors;
+        self
+    }
+
+    /// Install the JOINed per-bean [`MethodTablePairing`]s (R4): the macro-emitted
+    /// downcast invoke thunks that make the auto-proxy install TRANSPARENT (so a call
+    /// by `MethodKey` routes through the auto-installed chain via
+    /// [`InstalledProxies::invoke`]).
+    #[must_use]
+    pub fn with_method_tables(mut self, tables: Vec<MethodTablePairing>) -> Self {
+        self.method_tables = tables;
         self
     }
 
@@ -433,10 +448,17 @@ impl RunUnit {
         self.publisher = Some(publisher);
 
         // ── R4: the auto-proxy after_init install (ProxyPlan O(1) lookup → resolve
-        // each advisor's interceptor via make_interceptor, build the live chain) ──
+        // each advisor's interceptor via make_interceptor, build the live chain) +
+        // JOIN the per-bean method tables (the transparent-invoke seam) ──
         let advisors = std::mem::take(&mut self.advisors);
-        let proxies =
-            InstalledProxies::install(self.context().engine(), &self.proxy_plan, &advisors).await?;
+        let method_tables = std::mem::take(&mut self.method_tables);
+        let proxies = InstalledProxies::install_with_tables(
+            self.context().engine(),
+            &self.proxy_plan,
+            &advisors,
+            &method_tables,
+        )
+        .await?;
         self.proxies = Some(proxies);
 
         // ── R6: SmartInitializing barrier — register scheduled tasks then ARM ──

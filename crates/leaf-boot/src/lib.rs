@@ -156,9 +156,10 @@ pub use autoconfig::{
 // The App<Resolve> → App<Wired> seal + the eager-instantiation wave plan.
 pub use wiring::{order_batch, PlanLookup, Wave, WiringPlan};
 
-// The App<Wired> whole-graph validation pass inputs (the C2 Tier-2 site).
+// The App<Wired> whole-graph validation pass inputs (the C2 Tier-2 site) + the
+// macro→runtime config-properties bind-thunk JOIN row.
 pub use validate::{
-    validate, ConfigBean, ConfigBindResult, ValidationInputs, ValueDryRun,
+    validate, ConfigBean, ConfigBindResult, ConfigPairing, ValidationInputs, ValueDryRun,
 };
 
 // The App<Wired> → App<Running> run engine: the fused container-lifecycle
@@ -169,8 +170,12 @@ pub use lifecycle::{RunUnit, ShutdownReport};
 pub use events::EventPublisher;
 
 // The R4 auto-proxy after_init install (ProxyPlan → live AdviceChain table) + the
-// macro→runtime advisor JOIN row + the Container-over-Engine adapter.
-pub use proxy::{AdvisorPairing, EngineContainer, InstalledProxies};
+// macro→runtime advisor + per-bean join-point JOIN rows + the Container-over-Engine
+// adapter.
+pub use proxy::{
+    build_join_points, AdvisorPairing, EngineContainer, InstalledProxies, JoinPointPairing,
+    MethodTablePairing, ReifiedJoinPoints,
+};
 
 // The R6 scheduler binding (descriptor → Trigger+body registration + arm) + the
 // macro→runtime scheduled-task JOIN row + the cron-trigger seam.
@@ -179,9 +184,11 @@ pub use scheduling::{
 };
 
 // The opinionated run() pipeline — the SpringApplication analogue (the THIRD
-// orchestration layer over Context, ADR-05) that #[leaf::main] targets.
+// orchestration layer over Context, ADR-05) that #[leaf::main] targets + the
+// `dyn Runner` candidate enumeration the run pipeline discovers runners by.
 pub use application::{
-    print_banner, Application, RunFailure, RunOverlay, RunningApp,
+    print_banner, runner_candidate_ids, Application, RunFailure, RunOverlay, RunnerPairing,
+    RunnerUpcast, RunningApp,
 };
 
 // Re-export the one ProviderSeed type at the leaf-boot surface so a downstream

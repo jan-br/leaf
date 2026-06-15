@@ -417,7 +417,36 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// generic target hard-errors with the `register_proxy!(Concrete)` hint.
 #[proc_macro_attribute]
 pub fn advisable(attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_stereotype(attr, item, Stereotype::Component)
+    let parsed = parse_macro_input!(item as ItemStruct);
+    match stereotype::emit_struct(&parsed, Stereotype::Component, attr.into()) {
+        Ok(rows) => {
+            // ALSO emit the per-bean join-point spec pairing const (bean_type +
+            // markers) beside the component row, so leaf-boot's ProxyPlan::freeze can
+            // JOIN it by ContractId and match pointcuts to the bean. A bare struct
+            // attr cannot enumerate the bean's methods, so the methods spec is empty
+            // (the impl-aware form / binary supplies the method join points).
+            let join_points = emit_struct_join_points(&parsed);
+            quote! { #parsed #rows #join_points }.into()
+        }
+        Err(err) => {
+            let error = compile_error(&err);
+            quote! { #parsed #error }.into()
+        }
+    }
+}
+
+/// Emit the per-bean join-point spec pairing const for a struct (the shared body the
+/// `#[advisable]`/`#[aspect]` struct forms append beside their component row). The
+/// bean's self type is its ident; a struct attr cannot see methods, so the methods
+/// spec is empty.
+fn emit_struct_join_points(item: &ItemStruct) -> proc_macro2::TokenStream {
+    let ident = item.ident.to_string();
+    match syn::parse_str::<Type>(&ident) {
+        Ok(self_ty) => advisor::emit_join_points(&ident, &self_ty, &[]),
+        // An unnameable self type cannot mint a TypeId-of seam; skip the spec (the
+        // component row + the loud descriptor diagnostics already cover the bean).
+        Err(_) => proc_macro2::TokenStream::new(),
+    }
 }
 
 /// `register_proxy!(Concrete)` — register a CONCRETE proxyable type (the escape
@@ -499,7 +528,13 @@ pub fn aspect(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args,
         is_generic,
     ) {
-        Ok(advisor_rows) => quote! { #parsed #component #advisor_rows }.into(),
+        Ok(advisor_rows) => {
+            // The aspect bean is itself an advisable/proxyable bean carrier — emit its
+            // per-bean join-point spec pairing const too (bean_type + markers), so the
+            // proxy plan can match pointcuts to the aspect bean.
+            let join_points = emit_struct_join_points(&parsed);
+            quote! { #parsed #component #advisor_rows #join_points }.into()
+        }
         Err(err) => {
             let error = compile_error(&err);
             quote! { #parsed #error }.into()

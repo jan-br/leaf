@@ -331,9 +331,16 @@ pub fn emit_config_properties(
     let row_ident = format_ident!("__LEAF_CONFIG_META_{}", mangled);
     let group_ident = format_ident!("__LEAF_CONFIG_GROUP_{}", mangled);
     let props_ident = format_ident!("__LEAF_CONFIG_PROPS_{}", mangled);
+    // The C2 Tier-2 bind thunk is PUBLIC under the deterministic
+    // `__leaf_config_bind_<Ident>` pairing name (keyed on the raw ident) so
+    // leaf-boot's App<Wired>::validate can pair the config bean's Descriptor with its
+    // pure-projection bind+JSR recipe (the same shape as the `__leaf_seed_<Ident>`
+    // ProviderSeed pairing the assembly pass joins).
+    let bind_thunk_ident = format_ident!("__leaf_config_bind_{}", mangled);
 
     let prefix = &args.prefix;
     let ident_str = ident.to_string();
+    let bind_thunk = emit_config_bind_thunk(ident, prefix, &bind_thunk_ident);
 
     // The const ContractId, module-qualified at the use site (same as components).
     let contract = quote! {
@@ -361,6 +368,9 @@ pub fn emit_config_properties(
     Ok(quote! {
         #bind
 
+        // ── the C2 Tier-2 pure-projection bind+JSR thunk (the validate-time path) ──
+        #bind_thunk
+
         // ── the rich const ConfigGroup documenting the bound keys (leaf metadata) ──
         static #props_ident: &[::leaf_core::Property] = &[ #(#property_rows),* ];
         #[allow(non_upper_case_globals)]
@@ -385,6 +395,75 @@ pub fn emit_config_properties(
             prefix: #prefix,
         };
     })
+}
+
+/// Emit the PUBLIC C2 bind+JSR thunk for a `#[config_properties]` bean: a const
+/// `::leaf_core::ConfigBindThunk` (`fn(&Env, StartupValidation) -> ConfigBindOutcome`)
+/// named `__leaf_config_bind_<Ident>` that BINDS the bean from the sealed `Env`
+/// through its derived `BindTarget` under the canonical `prefix`, returning the bound
+/// `::leaf_core::Published` to PRE-BIND into the slot (the C2 Tier-2 path
+/// leaf-boot's `App<Wired>::validate` threads) or the aggregated bind faults.
+///
+/// The thunk is a PURE-PROJECTION bind: it reads ONLY the `&Env` (no `ResolveCtx`),
+/// so it is safe to run at validate-time before wiring is live — the SAME binder
+/// seam the runtime config-properties provider runs, so dry-run == real bind. The
+/// bean is opted into the engine-resolvability seam (`impl ::leaf_core::Bean`) so the
+/// bound value publishes as a `Published::shared_value`.
+///
+/// The JSR `ValidationBindHandler` lives in leaf-validation (out of this codegen
+/// unit's leaf-core-only dependency surface); the thunk runs the stock
+/// `NoopBindHandler`, so bind/convert faults surface here and JSR validation is the
+/// leaf-validation force-link's concern (the bind itself is the structural C2 gate).
+fn emit_config_bind_thunk(
+    ident: &syn::Ident,
+    prefix: &str,
+    thunk_ident: &syn::Ident,
+) -> TokenStream {
+    quote! {
+        // The bean is engine-resolvable so the bound value is a Published::shared_value
+        // (the same Bean opt-in a #[component] emits — a #[config_properties] type is
+        // registered as a bean too, via the auto-config / config-properties lane).
+        impl ::leaf_core::Bean for #ident {}
+
+        #[allow(non_upper_case_globals)]
+        pub const #thunk_ident: ::leaf_core::ConfigBindThunk =
+            |__env: &::leaf_core::Env, __lever: ::leaf_core::StartupValidation|
+                -> ::leaf_core::ConfigBindOutcome
+        {
+            let _ = __lever; // the bind itself is HARD under every lever (C2 structural)
+            let __cps = ::leaf_core::StackCps::new(__env.clone());
+            let __conv = ::leaf_core::ConversionService::new();
+            let __handler = ::leaf_core::NoopBindHandler;
+            let __binder = ::leaf_core::Binder::new(&__cps, &__conv, &__handler);
+            let __prefix = match ::leaf_core::CanonicalName::parse(#prefix) {
+                ::core::result::Result::Ok(__p) => __p,
+                ::core::result::Result::Err(__e) => {
+                    return ::core::result::Result::Err(::std::vec![
+                        ::leaf_core::LeafError::new(::leaf_core::ErrorKind::BindError).caused_by(
+                            ::leaf_core::Cause::plain(
+                                "binding @ConfigurationProperties",
+                                ::std::format!("invalid prefix `{}`: {}", #prefix, __e),
+                            )
+                        )
+                    ]);
+                }
+            };
+            match __binder.bind::<#ident>(&__prefix) {
+                ::leaf_core::BindResult::Bound(__bound) => {
+                    ::core::result::Result::Ok(::leaf_core::Published::shared_value(__bound))
+                }
+                // Absent config is NOT an error — bind the JavaBean default-filled value.
+                ::leaf_core::BindResult::Unbound => {
+                    ::core::result::Result::Ok(::leaf_core::Published::shared_value(
+                        <#ident as ::core::default::Default>::default()
+                    ))
+                }
+                ::leaf_core::BindResult::Failed(__e) => {
+                    ::core::result::Result::Err(::std::vec![__e])
+                }
+            }
+        };
+    }
 }
 
 // ───────────────────────────── #[value("...")] ──────────────────────────────
@@ -593,6 +672,35 @@ mod tests {
         assert!(s.contains(r#"name:"port""#), "got: {s}");
         // The property type is rendered as a string for the metadata.
         assert!(s.contains(r#"ty:"u16""#), "got: {s}");
+    }
+
+    #[test]
+    fn config_properties_emits_a_public_bind_thunk_pairing_const() {
+        // The C2 Tier-2 path: a #[config_properties] type emits a PUBLIC const bind
+        // thunk (`__leaf_config_bind_<Ident>`) of the macro-emitted
+        // `::leaf_core::ConfigBindThunk` type, so leaf-boot's App<Wired>::validate can
+        // JOIN it by ContractId and thread the REAL macro-emitted thunk (the same
+        // pairing-const pattern as the __leaf_seed_<Ident> ProviderSeed).
+        let args = ConfigPropertiesArgs { prefix: "app".into() };
+        let ts = emit_config_properties(&derive("struct AppProps { title: String, workers: u16 }"), &args)
+            .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The thunk is a PUBLIC const under the deterministic pairing name.
+        assert!(
+            s.contains("pubconst__leaf_config_bind_AppProps:::leaf_core::ConfigBindThunk"),
+            "got: {s}"
+        );
+        // It binds the bean from the env under the prefix through the derived
+        // BindTarget (the pure-projection bind, &Env only), via the one Binder seam.
+        assert!(s.contains("::leaf_core::Binder::new"), "got: {s}");
+        assert!(s.contains("bind::<AppProps>"), "got: {s}");
+        // The prefix is the parsed canonical key prefix.
+        assert!(s.contains(r#"CanonicalName::parse("app")"#), "got: {s}");
+        // It produces a Published on success (pre-bound into the slot) — the bean is
+        // opted into the engine-resolvability seam so Published::shared_value applies.
+        assert!(s.contains("::leaf_core::Published::shared_value"), "got: {s}");
+        assert!(s.contains("impl::leaf_core::BeanforAppProps{}"), "got: {s}");
     }
 
     // ── #[value("...")] ────────────────────────────────────────────────────────

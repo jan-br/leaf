@@ -212,8 +212,8 @@ pub use env::{
 
 pub use bind::{
     bind_error, BindCtx, BindCursor, BindHandler, BindMethod, BindResult, BindTarget, Binder,
-    ConfigurationPropertySource, ConfigurationPropertyState, ConversionService, Converter, Field,
-    NodeSchema, NoopBindHandler, StackCps,
+    ConfigBindOutcome, ConfigBindThunk, ConfigurationPropertySource, ConfigurationPropertyState,
+    ConversionService, Converter, Field, NodeSchema, NoopBindHandler, StackCps,
 };
 
 pub use metadata::{
@@ -321,10 +321,10 @@ pub use engine::{
 
 pub use proxy::{
     annotated_marker, returns, within, AdviceChain, AdviceError, AdvisorDescriptor, AdvisorRef,
-    And, Annotated, Anything, BeanJoinPoints, Call, CreatorPolicy, ErasedArgs, ErasedProxy,
-    ErasedRet, FixedTarget, Interceptor, JoinPointMeta, MakeInterceptor, MethodEntry,
-    MethodJoinPoint, MethodTable, Next, Not, Or, OwnedTarget, Pointcut, ProxyPlan, ResolveError,
-    Returns, ScopeTarget, Tail, TargetSource, Within,
+    And, Annotated, Anything, BeanJoinPoints, BeanJoinPointsSpec, Call, CreatorPolicy, ErasedArgs,
+    ErasedProxy, ErasedRet, FixedTarget, Interceptor, JoinPointMeta, MakeInterceptor, MethodEntry,
+    MethodJoinPoint, MethodJoinPointSpec, MethodTable, Next, Not, Or, OwnedTarget, Pointcut,
+    ProxyPlan, ResolveError, Returns, ScopeTarget, Tail, TargetSource, Within,
 };
 
 // - events: the in-process observer bus + the dispatch multicaster (C5 — a

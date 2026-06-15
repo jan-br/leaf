@@ -246,6 +246,71 @@ pub fn emit_advisor(
     })
 }
 
+/// One advisable method's join-point spec the macro emits (the const input
+/// [`emit_join_points`] lowers to a `::leaf_core::MethodJoinPointSpec`).
+///
+/// A bare `#[advisable]`/`#[aspect]` STRUCT attr cannot enumerate the bean's methods
+/// (a struct-position attr sees no impl), so the struct form emits NO method specs;
+/// a method-aware form (an impl-block lowering or the binary's collected method
+/// table) supplies these.
+#[derive(Clone, Debug)]
+pub struct MethodSpec {
+    /// The canonical `Bean::method` path minting the method's stable `MethodKey`.
+    pub method_path: String,
+    /// The method's argument types (lowered through the const `TypeId`-of seam).
+    pub arg_types: Vec<syn::Type>,
+    /// The method's return type (lowered through the const `TypeId`-of seam).
+    pub ret_type: syn::Type,
+}
+
+/// Emit the PUBLIC per-bean join-point spec pairing const for an advisable bean: a
+/// const `::leaf_core::BeanJoinPointsSpec` named `__leaf_joinpoints_<Ident>` carrying
+/// the bean's concrete `TypeId` (the `within::<T>()` pointcut key), a reference to the
+/// bean's OWN flat `AnnotationMetadata` static (`__LEAF_META_<Ident>`, the
+/// `annotated::<A>()` pointcut key — the SAME static the descriptor emitter emits
+/// beside the row), and one const `::leaf_core::MethodJoinPointSpec` per advisable
+/// method.
+///
+/// This is the proxy analogue of the `__leaf_seed_<Ident>` ProviderSeed / the
+/// `__leaf_advisor_<Ident>` order pairing: leaf-boot's proxy-assembly pass JOINs it
+/// to the bean's frozen `BeanId` by `ContractId` and reifies it into the runtime
+/// `BeanJoinPoints` that `ProxyPlan::freeze` runs pointcuts over — so the proxy plan
+/// is built from REAL macro-emitted per-bean data, never a hand-mirrored view.
+#[must_use]
+pub fn emit_join_points(ident: &str, self_ty: &syn::Type, methods: &[MethodSpec]) -> TokenStream {
+    let mangled = mangle(ident);
+    let spec_ident = format_ident!("__leaf_joinpoints_{}", mangled);
+    let meta_ident = format_ident!("__LEAF_META_{}", mangled);
+    let bean_type = quote! { const { ::core::any::TypeId::of::<#self_ty>() } };
+
+    let method_rows = methods.iter().map(|m| {
+        let path = &m.method_path;
+        let ret = &m.ret_type;
+        let args = m.arg_types.iter().map(|a| quote! { const { ::core::any::TypeId::of::<#a>() } });
+        quote! {
+            ::leaf_core::MethodJoinPointSpec {
+                method: ::leaf_core::MethodKey::of(#path),
+                arg_types: &[ #(#args),* ],
+                ret_type: const { ::core::any::TypeId::of::<#ret>() },
+            }
+        }
+    });
+
+    quote! {
+        // The PUBLIC per-bean join-point spec pairing const (the const twin of
+        // BeanJoinPoints): leaf-boot's proxy-assembly pass JOINs it by ContractId,
+        // reifies it (building each method's SmallVec), and runs every admitted
+        // advisor's pointcut over it at ProxyPlan::freeze. The markers reference the
+        // bean's OWN __LEAF_META_<Ident> static (annotation-model owns it).
+        #[allow(non_upper_case_globals)]
+        pub const #spec_ident: ::leaf_core::BeanJoinPointsSpec = ::leaf_core::BeanJoinPointsSpec {
+            bean_type: #bean_type,
+            markers: &#meta_ident,
+            methods: &[ #(#method_rows),* ],
+        };
+    }
+}
+
 /// The leading-ident name of a `register_proxy!(Concrete)` type (`Aspect<u32>` →
 /// `Aspect`), used as the concrete advisor's identity base.
 ///
@@ -421,5 +486,57 @@ mod tests {
     fn proxy_ident_reads_the_leading_ident_of_a_concrete_type() {
         let ty: syn::Type = syn::parse_str("Aspect<u32>").expect("a type");
         assert_eq!(proxy_ident(&ty).expect("nameable"), "Aspect");
+    }
+
+    // ── per-bean join-point spec (the proxy plan input) ──────────────────────────
+
+    fn ty(s: &str) -> syn::Type {
+        syn::parse_str(s).expect("a valid type")
+    }
+
+    #[test]
+    fn emits_a_public_bean_join_points_spec_pairing_const() {
+        // The headline: an #[advisable] bean emits a PUBLIC const
+        // `__leaf_joinpoints_<Ident>` of the macro-emitted ::leaf_core::BeanJoinPointsSpec
+        // type (the const twin of BeanJoinPoints), so leaf-boot's ProxyPlan::freeze can
+        // JOIN it by ContractId and run pointcuts over the bean — the same pairing-const
+        // pattern as the __leaf_seed_<Ident> ProviderSeed.
+        let ts = emit_join_points("OrderService", &ty("OrderService"), &[]);
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("pubconst__leaf_joinpoints_OrderService:::leaf_core::BeanJoinPointsSpec"),
+            "got: {s}"
+        );
+        // The bean_type rides the const TypeId-of seam.
+        assert!(
+            s.contains("bean_type:const{::core::any::TypeId::of::<OrderService>()}"),
+            "got: {s}"
+        );
+        // The markers reference the bean's OWN flat AnnotationMetadata static (the
+        // SAME `__LEAF_META_<Ident>` the descriptor emitter emits — annotated::<A>()).
+        assert!(s.contains("markers:&__LEAF_META_OrderService"), "got: {s}");
+        // A bare struct form has no enumerable methods (the struct attr cannot see
+        // them — an honest empty spec; the impl-aware form / binary supplies methods).
+        assert!(s.contains("methods:&[]"), "got: {s}");
+    }
+
+    #[test]
+    fn join_points_spec_carries_declared_method_rows() {
+        // The method-aware form (the impl-block / binary path) emits one const
+        // MethodJoinPointSpec per advisable method: its MethodKey + const arg/ret types.
+        let methods = vec![MethodSpec {
+            method_path: "OrderService::place_order".into(),
+            arg_types: vec![ty("i64")],
+            ret_type: ty("i64"),
+        }];
+        let s = flat(&emit_join_points("OrderService", &ty("OrderService"), &methods));
+        assert!(s.contains("::leaf_core::MethodJoinPointSpec"), "got: {s}");
+        assert!(
+            s.contains(r#"::leaf_core::MethodKey::of("OrderService::place_order")"#),
+            "got: {s}"
+        );
+        assert!(s.contains("ret_type:const{::core::any::TypeId::of::<i64>()}"), "got: {s}");
+        assert!(s.contains("arg_types:&[const{::core::any::TypeId::of::<i64>()}]"), "got: {s}");
     }
 }

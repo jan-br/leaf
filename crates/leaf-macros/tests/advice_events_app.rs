@@ -23,7 +23,7 @@ use leaf_core::{
     ADVISORS, CATALOGS, COMPONENTS, EVENT_LISTENERS, FAILURE_ANALYZERS, RESOURCES, SCHEDULED,
 };
 use leaf_macros::{
-    aspect, catalog, event_listener, failure_analyzer, runner, scheduled,
+    advisable, aspect, catalog, event_listener, failure_analyzer, runner, scheduled,
     transactional_event_listener,
 };
 
@@ -140,6 +140,51 @@ fn the_aspect_chain_order_pairing_const_carries_the_explicit_order() {
     // (Annotation-sourced, so it beats an Implicit floor at equal value).
     assert_eq!(__leaf_advisor_AuditAspect.value, 50);
     assert_eq!(__leaf_advisor_AuditAspect.source, leaf_core::OrderSource::Annotation);
+}
+
+// ─────────────────────────────── #[advisable] ───────────────────────────────
+
+/// An advisable bean (a #[component] PROXY TARGET) carrying a marker the proxy plan's
+/// `annotated::<A>()` pointcut can match.
+#[advisable]
+struct OrderService;
+
+impl OrderService {
+    fn new() -> Self {
+        OrderService
+    }
+}
+
+#[test]
+fn advisable_emits_a_per_bean_join_points_spec_pairing_const() {
+    // The headline proxy-join-point closure: an #[advisable] bean emits a PUBLIC
+    // ::leaf_core::BeanJoinPointsSpec pairing const (the const twin of BeanJoinPoints)
+    // carrying its bean_type + a reference to its OWN flat AnnotationMetadata — the
+    // per-bean data leaf-boot's ProxyPlan::freeze runs pointcuts over. The bean is
+    // ALSO a registered COMPONENTS bean (the proxy target is a normal bean).
+    assert!(
+        COMPONENTS.iter().any(|d| d.declared_name == Some("orderService")),
+        "#[advisable] must register the proxy-target bean"
+    );
+    let spec = __leaf_joinpoints_OrderService;
+    assert_eq!(
+        spec.bean_type,
+        std::any::TypeId::of::<OrderService>(),
+        "the join-point spec carries the bean's concrete TypeId (the within::<T>() key)"
+    );
+    // The markers reference is the bean's OWN flat AnnotationMetadata (it carries the
+    // @component marker closure — annotated::<A>() reads it).
+    let component_marker = leaf_core::MarkerId::of("leaf::Component");
+    assert!(
+        spec.markers.markers.contains(&component_marker),
+        "the join-point spec markers carry the bean's @component marker closure"
+    );
+    // It reifies into the runtime BeanJoinPoints ProxyPlan::freeze consumes (a struct
+    // attr cannot enumerate methods, so the method spec is empty here — the binary /
+    // impl-aware form supplies the per-method join points).
+    assert!(spec.methods.is_empty(), "a bare #[advisable] struct has no enumerated methods");
+    let reified = spec.reify_methods();
+    assert!(reified.is_empty());
 }
 
 // ─────────────────────────────── #[catalog] ─────────────────────────────────

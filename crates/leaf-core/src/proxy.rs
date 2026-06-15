@@ -875,6 +875,67 @@ pub struct MethodJoinPoint {
     pub ret_type: TypeId,
 }
 
+/// The CONST-CONSTRUCTIBLE per-method join-point row the macro emits (the const
+/// twin of [`MethodJoinPoint`]).
+///
+/// [`MethodJoinPoint::arg_types`] is a [`SmallVec`] (`SmallVec::new()` is not a
+/// `const fn`), so it cannot ride a `const`/`static` initializer the macro emits.
+/// This spec uses a `&'static [TypeId]` instead — fully const-constructible via the
+/// inline-`const { TypeId::of::<_>() }` seam — and [`MethodJoinPointSpec::reify`]
+/// builds the runtime [`MethodJoinPoint`] (the `SmallVec`) at the leaf-boot JOIN.
+#[derive(Clone, Copy, Debug)]
+pub struct MethodJoinPointSpec {
+    /// The method's stable identity.
+    pub method: MethodKey,
+    /// The method's argument `TypeId`s (a const slice, reified into a `SmallVec`).
+    pub arg_types: &'static [TypeId],
+    /// The method's return `TypeId`.
+    pub ret_type: TypeId,
+}
+
+impl MethodJoinPointSpec {
+    /// Reify into the runtime [`MethodJoinPoint`] (building the `SmallVec`).
+    #[must_use]
+    pub fn reify(&self) -> MethodJoinPoint {
+        MethodJoinPoint {
+            method: self.method,
+            arg_types: SmallVec::from_slice(self.arg_types),
+            ret_type: self.ret_type,
+        }
+    }
+}
+
+/// The CONST-CONSTRUCTIBLE per-bean join-point descriptor the macro emits beside an
+/// `#[advisable]`/`#[aspect]` bean's `Descriptor` (the const twin of
+/// [`BeanJoinPoints`]) — the proxy analogue of the `__leaf_seed_<Ident>` /
+/// `__leaf_guard_<Ident>` pairing consts.
+///
+/// `#[advisable]`/`#[aspect]` emits one PUBLIC `__leaf_joinpoints_<Ident>` const of
+/// this type (the bean's concrete type + its flat `AnnotationMetadata` + its const
+/// method specs). leaf-boot JOINs it to the bean's frozen `BeanId` by `ContractId`
+/// and [`reify`](BeanJoinPointsSpec::reify_methods)es it into the runtime
+/// [`BeanJoinPoints`] [`ProxyPlan::freeze`] runs pointcuts over — so the proxy plan
+/// is built from REAL macro-emitted per-bean data, never a hand-mirrored view.
+#[derive(Clone, Copy, Debug)]
+pub struct BeanJoinPointsSpec {
+    /// The bean's concrete `TypeId` (the `within::<T>()` pointcut key).
+    pub bean_type: TypeId,
+    /// The bean's flat annotation metadata (the `annotated::<A>()` pointcut key).
+    pub markers: &'static crate::definition::AnnotationMetadata,
+    /// The bean's const method join-point specs (one per advisable method).
+    pub methods: &'static [MethodJoinPointSpec],
+}
+
+impl BeanJoinPointsSpec {
+    /// Reify this spec's const method specs into the runtime [`MethodJoinPoint`]s
+    /// (building each `SmallVec`) — the leaf-boot JOIN calls this, then borrows the
+    /// result to build a [`BeanJoinPoints`] for [`ProxyPlan::freeze`].
+    #[must_use]
+    pub fn reify_methods(&self) -> Vec<MethodJoinPoint> {
+        self.methods.iter().map(MethodJoinPointSpec::reify).collect()
+    }
+}
+
 impl ProxyPlan {
     /// A plan with no decorations (the bare-engine parity case: no creator).
     #[must_use]

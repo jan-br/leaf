@@ -29,9 +29,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use leaf_core::{
-    analyze_first, AnalysisCtx, ApplicationArguments, BannerMode, CandidateRole, Diagnostic,
-    Env, EarlyListener, FailureAnalyzer, FailureAnalysis, InjectionPlan, LeafError, LifecyclePlan,
-    RenderStyle, RunMilestone, SchedulerCore, Spawner,
+    analyze_first, cmp_order, AnalysisCtx, ApplicationArguments, BannerMode, BeanKey, CandidateRole,
+    CreatorPolicy, Diagnostic, Env, EarlyListener, ErasedBean, FailureAnalyzer, FailureAnalysis,
+    InjectionPlan, LeafError, LifecyclePlan, OrderKey, RenderStyle, Runner, RunMilestone,
+    SchedulerCore, Spawner,
 };
 
 use crate::app::App;
@@ -40,12 +41,23 @@ use crate::autoconfig::{AutoConfigCandidate, ExclusionSet};
 use crate::conditions::GuardPairing;
 use crate::environment::SealInputs;
 use crate::lifecycle::RunUnit;
-use crate::proxy::AdvisorPairing;
+use crate::proxy::{build_join_points, AdvisorPairing, JoinPointPairing, MethodTablePairing};
 use crate::scheduling::{CronTriggerFactory, ScheduledPairing};
-use crate::validate::ValidationInputs;
+use crate::validate::{ConfigBean, ConfigPairing, ValidationInputs};
 
 type PlanResolver = Arc<dyn Fn(leaf_core::BeanId) -> LifecyclePlan + Send + Sync>;
 type InjectionResolver = Arc<dyn Fn(leaf_core::BeanId) -> InjectionPlan + Send + Sync>;
+
+/// A macro-emitted runner UPCAST thunk: downcast a resolved [`ErasedBean`] (the
+/// origin-agnostic `Arc<dyn Any>` the registry's `dyn Runner` candidate view yields,
+/// whose declared upcast is the identity re-erase) to the concrete runner type and
+/// re-wrap it as `Arc<dyn Runner>`. `None` iff the bean is not that concrete type
+/// (a different `dyn Runner` candidate matched the same view).
+///
+/// This is the "per-runner thunk the macro emits" the design names: an `ErasedBean`
+/// cannot carry a `dyn Runner` vtable, so auto-collection JOINs each `dyn Runner`
+/// candidate bean to this thunk by `ContractId` to recover a callable handle.
+pub type RunnerUpcast = fn(ErasedBean) -> Option<Arc<dyn Runner>>;
 
 // ──────────────────────────────── RunOverlay ────────────────────────────────
 
@@ -73,6 +85,51 @@ impl std::fmt::Debug for RunOverlay {
             .field("has_hook", &self.hook.is_some())
             .field("abandoned", &self.abandoned)
             .finish()
+    }
+}
+
+// ──────────────────────────────── RunnerPairing ──────────────────────────────
+
+/// The macro→runtime RUNNER JOIN row (the bootstrap analogue of
+/// [`SeedPairing`](crate::SeedPairing)): pairs a `#[runner]` bean's IDENTITY (its
+/// `ContractId`) with the macro-emitted [`RunnerUpcast`] thunk that recovers a
+/// callable `Arc<dyn Runner>` from the resolved [`ErasedBean`].
+///
+/// The run pipeline AUTO-COLLECTS runner beans from the live `Context` by the
+/// `dyn Runner` candidate view (see [`runner_candidate_ids`]), JOINs each to its
+/// `RunnerPairing` by `ContractId`, resolves the erased bean, and upcasts it — so a
+/// `#[runner]` bean runs automatically with NO explicit
+/// [`with_runner`](Application::with_runner).
+#[derive(Clone, Copy)]
+pub struct RunnerPairing {
+    /// The runner bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: leaf_core::ContractId,
+    /// The macro-emitted upcast thunk (`ErasedBean` → `Arc<dyn Runner>`).
+    pub upcast: RunnerUpcast,
+    /// The runner's stream order (lower-value-first; the `cmp_order` sort key).
+    pub order: OrderKey,
+}
+
+impl RunnerPairing {
+    /// Build a runner pairing at the implicit (declaration) order.
+    #[must_use]
+    pub fn new(contract: leaf_core::ContractId, upcast: RunnerUpcast) -> Self {
+        RunnerPairing { contract, upcast, order: OrderKey::implicit() }
+    }
+
+    /// Build a runner pairing at an explicit stream order.
+    #[must_use]
+    pub fn with_order(contract: leaf_core::ContractId, upcast: RunnerUpcast, order: OrderKey) -> Self {
+        RunnerPairing { contract, upcast, order }
+    }
+}
+
+impl std::fmt::Debug for RunnerPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunnerPairing")
+            .field("contract", &self.contract)
+            .field("order", &self.order)
+            .finish_non_exhaustive()
     }
 }
 
@@ -137,6 +194,34 @@ impl RunningApp {
         self.exit_code
     }
 
+    /// `true` iff `bean` was AUTOMATICALLY advised by the R4 auto-proxy install (its
+    /// interceptor chain was built over the published singleton).
+    #[must_use]
+    pub fn is_advised(&self, bean: leaf_core::BeanId) -> bool {
+        self.unit.proxies().is_some_and(|p| p.is_advised(bean))
+    }
+
+    /// TRANSPARENTLY invoke an advised method through the AUTO-INSTALLED interceptor
+    /// chain (the R4 after_init proxy): route a call to `method` on the advised
+    /// singleton `bean` through its chain, terminating in the macro-emitted
+    /// [`MethodTable`](leaf_core::MethodTable) downcast thunk — so a `#[advisable]`
+    /// bean's method is advised with NO hand-written `Call`/`Tail` in user code.
+    ///
+    /// # Errors
+    /// An [`AdviceError`](leaf_core::AdviceError) if the bean is not advised / has no
+    /// method table, the method is absent, the singleton is not published, or any
+    /// interceptor / the real method faults.
+    pub async fn invoke_advised(
+        &self,
+        bean: leaf_core::BeanId,
+        method: leaf_core::MethodKey,
+        args: leaf_core::ErasedArgs,
+    ) -> Result<leaf_core::ErasedRet, leaf_core::AdviceError> {
+        let proxies = self.unit.proxies().ok_or(leaf_core::AdviceError::DowncastMismatch { method })?;
+        let engine = self.unit.context().engine();
+        proxies.invoke(engine.registry(), engine, bean, method, args).await
+    }
+
     /// The `App::exit()` analogue: drive `Context::shutdown()` (drain the ledger
     /// LIFO after `stop_all`), then return the computed [`ExitCode`].
     pub async fn exit(self) -> ExitCode {
@@ -171,10 +256,15 @@ pub struct Application {
     autoconfig: Vec<AutoConfigCandidate>,
     exclusions: ExclusionSet,
     advisors: Vec<AdvisorPairing>,
+    join_points: Vec<JoinPointPairing>,
+    method_tables: Vec<MethodTablePairing>,
+    creator_policy: CreatorPolicy,
+    config_pairings: Vec<ConfigPairing>,
     listeners: Vec<leaf_core::ListenerDescriptor>,
     dispatch_chain: Vec<Arc<dyn leaf_core::DispatchInterceptor>>,
     scheduled: Vec<ScheduledPairing>,
     runners: Vec<Arc<dyn leaf_core::Runner>>,
+    runner_beans: Vec<RunnerPairing>,
     exit_code_contributors: Vec<i32>,
     plan_of: PlanResolver,
     inj_of: InjectionResolver,
@@ -197,10 +287,18 @@ impl Application {
             autoconfig: Vec::new(),
             exclusions: ExclusionSet::new(),
             advisors: Vec::new(),
+            join_points: Vec::new(),
+            method_tables: Vec::new(),
+            // Application aspects are admitted by default (the run() pipeline is the
+            // binary/app-root where the full enabled-feature set is visible — the
+            // @EnableAspectJAutoProxy analogue assembled here, never a racing bean).
+            creator_policy: CreatorPolicy::ALL,
+            config_pairings: Vec::new(),
             listeners: Vec::new(),
             dispatch_chain: Vec::new(),
             scheduled: Vec::new(),
             runners: Vec::new(),
+            runner_beans: Vec::new(),
             exit_code_contributors: Vec::new(),
             plan_of: Arc::new(|_| LifecyclePlan::EMPTY),
             inj_of: Arc::new(|_| InjectionPlan::EMPTY),
@@ -259,6 +357,46 @@ impl Application {
         self
     }
 
+    /// The per-bean join-point JOIN table (the macro-emitted `__leaf_joinpoints_<Ident>`
+    /// `BeanJoinPointsSpec` consts), keyed by `ContractId`. `frozen_proxy_plan` JOINs
+    /// each to its frozen `BeanId` and runs the advisors' pointcuts over it — so the
+    /// proxy plan is built from REAL macro-emitted per-bean data.
+    #[must_use]
+    pub fn with_join_points(mut self, join_points: Vec<JoinPointPairing>) -> Self {
+        self.join_points = join_points;
+        self
+    }
+
+    /// The per-bean method-table JOIN table (the macro-emitted `__leaf_methods_<Ident>`
+    /// `&'static MethodTable` consts), keyed by `ContractId`. The run pipeline threads
+    /// them through the R4 auto-proxy install so an advised call routes through the
+    /// auto-installed interceptor chain TRANSPARENTLY (via
+    /// [`RunningApp::invoke_advised`]) — no hand-written `Call`/`Tail` in user code.
+    #[must_use]
+    pub fn with_method_tables(mut self, tables: Vec<MethodTablePairing>) -> Self {
+        self.method_tables = tables;
+        self
+    }
+
+    /// Override the auto-proxy [`CreatorPolicy`] capability lattice (the
+    /// `@EnableAspectJAutoProxy` analogue; defaults to admitting application aspects).
+    #[must_use]
+    pub fn with_creator_policy(mut self, policy: CreatorPolicy) -> Self {
+        self.creator_policy = policy;
+        self
+    }
+
+    /// The `@ConfigurationProperties` bind-thunk JOIN table (the macro-emitted
+    /// `__leaf_config_bind_<Ident>` `ConfigBindThunk` consts), keyed by `ContractId`.
+    /// `App<Wired>::validate` JOINs each to its frozen `BeanId` and threads it as the
+    /// REAL C2 Tier-2 [`ConfigBean`](crate::ConfigBean) bind thunk (pre-materializing
+    /// the config bean into its slot before refresh) — never a hand-mirrored thunk.
+    #[must_use]
+    pub fn with_config_properties(mut self, config_pairings: Vec<ConfigPairing>) -> Self {
+        self.config_pairings = config_pairings;
+        self
+    }
+
     /// The event-listener descriptors (the R3 multicaster install).
     #[must_use]
     pub fn with_listeners(mut self, listeners: Vec<leaf_core::ListenerDescriptor>) -> Self {
@@ -289,6 +427,18 @@ impl Application {
     #[must_use]
     pub fn with_runner(mut self, runner: Arc<dyn leaf_core::Runner>) -> Self {
         self.runners.push(runner);
+        self
+    }
+
+    /// The `#[runner]` bean JOIN table (the macro-emitted [`RunnerPairing`] upcast
+    /// thunks), keyed by `ContractId`. The run pipeline AUTO-COLLECTS the live
+    /// `dyn Runner` candidate beans from the refreshed `Context`, JOINs each to its
+    /// pairing, upcasts the resolved bean, and runs them in the readiness-gate window
+    /// (ordered by [`cmp_order`](leaf_core::cmp_order)) — so a `#[runner]` bean runs
+    /// automatically with NO explicit [`with_runner`](Application::with_runner).
+    #[must_use]
+    pub fn with_runner_beans(mut self, runners: Vec<RunnerPairing>) -> Self {
+        self.runner_beans = runners;
         self
     }
 
@@ -428,10 +578,25 @@ impl Application {
         *phase = RunMilestone::Prepared;
         self.fire_early(overlay, RunMilestone::Prepared);
 
-        // The Tier-2 aggregated validation pass (config materialization + dry-runs
-        // live behind ValidationInputs; the minimal pipeline validates the wiring).
-        let validation = ValidationInputs::new();
+        // The Tier-2 aggregated validation pass. The C2 config-properties beans are
+        // PRE-MATERIALIZED here from the REAL macro-emitted bind thunks: JOIN each
+        // ConfigPairing to its frozen BeanId (by ContractId) and thread it as a
+        // ConfigBean so validate() binds + pre-binds the bean into its slot (so refresh
+        // R5 publishes the bound Arc and never re-binds). The per-bean injection plans
+        // also flow in so the whole-graph wiring check resolves every mandatory edge.
+        let config_beans: Vec<ConfigBean<'_>> = self
+            .config_pairings
+            .iter()
+            .filter_map(|p| p.to_config_bean(app.registry()))
+            .collect();
+        let inj_of = Arc::clone(&self.inj_of);
+        let plan_lookup = move |id: leaf_core::BeanId| -> InjectionPlan { inj_of(id) };
+        let validation = ValidationInputs::new()
+            .with_plans(&plan_lookup)
+            .with_config_beans(&config_beans);
         app.validate(&validation)?;
+        drop(config_beans);
+        drop(plan_lookup);
 
         // (11) Context::refresh() — R0..R8. Refreshed/Started fire DURING via the
         // now-live EventPublisher; the runner window opens after.
@@ -443,8 +608,9 @@ impl Application {
         *phase = RunMilestone::Started;
 
         // (13) call_runners() in the readiness-gate window (after Started+Liveness,
-        // BEFORE Ready+Readiness) — sequentially, abort on the first Err.
-        self.call_runners(&run_args).await?;
+        // BEFORE Ready+Readiness) — sequentially, abort on the first Err. The
+        // `#[runner]` beans are AUTO-COLLECTED from the live Context here.
+        self.call_runners(unit.context(), &run_args).await?;
         *phase = RunMilestone::RunnersInvoked;
 
         // (14) Ready: flip Readiness=AcceptingTraffic (the K8s readiness gate — the
@@ -465,23 +631,15 @@ impl Application {
 
         let plan_of = Arc::clone(&self.plan_of);
         let inj_of = Arc::clone(&self.inj_of);
-        let advisors: Vec<leaf_core::AdvisorDescriptor> = self
-            .advisors
-            .iter()
-            .map(|p| leaf_core::AdvisorDescriptor {
-                id: p.contract,
-                order: p.order,
-                role: p.role,
-                pointcut: p.pointcut,
-                make_interceptor: p.make_interceptor,
-            })
-            .collect();
+        let advisors: Vec<leaf_core::AdvisorDescriptor> =
+            self.advisors.iter().map(advisor_descriptor).collect();
 
         let mut unit = RunUnit::over_engine(leaf_core::Engine::new(registry), env)
             .with_plan_resolver(move |id| plan_of(id))
             .with_injection_plans(move |id| inj_of(id))
             .with_proxy_plan(proxy_plan)
             .with_advisors(advisors)
+            .with_method_tables(self.method_tables.clone())
             .with_listeners(movable.listeners)
             .with_dispatch_chain(movable.dispatch_chain)
             .with_scheduled(movable.scheduled)
@@ -499,22 +657,81 @@ impl Application {
         Ok(unit)
     }
 
-    /// Compute the frozen [`ProxyPlan`](leaf_core::ProxyPlan) over the advised
-    /// beans. The minimal pipeline has no join-point views to match yet (the macro
-    /// emits `BeanJoinPoints` in a later codegen unit), so this is the empty plan
-    /// unless a richer table is supplied; the advisor descriptors still ride into
-    /// the unit so the install resolves any plan-referenced advisor.
+    /// Compute the frozen [`ProxyPlan`](leaf_core::ProxyPlan) over the advised beans
+    /// (proxy-interception phase3/08): JOIN the macro-emitted per-bean
+    /// [`JoinPointPairing`]s to their frozen `BeanId`s, reify each into the runtime
+    /// [`BeanJoinPoints`](leaf_core::BeanJoinPoints), and run every admitted advisor's
+    /// pointcut over them via [`ProxyPlan::freeze`](leaf_core::ProxyPlan::freeze) —
+    /// the O(1) `advisors_for` decoration table the R4 `after_init` install consumes.
+    ///
+    /// With no join-point pairings (a minimal app with no `#[advisable]` beans) this
+    /// is the empty plan; the advisor descriptors still ride into the unit so the
+    /// install resolves any plan-referenced advisor.
+    ///
+    /// # Errors
+    /// A [`LeafError`] from [`ProxyPlan::freeze`](leaf_core::ProxyPlan::freeze) (the
+    /// match is pure; the `Result` is kept so the seam can grow loud faults).
     fn frozen_proxy_plan(
         &self,
-        _registry: &leaf_core::Registry,
+        registry: &leaf_core::Registry,
     ) -> Result<leaf_core::ProxyPlan, LeafError> {
-        Ok(leaf_core::ProxyPlan::empty())
+        // JOIN the macro-emitted join-point specs to the frozen registry (reifying
+        // each const spec into the owned runtime BeanJoinPoints the freeze borrows).
+        let reified = build_join_points(&self.join_points, registry);
+        if reified.is_empty() {
+            return Ok(leaf_core::ProxyPlan::empty());
+        }
+        let advisors: Vec<leaf_core::AdvisorDescriptor> =
+            self.advisors.iter().map(advisor_descriptor).collect();
+        let join_points: std::collections::HashMap<leaf_core::BeanId, leaf_core::BeanJoinPoints<'_>> =
+            reified.iter().map(|r| (r.id(), r.view())).collect();
+        leaf_core::ProxyPlan::freeze(&advisors, registry, &self.creator_policy, &join_points)
+            // AssemblyError wraps the one LeafError spine (the match is pure today,
+            // so this never fires; kept so the seam can grow loud faults).
+            .map_err(|e| e.0)
     }
 
-    /// Run the merged runner stream sequentially in the readiness-gate window,
-    /// over the shared [`ApplicationArguments`]. Abort on the first `Err`.
-    async fn call_runners(&self, args: &ApplicationArguments) -> Result<(), LeafError> {
+    /// Run the merged runner stream sequentially in the readiness-gate window, over
+    /// the shared [`ApplicationArguments`]. Abort on the first `Err`.
+    ///
+    /// The stream is the union of (a) the explicit [`with_runner`](Application::with_runner)
+    /// handles and (b) the `#[runner]` beans AUTO-COLLECTED from the live `Context`:
+    /// every `dyn Runner` candidate bean (see [`runner_candidate_ids`]) JOINed to its
+    /// [`RunnerPairing`] by `ContractId`, resolved + upcast through the macro-emitted
+    /// thunk. The auto-collected beans are ordered by [`cmp_order`](leaf_core::cmp_order)
+    /// (the `RunnerPairing.order` key, then `ContractId`) and run after the explicit
+    /// handles. A candidate with no matching pairing is skipped (it is enumerable but
+    /// has no callable upcast thunk).
+    async fn call_runners(
+        &self,
+        context: &leaf_core::Context,
+        args: &ApplicationArguments,
+    ) -> Result<(), LeafError> {
+        // (a) the explicit handles (registration order).
         for runner in &self.runners {
+            runner.run(args).await?;
+        }
+
+        // (b) the auto-collected #[runner] beans from the live Context.
+        let engine = context.engine();
+        let registry = engine.registry();
+        let by_contract: std::collections::HashMap<leaf_core::ContractId, &RunnerPairing> =
+            self.runner_beans.iter().map(|p| (p.contract, p)).collect();
+
+        // The dyn Runner candidate beans, JOINed to their pairings (ordered by
+        // cmp_order — the RunnerPairing.order key, then the stable ContractId).
+        let mut collected: Vec<(OrderKey, leaf_core::ContractId, RunnerUpcast)> = Vec::new();
+        for id in runner_candidate_ids(registry) {
+            let contract = registry.descriptor(id).contract;
+            if let Some(pairing) = by_contract.get(&contract) {
+                collected.push((pairing.order, contract, pairing.upcast));
+            }
+        }
+        collected.sort_by(|(oa, ca, _), (ob, cb, _)| cmp_order(oa, ob).then(ca.cmp(cb)));
+
+        for (_order, contract, upcast) in collected {
+            let bean = engine.get_erased(BeanKey::ByContract(contract)).await?;
+            let runner = upcast(bean).ok_or_else(|| runner_upcast_failed(contract))?;
             runner.run(args).await?;
         }
         Ok(())
@@ -615,6 +832,55 @@ pub fn print_banner(env: &Env, mode: BannerMode, app_name: &str) {
             eprintln!(":: {app_name} ::");
         }
     }
+}
+
+/// Enumerate the `dyn Runner` candidate beans in the frozen registry: every bean
+/// whose `provides[]` declares the `dyn ::leaf_core::Runner` upcast view (what the
+/// `#[runner]`/`#[component]`-implementing-`Runner` macro emits).
+///
+/// This is the design's "runners are ordinary beans resolved as a typed collection
+/// from the frozen Context" (bootstrap-diagnostics phase3/14): the run pipeline
+/// discovers runner beans by the `dyn Runner` candidate view (the cleanest
+/// enumeration, per the design — no bespoke `RUNNERS` slice). The returned ids are
+/// in the registry's deterministic candidate order.
+///
+/// [`Application::call_runners`](Application) consumes this for AUTO-COLLECTION: each
+/// enumerated candidate is JOINed to its [`RunnerPairing`] by `ContractId`, the bean
+/// is resolved as an [`ErasedBean`] (which is `Arc<dyn Any>` and cannot carry a
+/// `dyn Runner` vtable), and the pairing's macro-emitted [`RunnerUpcast`] thunk
+/// recovers the callable `Arc<dyn Runner>` — the concrete→trait upcast the design
+/// names. Enumeration here is the discovery primitive; the pairing is the upcast.
+#[must_use]
+pub fn runner_candidate_ids(registry: &leaf_core::Registry) -> Vec<leaf_core::BeanId> {
+    registry
+        .candidates(std::any::TypeId::of::<dyn Runner>())
+        .to_vec()
+}
+
+/// Reify one [`AdvisorPairing`] into the live [`AdvisorDescriptor`](leaf_core::AdvisorDescriptor)
+/// the [`ProxyPlan`](leaf_core::ProxyPlan) freezes / the R4 install resolves (shared
+/// by `frozen_proxy_plan` and `build_run_unit`).
+fn advisor_descriptor(p: &AdvisorPairing) -> leaf_core::AdvisorDescriptor {
+    leaf_core::AdvisorDescriptor {
+        id: p.contract,
+        order: p.order,
+        role: p.role,
+        pointcut: p.pointcut,
+        make_interceptor: p.make_interceptor,
+    }
+}
+
+/// A runner bean's macro-emitted upcast thunk returned `None` (the resolved bean
+/// was not the concrete runner type the pairing names — a JOIN-table mismatch).
+fn runner_upcast_failed(contract: leaf_core::ContractId) -> LeafError {
+    LeafError::new(leaf_core::ErrorKind::ConstructionFailed).caused_by(leaf_core::Cause::plain(
+        "auto-collecting #[runner] beans",
+        format!(
+            "the runner bean {contract:?} resolved, but its RunnerPairing upcast thunk did not \
+             recover an `Arc<dyn Runner>` (the macro-emitted thunk names a different concrete type \
+             than the resolved bean)"
+        ),
+    ))
 }
 
 /// Highest-magnitude-wins exit-code aggregation (max-of-positives or

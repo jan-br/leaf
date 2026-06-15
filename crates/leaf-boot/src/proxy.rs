@@ -32,8 +32,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use leaf_core::{
-    AdviceChain, AdvisorDescriptor, BeanId, Cardinality, Container, ContractId, Engine, ErasedBean,
-    Interceptor, LeafError, OrderKey, Pointcut, ProxyPlan, Published, Registry, Role, Strictness,
+    AdviceChain, AdviceError, AdvisorDescriptor, BeanId, BeanJoinPoints, BeanJoinPointsSpec,
+    BeanKey, Call, Cardinality, Container, ContractId, Engine, ErasedArgs, ErasedBean, ErasedRet,
+    FixedTarget, Interceptor, LeafError, MethodJoinPoint, MethodKey, MethodTable, OrderKey,
+    Pointcut, ProxyPlan, Published, Registry, ResolveCtx, Role, Strictness, Tail,
 };
 
 // ─────────────────────────────── AdvisorPairing ─────────────────────────────
@@ -96,6 +98,154 @@ impl std::fmt::Debug for AdvisorPairing {
     }
 }
 
+// ─────────────────────────────── JoinPointPairing ───────────────────────────
+
+/// The macro→runtime per-bean join-point JOIN row (the proxy analogue of
+/// [`SeedPairing`](crate::SeedPairing)/[`AdvisorPairing`]): pairs an advisable bean's
+/// IDENTITY (its `ContractId`) with the PUBLIC `::leaf_core::BeanJoinPointsSpec` const
+/// (`__leaf_joinpoints_<Ident>`) the `#[advisable]`/`#[aspect]` macro emits beside the
+/// bean's `Descriptor`.
+///
+/// leaf-core's frozen `Descriptor` carries no join-point view, so — exactly like the
+/// `ProviderSeed`/`CondExpr`/advisor JOINs — the binary crate (`#[leaf::main]`)
+/// supplies one row per advisable bean and the proxy-assembly pass
+/// ([`build_join_points`]) JOINs each to its frozen `BeanId` by `contract` and
+/// reifies the const spec into the runtime [`BeanJoinPoints`]
+/// [`ProxyPlan::freeze`](leaf_core::ProxyPlan::freeze) runs every admitted advisor's
+/// pointcut over — so the proxy plan is built from REAL macro-emitted per-bean data,
+/// never a hand-mirrored view.
+#[derive(Clone, Copy)]
+pub struct JoinPointPairing {
+    /// The advisable bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: ContractId,
+    /// The macro-emitted const per-bean join-point spec (bean_type + markers + methods).
+    pub spec: &'static BeanJoinPointsSpec,
+}
+
+impl JoinPointPairing {
+    /// Build a join-point pairing from an advisable bean's identity + its macro-emitted
+    /// const [`BeanJoinPointsSpec`].
+    #[must_use]
+    pub fn new(contract: ContractId, spec: &'static BeanJoinPointsSpec) -> Self {
+        JoinPointPairing { contract, spec }
+    }
+}
+
+impl std::fmt::Debug for JoinPointPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinPointPairing")
+            .field("contract", &self.contract)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The owned reification of one bean's join points (the `SmallVec`-built
+/// [`MethodJoinPoint`]s borrowed by a [`BeanJoinPoints`] view). Kept alive across the
+/// [`ProxyPlan::freeze`](leaf_core::ProxyPlan::freeze) call (the view borrows it).
+pub struct ReifiedJoinPoints {
+    /// The bean's frozen slot id.
+    id: BeanId,
+    /// The bean's concrete `TypeId`.
+    bean_type: std::any::TypeId,
+    /// The bean's flat annotation metadata.
+    markers: &'static leaf_core::AnnotationMetadata,
+    /// The reified runtime method join points (the `SmallVec`s the view borrows).
+    methods: Vec<MethodJoinPoint>,
+}
+
+impl ReifiedJoinPoints {
+    /// Borrow this reification as a leaf-core [`BeanJoinPoints`] view (for
+    /// [`ProxyPlan::freeze`](leaf_core::ProxyPlan::freeze)).
+    #[must_use]
+    pub fn view(&self) -> BeanJoinPoints<'_> {
+        BeanJoinPoints {
+            bean_type: self.bean_type,
+            markers: self.markers,
+            methods: &self.methods,
+        }
+    }
+
+    /// The bean's frozen slot id (the `HashMap<BeanId, BeanJoinPoints>` key).
+    #[must_use]
+    pub fn id(&self) -> BeanId {
+        self.id
+    }
+}
+
+/// JOIN the macro-emitted [`JoinPointPairing`]s to the frozen registry: for each
+/// pairing whose `contract` is a registered bean, reify its const
+/// [`BeanJoinPointsSpec`] into an owned [`ReifiedJoinPoints`] (building each method's
+/// `SmallVec`). A pairing whose contract is not registered (a bean gated off by a
+/// condition / never registered) is silently skipped (not a fault — it has no slot to
+/// advise).
+///
+/// The returned `Vec` OWNS the reified method join points; the caller borrows each
+/// into a `HashMap<BeanId, BeanJoinPoints>` (the [`ProxyPlan::freeze`](leaf_core::ProxyPlan::freeze)
+/// input) via [`ReifiedJoinPoints::view`], so the owned `Vec` must outlive the freeze.
+#[must_use]
+pub fn build_join_points(
+    pairings: &[JoinPointPairing],
+    registry: &Registry,
+) -> Vec<ReifiedJoinPoints> {
+    pairings
+        .iter()
+        .filter_map(|p| {
+            let id = registry.by_contract(p.contract)?;
+            Some(ReifiedJoinPoints {
+                id,
+                bean_type: p.spec.bean_type,
+                markers: p.spec.markers,
+                methods: p.spec.reify_methods(),
+            })
+        })
+        .collect()
+}
+
+// ─────────────────────────────── MethodTablePairing ─────────────────────────
+
+/// The macro→runtime per-bean METHOD-TABLE JOIN row (the proxy analogue of
+/// [`SeedPairing`](crate::SeedPairing)/[`JoinPointPairing`]): pairs an advised bean's
+/// IDENTITY (its `ContractId`) with the PUBLIC `&'static ::leaf_core::MethodTable`
+/// (`__leaf_methods_<Ident>`) the `#[advisable]`/`#[aspect]` macro emits beside the
+/// bean's `Descriptor`.
+///
+/// The [`MethodTable`] carries the per-method downcast-and-invoke thunks
+/// ([`MethodEntry`](leaf_core::MethodEntry)) that drive the REAL method over the
+/// resolved [`ErasedBean`] + the [`ErasedArgs`]. It is what makes the auto-installed
+/// proxy TRANSPARENT: [`InstalledProxies::invoke`] routes a call by [`MethodKey`]
+/// through the bean's `cmp_chain`-sorted [`AdviceChain`] and terminates in the
+/// matching `MethodEntry.invoke` thunk — so a `#[advisable]` bean is advised with NO
+/// hand-written `Call`/`Tail`/`FixedTarget` in user code.
+///
+/// As with the `__leaf_joinpoints_<Ident>` JOIN, the binary crate (`#[leaf::main]`)
+/// supplies one row per advised bean and [`InstalledProxies::install`] JOINs each to
+/// its frozen `BeanId` by `contract`.
+#[derive(Clone, Copy)]
+pub struct MethodTablePairing {
+    /// The advised bean's stable identity (the JOIN key against the frozen registry).
+    pub contract: ContractId,
+    /// The macro-emitted const per-bean method table (the downcast invoke thunks).
+    pub table: &'static MethodTable,
+}
+
+impl MethodTablePairing {
+    /// Build a method-table pairing from an advised bean's identity + its
+    /// macro-emitted const [`MethodTable`].
+    #[must_use]
+    pub fn new(contract: ContractId, table: &'static MethodTable) -> Self {
+        MethodTablePairing { contract, table }
+    }
+}
+
+impl std::fmt::Debug for MethodTablePairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MethodTablePairing")
+            .field("contract", &self.contract)
+            .field("methods", &self.table.len())
+            .finish_non_exhaustive()
+    }
+}
+
 // ───────────────────────── a Container over the Engine ───────────────────────
 
 /// A thin [`Container`] adapter over a live [`Engine`], so a
@@ -136,19 +286,25 @@ impl Container for EngineContainer<'_> {
 /// The frozen R4 `after_init` table: a `BeanId`-keyed map of live
 /// [`AdviceChain`]s (one per advised bean), each built by resolving the bean's
 /// `cmp_chain`-sorted advisor refs into live [`Interceptor`]s via their
-/// [`MakeInterceptor`](leaf_core::MakeInterceptor) bridge.
+/// [`MakeInterceptor`](leaf_core::MakeInterceptor) bridge, PLUS the per-bean
+/// [`MethodTable`] that makes the install TRANSPARENT (so an advised call routes
+/// through the chain by [`MethodKey`] via [`InstalledProxies::invoke`] with no
+/// hand-written `Call`/`Tail`).
 ///
 /// A bean with no matching advisor mints no entry (it passes through UNWRAPPED).
 #[derive(Default)]
 pub struct InstalledProxies {
     by_bean: HashMap<BeanId, Arc<AdviceChain>>,
+    /// The macro-emitted per-bean method tables (the downcast invoke thunks), JOINed
+    /// by `BeanId` from the [`MethodTablePairing`] rows — the transparent-invoke seam.
+    tables: HashMap<BeanId, &'static MethodTable>,
 }
 
 impl InstalledProxies {
     /// An empty install (the bare-engine parity case: no advised bean).
     #[must_use]
     pub fn empty() -> Self {
-        InstalledProxies { by_bean: HashMap::new() }
+        InstalledProxies { by_bean: HashMap::new(), tables: HashMap::new() }
     }
 
     /// Install the auto-proxy table (R4): for each advised bean in `plan`, resolve
@@ -159,6 +315,10 @@ impl InstalledProxies {
     /// `advisors` is the JOINed [`AdvisorDescriptor`] set (the proxy plan keyed by
     /// `ContractId`); only those referenced by an advised bean's chain are resolved.
     ///
+    /// No method tables are JOINed by this entry point (the chain is built but the
+    /// transparent-invoke seam is inert); use [`install_with_tables`](InstalledProxies::install_with_tables)
+    /// to thread the macro-emitted [`MethodTablePairing`]s.
+    ///
     /// # Errors
     /// A [`LeafError`] if an advisor's `make_interceptor` fails to resolve its
     /// aspect bean (the proxy install hard-fails the refresh — an advised bean
@@ -168,12 +328,32 @@ impl InstalledProxies {
         plan: &ProxyPlan,
         advisors: &[AdvisorDescriptor],
     ) -> Result<InstalledProxies, LeafError> {
+        Self::install_with_tables(engine, plan, advisors, &[]).await
+    }
+
+    /// Install the auto-proxy table (R4) AND JOIN the macro-emitted per-bean
+    /// [`MethodTablePairing`]s by `ContractId` — so [`InstalledProxies::invoke`]
+    /// routes a call by [`MethodKey`] through the auto-installed chain TRANSPARENTLY.
+    ///
+    /// `method_tables` is the JOINed per-bean method-table set (one row per advised
+    /// bean whose methods are transparently invocable); a bean with a chain but no
+    /// table can still be inspected (`is_advised`) but not transparently invoked.
+    ///
+    /// # Errors
+    /// As [`install`](InstalledProxies::install).
+    pub async fn install_with_tables(
+        engine: &Engine,
+        plan: &ProxyPlan,
+        advisors: &[AdvisorDescriptor],
+        method_tables: &[MethodTablePairing],
+    ) -> Result<InstalledProxies, LeafError> {
         let by_id: HashMap<ContractId, &AdvisorDescriptor> =
             advisors.iter().map(|a| (a.id, a)).collect();
         let container = EngineContainer::new(engine);
+        let registry = engine.registry();
         let mut by_bean: HashMap<BeanId, Arc<AdviceChain>> = HashMap::new();
 
-        for id in engine.registry().ids() {
+        for id in registry.ids() {
             let refs = plan.advisors_for(id);
             if refs.is_empty() {
                 continue;
@@ -191,7 +371,73 @@ impl InstalledProxies {
             by_bean.insert(id, Arc::new(AdviceChain::new(chain.into_boxed_slice())));
         }
 
-        Ok(InstalledProxies { by_bean })
+        // JOIN the per-bean method tables to their frozen BeanIds (by ContractId). A
+        // pairing whose contract is unregistered is silently skipped (no slot).
+        let tables: HashMap<BeanId, &'static MethodTable> = method_tables
+            .iter()
+            .filter_map(|p| registry.by_contract(p.contract).map(|id| (id, p.table)))
+            .collect();
+
+        Ok(InstalledProxies { by_bean, tables })
+    }
+
+    /// TRANSPARENTLY invoke an advised method (R4 after_init routing): route a call
+    /// to `method` on the advised singleton `bean` through its auto-installed
+    /// [`AdviceChain`], terminating in the bean's macro-emitted
+    /// [`MethodEntry`](leaf_core::MethodEntry) downcast thunk over the published
+    /// singleton ([`FixedTarget`]).
+    ///
+    /// This is the run-engine's "the proxy wraps the bean" half: a `#[advisable]`
+    /// bean's method is invocable through the interceptor chain with NO hand-written
+    /// `Call`/`Tail`/`FixedTarget` — the macro-emitted [`MethodTable`] supplies the
+    /// real-method dispatch.
+    ///
+    /// # Errors
+    /// An [`AdviceError`] if the bean is not advised / has no method table, the
+    /// method is not in the table, the singleton is not yet published, or any
+    /// interceptor / the real method faults.
+    pub async fn invoke(
+        &self,
+        registry: &Registry,
+        engine: &Engine,
+        bean: BeanId,
+        method: MethodKey,
+        args: ErasedArgs,
+    ) -> Result<ErasedRet, AdviceError> {
+        let chain = self.by_bean.get(&bean).ok_or(AdviceError::DowncastMismatch { method })?;
+        let table = self.tables.get(&bean).ok_or(AdviceError::DowncastMismatch { method })?;
+        let entry = table.lookup(method).ok_or(AdviceError::DowncastMismatch { method })?;
+
+        // The innermost target is the already-published singleton (FixedTarget); the
+        // tail drives the macro-emitted downcast thunk over it.
+        let target = FixedTarget::new(
+            Self::fixed_target_for(registry, bean).map_err(AdviceError::TargetResolution)?,
+        );
+        let cx = ResolveCtx::for_engine(engine);
+        // `Call.args` is the empty pack; the real args ride a take-once cell so the
+        // owned-args `MethodEntry.invoke` thunk can consume them on the (single)
+        // innermost proceed (a non-replaying around advisor — the common path).
+        let call = Call::new(
+            method,
+            BeanKey::ByContract(registry.descriptor(bean).contract),
+            ErasedArgs::none(),
+            &target,
+            &cx,
+        );
+        let invoke = entry.invoke;
+        let args_cell: std::sync::Mutex<Option<ErasedArgs>> = std::sync::Mutex::new(Some(args));
+        let tail: Box<Tail> = Box::new(move |call: &Call<'_>| {
+            // Re-resolve the singleton per proceed, then drive the macro-emitted
+            // downcast thunk over it with the take-once args.
+            let resolved = call.source.get(call.cx);
+            let taken = args_cell.lock().expect("args cell").take();
+            Box::pin(async move {
+                let bean = resolved.await.map_err(AdviceError::TargetResolution)?;
+                let args = taken.ok_or(AdviceError::DowncastMismatch { method })?;
+                invoke(&bean, args, call.cx).await
+            })
+        });
+        chain.invoke(&call, &*tail).await
     }
 
     /// The O(1) `after_init` lookup: the live [`AdviceChain`] for `bean`, or `None`
@@ -416,6 +662,103 @@ mod tests {
         let out = block(chain.invoke(&call, &*tail)).unwrap();
         assert_eq!(out.unpack::<i64>().unwrap(), 105, "the real method ran (100 + 5)");
         assert_eq!(*LOG.lock().unwrap(), vec!["enter", "exit"], "the call routed through the chain");
+    }
+
+    // A dedicated recorder for the transparent-invoke test (its own log so it does
+    // not race the shared `LOG` the install_resolves test clears + asserts on).
+    static TI_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    struct TiRecorder;
+    impl leaf_core::Interceptor for TiRecorder {
+        fn intercept<'a>(
+            &'a self,
+            call: &'a Call<'a>,
+            mut next: Next<'a>,
+        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
+            Box::pin(async move {
+                TI_LOG.lock().unwrap().push("enter");
+                let r = next.proceed(call).await;
+                TI_LOG.lock().unwrap().push("exit");
+                r
+            })
+        }
+    }
+
+    #[test]
+    fn install_with_tables_routes_a_transparent_invoke_through_the_chain() {
+        TI_LOG.lock().unwrap().clear();
+
+        let mut builder = RegistryBuilder::new();
+        let d = svc_desc();
+        let id = builder.register(d, Arc::new(SvcProv(d))).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        block(engine.get::<Svc>()).unwrap(); // publish the singleton
+
+        let advisor = AdvisorPairing::new(
+            ContractId::of("test::RecorderAdvisor"),
+            OrderKey::implicit(),
+            Role::Application,
+            &ANY,
+            |_c: &dyn Container| Box::pin(async { Ok(Arc::new(TiRecorder) as Arc<dyn Interceptor>) }),
+        )
+        .into_descriptor();
+        let mut jps = std::collections::HashMap::new();
+        let methods = vec![leaf_core::MethodJoinPoint {
+            method: MethodKey::of("test::Svc::add"),
+            arg_types: Default::default(),
+            ret_type: TypeId::of::<i64>(),
+        }];
+        jps.insert(
+            id,
+            leaf_core::BeanJoinPoints {
+                bean_type: TypeId::of::<Svc>(),
+                markers: &AnnotationMetadata::EMPTY,
+                methods: &methods,
+            },
+        );
+        let plan = ProxyPlan::freeze(
+            std::slice::from_ref(&advisor),
+            engine.registry(),
+            &CreatorPolicy::ALL,
+            &jps,
+        )
+        .unwrap();
+
+        // The macro-emitted MethodTable: the downcast invoke thunk for Svc::add.
+        fn add_invoke(
+            bean: &ErasedBean,
+            args: ErasedArgs,
+            _cx: &ResolveCtx<'_>,
+        ) -> leaf_core::BoxFuture<'static, Result<ErasedRet, AdviceError>> {
+            let svc = Arc::clone(bean).downcast::<Svc>().expect("Svc");
+            Box::pin(async move {
+                let add = args
+                    .unpack::<i64>()
+                    .map_err(|_| AdviceError::DowncastMismatch { method: MethodKey::of("test::Svc::add") })?;
+                Ok(ErasedRet::pack(svc.base + add))
+            })
+        }
+        static TABLE: MethodTable = MethodTable(&[leaf_core::MethodEntry {
+            key: MethodKey::of("test::Svc::add"),
+            invoke: add_invoke,
+        }]);
+        let tables = [MethodTablePairing::new(ContractId::of("test::Svc"), &TABLE)];
+
+        // INSTALL WITH TABLES (R4): the transparent-invoke seam is now live.
+        let installed =
+            block(InstalledProxies::install_with_tables(&engine, &plan, &[advisor], &tables)).unwrap();
+        assert!(installed.is_advised(id));
+
+        // TRANSPARENT invoke: no hand-written Call/Tail — the macro-emitted thunk drives it.
+        let out = block(installed.invoke(
+            engine.registry(),
+            &engine,
+            id,
+            MethodKey::of("test::Svc::add"),
+            ErasedArgs::pack(5_i64),
+        ))
+        .unwrap();
+        assert_eq!(out.unpack::<i64>().unwrap(), 105, "the real method ran (100 + 5)");
+        assert_eq!(*TI_LOG.lock().unwrap(), vec!["enter", "exit"], "routed through the chain");
     }
 
     #[test]
