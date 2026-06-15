@@ -52,6 +52,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod configdata;
 pub mod engine;
 pub mod error;
 pub mod flatten;
@@ -60,6 +61,11 @@ pub mod placeholder_engine;
 pub mod precedence;
 
 // ── curated re-exports: the flat config-engine surface ──
+
+pub use configdata::{
+    illegal_activation_error, illegal_activation_key, is_document_active, DocControl,
+    ACTIVATE_ON_PROFILE, IMPORT_KEY, RESERVED_ACTIVATION_KEYS,
+};
 
 pub use error::{ConfigDataError, ConfigDataErrorKind, ConfigDataLocation, LocationScheme};
 

@@ -15,11 +15,18 @@
 //!    schema-independently).
 //! 2. **config-data load** (the `spring.config.import`-analogue) — the supplied
 //!    location worklist is driven through leaf-config's [`ConfigDataLoader`]s
-//!    (async, on the bootstrap executor here), each document folded onto the
-//!    env-builder stack at its [`PrecedenceRung`].
+//!    (async, on the bootstrap executor here) RECURSIVELY: a `leaf.config.import`
+//!    key inside a loaded document discovers + folds in the imported location(s),
+//!    with a visited-set so an import CYCLE is idempotent. This is TWO-PHASE: the
+//!    documents are collected first (always-active ones seed profile resolution),
+//!    then re-filtered against the resolved active profiles — a loaded document
+//!    carrying `leaf.config.activate.on-profile` is DROPPED unless its profile
+//!    expression is active, and a profile-activated document that sets a reserved
+//!    early-binding key is a loud `IllegalActivationDocument` error.
 //! 3. **profile activation** — [`leaf_core::ProfileLevers`] are harvested from the
-//!    sealed-so-far stack and resolved ONCE via [`leaf_core::resolve_active`] into
-//!    the canonical [`leaf_core::ActiveProfiles`], BEFORE any condition evaluates.
+//!    always-active stack and resolved ONCE via [`leaf_core::resolve_active`] into
+//!    the canonical [`leaf_core::ActiveProfiles`], BEFORE any condition evaluates
+//!    AND before the document-activation filter (phase-2) runs.
 //! 4. **`bindToApplication`** — the `leaf.main.*` subtree is bound onto the live
 //!    [`leaf_core::BootstrapSettings`] record (declarative-seal, NOT live-object
 //!    mutation; config = last write wins over programmatic defaults).
@@ -39,7 +46,10 @@ use leaf_core::{
 };
 
 use leaf_config::{apply, ConfigDataError, ConfigDataLoader, LoadCtx, PrecedenceRung};
-use leaf_config::{ConfigDataLocation, Contribution, ConfigDataPlan};
+use leaf_config::{
+    illegal_activation_error, illegal_activation_key, is_document_active, ConfigDataLocation,
+    ConfigDataPlan, Contribution, DocControl,
+};
 
 /// The stable name of the synthesized command-line property source.
 pub const COMMAND_LINE_SOURCE: &str = "commandLineArgs";
@@ -174,27 +184,70 @@ pub fn command_line_source(args: &ApplicationArguments) -> MapPropertySource {
     MapPropertySource::new(Arc::<str>::from(COMMAND_LINE_SOURCE), entries)
 }
 
-/// Drive the config-data import worklist through leaf-config's loaders, folding
-/// each resulting document onto `builder` at its rung.
+/// One config-data document collected during the recursive worklist traversal,
+/// carrying everything the two-phase orchestration needs: its precedence rung +
+/// deterministic discovery index, its sealed source name, its parsed control
+/// subset (on-profile gate + declared imports), and its flattened props.
+struct CollectedDoc {
+    rung: PrecedenceRung,
+    index: u32,
+    source_name: String,
+    control: DocControl,
+    props: Vec<(String, leaf_core::PropertyValue)>,
+}
+
+/// PHASE 1 — drive the config-data import worklist through leaf-config's loaders
+/// RECURSIVELY (the `leaf.config.import`-analogue traversal), collecting every
+/// loaded document in deterministic discovery order.
+///
+/// A `leaf.config.import` key INSIDE a loaded document discovers + folds in the
+/// imported location(s); a `visited` set keyed by the RESOLVED location raw
+/// string makes an import CYCLE idempotent (each location loads at most once, no
+/// infinite loop, no double-load). Imported documents sit at the next group's
+/// `external` rung so they out-rank the importer (Spring's import precedence).
 ///
 /// Async because a genuinely-remote loader's `load` is a `BoxFuture` (the cold
 /// IO fence runs on the bootstrap executor); the local-file inline/snapshot path
 /// resolves without touching the filesystem. Selection is by `handles` DATA,
 /// never link order; a location no loader claims is a loud `ConfigDataError`.
-async fn load_config_data(
+///
+/// NOTE: no document-activation filter or illegal-activation check runs here —
+/// that is PHASE 2 ([`build_filtered_plan`]), which needs the resolved active
+/// profiles. This phase only DISCOVERS + LOADS (so the always-active docs can
+/// seed profile resolution).
+async fn collect_documents(
     loaders: &[&dyn ConfigDataLoader],
     imports: &[ImportLocation],
-    builder: &mut EnvBuilder,
-) -> Result<(), ConfigDataError> {
-    let mut plan = ConfigDataPlan::new();
+) -> Result<Vec<CollectedDoc>, ConfigDataError> {
+    let mut collected = Vec::new();
     let mut index: u32 = 0;
-    for item in imports {
-        let location = ConfigDataLocation::parse(&item.raw_location);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // The recursion worklist: (location, rung, inline-text, group). The seed
+    // imports keep their declared rung + group; a discovered import descends one
+    // group + flips `external` so it out-ranks its importer.
+    let mut work: std::collections::VecDeque<(ConfigDataLocation, PrecedenceRung, Option<String>)> =
+        imports
+            .iter()
+            .map(|item| {
+                (
+                    ConfigDataLocation::parse(&item.raw_location),
+                    item.rung,
+                    item.inline.clone(),
+                )
+            })
+            .collect();
+
+    while let Some((location, rung, inline)) = work.pop_front() {
+        // Idempotent visited-set keyed by the resolved location raw string.
+        if !visited.insert(location.raw().to_string()) {
+            continue;
+        }
         let loader = loaders
             .iter()
             .find(|l| l.handles(&location))
             .ok_or_else(|| ConfigDataError::no_loader(location.raw()))?;
-        let cx = match &item.inline {
+        let cx = match &inline {
             Some(text) => LoadCtx::inline(text),
             None => LoadCtx::new(),
         };
@@ -205,12 +258,113 @@ async fn load_config_data(
             } else {
                 format!("{}#{doc_no}", location.raw())
             };
-            plan.push(Contribution::new(item.rung, index, source_name, doc.props));
+            let control = DocControl::parse(&doc.props);
+            // Enqueue this document's declared imports (recursive discovery).
+            // Imported docs descend one group + are `external` so they out-rank
+            // the importer; inline text never propagates (imports name a loader-
+            // resolvable location, read fresh).
+            //
+            // A PROFILE-ACTIVATED document's import is NOT followed here: an
+            // import inside an activated doc is a reserved early-binding key, so
+            // it is either dropped (inactive doc) or a loud illegal-activation
+            // error (active doc) — both decided in phase 2. Following it eagerly
+            // would surface the wrong (load-IO) fault before that check.
+            if !control.is_profile_activated() {
+                let import_rung = next_import_rung(rung);
+                for raw in &control.imports {
+                    work.push_back((ConfigDataLocation::parse(raw), import_rung, None));
+                }
+            }
+            collected.push(CollectedDoc {
+                rung,
+                index,
+                source_name,
+                control,
+                props: doc.props,
+            });
             index += 1;
         }
     }
+    Ok(collected)
+}
+
+/// The rung a document discovered via `leaf.config.import` sits at: one group
+/// above its importer, flagged `external`, so an imported file out-ranks the
+/// importing file (the Spring import-precedence rule). A non-`ConfigDataFile`
+/// rung (e.g. an env/cmdline-seeded import) keeps its rung verbatim.
+fn next_import_rung(parent: PrecedenceRung) -> PrecedenceRung {
+    match parent {
+        PrecedenceRung::ConfigDataFile { group, .. } => PrecedenceRung::ConfigDataFile {
+            group: group.saturating_add(1),
+            profile_specific: false,
+            external: true,
+        },
+        other => other,
+    }
+}
+
+/// Fold the always-active (NON-profile-gated) documents onto `builder`. The
+/// profile levers harvested off this stack (plus the command-line source already
+/// on `builder`) resolve the active profiles BEFORE the activation filter runs.
+fn apply_always_active(docs: &[CollectedDoc], builder: &mut EnvBuilder) {
+    let mut plan = ConfigDataPlan::new();
+    for doc in docs {
+        if doc.control.is_profile_activated() {
+            continue;
+        }
+        plan.push(Contribution::new(
+            doc.rung,
+            doc.index,
+            doc.source_name.clone(),
+            doc.props.clone(),
+        ));
+    }
     apply(plan, builder);
-    Ok(())
+}
+
+/// PHASE 2 — build the FINAL plan over the resolved active profiles: apply the
+/// document-activation filter (drop a gated doc whose on-profile expression is
+/// inactive) + enforce the illegal-activation hard rule (a profile-activated
+/// doc that sets a reserved early-binding key is a loud error).
+///
+/// A profile-specific (activated) document that survives the filter sits at its
+/// `profile_specific` rung so it out-ranks the plain documents at its group.
+fn build_filtered_plan(
+    docs: Vec<CollectedDoc>,
+    active: &leaf_core::ActiveProfiles,
+) -> Result<ConfigDataPlan, ConfigDataError> {
+    let mut plan = ConfigDataPlan::new();
+    for doc in docs {
+        if !is_document_active(&doc.control, active, &doc.source_name)? {
+            continue;
+        }
+        if doc.control.is_profile_activated() {
+            // Hard rule: an activated doc may not set a reserved early key.
+            if let Some(key) = illegal_activation_key(&doc.control, &doc.props) {
+                return Err(illegal_activation_error(&doc.source_name, key));
+            }
+        }
+        let rung = if doc.control.is_profile_activated() {
+            promote_profile_specific(doc.rung)
+        } else {
+            doc.rung
+        };
+        plan.push(Contribution::new(rung, doc.index, doc.source_name, doc.props));
+    }
+    Ok(plan)
+}
+
+/// Promote a document's rung to `profile_specific` (an activated document
+/// out-ranks the plain documents at its group — the last-profile-wins ladder).
+fn promote_profile_specific(rung: PrecedenceRung) -> PrecedenceRung {
+    match rung {
+        PrecedenceRung::ConfigDataFile { group, external, .. } => PrecedenceRung::ConfigDataFile {
+            group,
+            profile_specific: true,
+            external,
+        },
+        other => other,
+    }
 }
 
 /// Harvest the [`ProfileLevers`] from the (partly-)sealed stack: the relaxed
@@ -309,44 +463,62 @@ pub async fn seal_environment_with(
     // ── 1. argv → ApplicationArguments + the highest-precedence cmdline source ──
     let args = ApplicationArguments::parse(inputs.argv)?;
 
-    let mut builder = EnvBuilder::new();
-    // Command-line is the highest operational rung (add_first = wins).
-    builder.add_first(Arc::new(command_line_source(&args)));
+    let cmdline: Arc<dyn leaf_core::PropertySource> = Arc::new(command_line_source(&args));
 
-    // ── 2. config-data load (the spring.config.import-analogue) ────────────────
-    // Loaded documents fold onto the stack BELOW the command-line source (the
-    // applier `add_last`s them, so the cmdline source stays first/highest).
-    load_config_data(loaders, &inputs.imports, &mut builder).await?;
+    // Programmatic defaults are the LOWEST operational rung — built once here so
+    // both the provisional (phase-1) and final (phase-2) stacks share it.
+    let programmatic: Option<Arc<dyn leaf_core::PropertySource>> = (!inputs.programmatic.is_empty())
+        .then(|| {
+            let origin = Origin::Native { crate_name: Some("leaf-boot::programmatic") };
+            let prog = MapPropertySource::new(
+                Arc::<str>::from(PROGRAMMATIC_SOURCE),
+                inputs
+                    .programmatic
+                    .into_iter()
+                    .map(|(k, v)| (k, PropertyValue::with_origin(v, origin))),
+            );
+            Arc::new(prog) as Arc<dyn leaf_core::PropertySource>
+        });
 
-    // Programmatic defaults are the LOWEST operational rung (added last).
-    if !inputs.programmatic.is_empty() {
-        let origin = Origin::Native { crate_name: Some("leaf-boot::programmatic") };
-        let prog = MapPropertySource::new(
-            Arc::<str>::from(PROGRAMMATIC_SOURCE),
-            inputs
-                .programmatic
-                .into_iter()
-                .map(|(k, v)| (k, PropertyValue::with_origin(v, origin))),
-        );
-        builder.add_last(Arc::new(prog));
+    // ── 2. config-data load PHASE 1 — recursive import discovery + collect ─────
+    // The `leaf.config.import` worklist is driven RECURSIVELY (visited-set keyed
+    // by resolved location → cycle-idempotent); no activation filter yet (it
+    // needs the active profiles, which the always-active docs below resolve).
+    let docs = collect_documents(loaders, &inputs.imports).await?;
+
+    // ── 3. profile activation — resolve ONCE over (cmdline + always-active docs +
+    //       programmatic), the inputs that can carry profile levers BEFORE the
+    //       document-activation filter runs (Spring's two-phase resolve).
+    let mut provisional_builder = EnvBuilder::new();
+    provisional_builder.add_first(cmdline.clone());
+    apply_always_active(&docs, &mut provisional_builder);
+    if let Some(prog) = &programmatic {
+        provisional_builder.add_last(prog.clone());
     }
-
-    // The stack is now assembled; snapshot a provisional read view for the levers
-    // + binding (both pure reads over the sealed-so-far stack).
-    let provisional = builder.seal_env();
-
-    // ── 3. profile activation (resolve_active runs ONCE, before any condition) ──
+    let provisional = provisional_builder.seal_env();
     let levers = harvest_profile_levers(&provisional);
     let profiles = resolve_active(levers, false)?;
 
-    // ── 4. bindToApplication (leaf.main.* → frozen BootstrapSettings) ──────────
-    let settings = bind_to_application(&provisional);
+    // ── 4. config-data PHASE 2 — apply the document-activation filter + the
+    //       illegal-activation hard rule against the now-resolved profiles, then
+    //       fold the FINAL plan onto the real stack.
+    let plan = build_filtered_plan(docs, &profiles)?;
+    let mut builder = EnvBuilder::new();
+    builder.add_first(cmdline);
+    apply(plan, &mut builder);
+    if let Some(prog) = programmatic {
+        builder.add_last(prog);
+    }
+    let env = builder.seal_env();
 
-    // ── 5. snapshot the Env (the seal fence) ───────────────────────────────────
-    // The provisional view IS the sealed env (the builder is consumed); no source
-    // push is representable after this point.
+    // ── 5. bindToApplication (leaf.main.* → frozen BootstrapSettings) ──────────
+    let settings = bind_to_application(&env);
+
+    // ── 6. snapshot the Env (the seal fence) ───────────────────────────────────
+    // The view IS the sealed env (the builder is consumed); no source push is
+    // representable after this point.
     Ok(SealedEnvironment {
-        env: provisional,
+        env,
         args,
         settings,
         profiles,
@@ -470,5 +642,213 @@ mod tests {
             .expect("seals");
         // A bare flag is present (empty string), which is truthy by OnProperty's rule.
         assert_eq!(sealed.env.get("debug").unwrap().raw, "");
+    }
+
+    // ── config-data orchestration: on-profile activation filter ───────────────
+
+    fn group0() -> PrecedenceRung {
+        PrecedenceRung::ConfigDataFile {
+            group: 0,
+            profile_specific: false,
+            external: false,
+        }
+    }
+
+    #[test]
+    fn on_profile_document_is_dropped_when_profile_inactive() {
+        // A multi-doc YAML: the base doc is always-active; the second doc gates
+        // on `prod`, which is NOT active (no profile activated). The gated doc's
+        // key must NOT be present.
+        let yaml = leaf_config::YamlLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&yaml];
+        let inputs = SealInputs::new().with_import(ImportLocation::inline(
+            "application.yaml",
+            group0(),
+            "base.key: base-val\n---\nleaf.config.activate.on-profile: prod\nprod.key: prod-val\n",
+        ));
+        let sealed = block_on(seal_environment_with(inputs, &loaders)).expect("seals");
+        assert_eq!(sealed.env.get("base.key").unwrap().raw, "base-val");
+        assert!(
+            sealed.env.get("prod.key").is_none(),
+            "an inactive on-profile document must be dropped"
+        );
+    }
+
+    #[test]
+    fn on_profile_document_is_kept_when_profile_active() {
+        // Same file, but `--leaf.profiles.active=prod` makes the gated doc active.
+        let yaml = leaf_config::YamlLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&yaml];
+        let inputs = SealInputs::new()
+            .with_args(["--leaf.profiles.active=prod"])
+            .with_import(ImportLocation::inline(
+                "application.yaml",
+                group0(),
+                "base.key: base-val\n---\nleaf.config.activate.on-profile: prod\nprod.key: prod-val\n",
+            ));
+        let sealed = block_on(seal_environment_with(inputs, &loaders)).expect("seals");
+        assert_eq!(sealed.env.get("base.key").unwrap().raw, "base-val");
+        assert_eq!(
+            sealed.env.get("prod.key").unwrap().raw,
+            "prod-val",
+            "an active on-profile document must be kept"
+        );
+    }
+
+    #[test]
+    fn on_profile_document_uses_full_profile_algebra() {
+        // Expression `prod & !legacy`: active under {prod}, inactive under {prod,legacy}.
+        let yaml = leaf_config::YamlLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&yaml];
+        let text = "base.key: base\n---\nleaf.config.activate.on-profile: prod & !legacy\ngated.key: on\n";
+        let active = block_on(seal_environment_with(
+            SealInputs::new()
+                .with_args(["--leaf.profiles.active=prod"])
+                .with_import(ImportLocation::inline("application.yaml", group0(), text)),
+            &loaders,
+        ))
+        .expect("seals");
+        assert_eq!(active.env.get("gated.key").unwrap().raw, "on");
+
+        let inactive = block_on(seal_environment_with(
+            SealInputs::new()
+                .with_args(["--leaf.profiles.active=prod,legacy"])
+                .with_import(ImportLocation::inline("application.yaml", group0(), text)),
+            &loaders,
+        ))
+        .expect("seals");
+        assert!(inactive.env.get("gated.key").is_none());
+    }
+
+    // ── config-data orchestration: recursive import traversal ─────────────────
+
+    fn write_temp(name: &str, text: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "leaf-cfgimport-{}-{}",
+            std::process::id(),
+            name.replace(['/', '.'], "_")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn recursive_import_folds_in_imported_locations() {
+        // base.json imports child.json (by file path); child.json's key must
+        // appear in the sealed env.
+        let json = JsonLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&json];
+        let child = write_temp("child.json", r#"{"child":{"key":"from-child"}}"#);
+        let base_text = format!(
+            r#"{{"base":{{"key":"from-base"}},"leaf":{{"config":{{"import":"{}"}}}}}}"#,
+            child.display()
+        );
+        let base = write_temp("base.json", &base_text);
+        let inputs =
+            SealInputs::new().with_import(ImportLocation::file(base.display().to_string()));
+        let sealed = block_on(seal_environment_with(inputs, &loaders)).expect("seals");
+        assert_eq!(sealed.env.get("base.key").unwrap().raw, "from-base");
+        assert_eq!(
+            sealed.env.get("child.key").unwrap().raw,
+            "from-child",
+            "the recursively-imported document must be folded in"
+        );
+    }
+
+    #[test]
+    fn import_cycle_is_idempotent_no_infinite_loop() {
+        // a.json imports b.json; b.json imports a.json. The load must terminate
+        // and each location loads at most once (the visited-set keyed by resolved
+        // location). We assert both keys resolve and the call returns.
+        let json = JsonLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&json];
+        // Pre-declare the paths so each file can name the other.
+        let dir = std::env::temp_dir().join(format!("leaf-cfgcycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.json");
+        let b = dir.join("b.json");
+        std::fs::write(
+            &a,
+            format!(
+                r#"{{"a":{{"key":"a-val"}},"leaf":{{"config":{{"import":"{}"}}}}}}"#,
+                b.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            format!(
+                r#"{{"b":{{"key":"b-val"}},"leaf":{{"config":{{"import":"{}"}}}}}}"#,
+                a.display()
+            ),
+        )
+        .unwrap();
+        let inputs =
+            SealInputs::new().with_import(ImportLocation::file(a.display().to_string()));
+        let sealed = block_on(seal_environment_with(inputs, &loaders))
+            .expect("an import cycle terminates idempotently");
+        assert_eq!(sealed.env.get("a.key").unwrap().raw, "a-val");
+        assert_eq!(sealed.env.get("b.key").unwrap().raw, "b-val");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── config-data orchestration: illegal-activation hard rule ───────────────
+
+    #[test]
+    fn profile_activated_document_setting_active_profiles_is_loud() {
+        let yaml = leaf_config::YamlLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&yaml];
+        let inputs = SealInputs::new()
+            .with_args(["--leaf.profiles.active=prod"])
+            .with_import(ImportLocation::inline(
+                "application.yaml",
+                group0(),
+                "---\nleaf.config.activate.on-profile: prod\nleaf.profiles.active: sneaky\n",
+            ));
+        let err = block_on(seal_environment_with(inputs, &loaders))
+            .expect_err("a profile-activated doc setting active profiles is illegal");
+        assert_eq!(err.kind, leaf_core::ErrorKind::BindError);
+    }
+
+    #[test]
+    fn profile_activated_document_setting_import_is_loud() {
+        let yaml = leaf_config::YamlLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&yaml];
+        let inputs = SealInputs::new()
+            .with_args(["--leaf.profiles.active=prod"])
+            .with_import(ImportLocation::inline(
+                "application.yaml",
+                group0(),
+                "---\nleaf.config.activate.on-profile: prod\nleaf.config.import: more.json\n",
+            ));
+        let err = block_on(seal_environment_with(inputs, &loaders))
+            .expect_err("a profile-activated doc setting an import is illegal");
+        assert_eq!(err.kind, leaf_core::ErrorKind::BindError);
+    }
+
+    // ── config-data orchestration: precedence of imported/profile docs ────────
+
+    #[test]
+    fn profile_activated_document_outranks_base_document() {
+        // base sets server.port=1111 (always active); a prod-gated doc sets it to
+        // 2222. With prod active, the profile-specific doc must WIN (it sits at a
+        // higher rung).
+        let yaml = leaf_config::YamlLoader;
+        let loaders: [&dyn ConfigDataLoader; 1] = [&yaml];
+        let inputs = SealInputs::new()
+            .with_args(["--leaf.profiles.active=prod"])
+            .with_import(ImportLocation::inline(
+                "application.yaml",
+                group0(),
+                "server.port: 1111\n---\nleaf.config.activate.on-profile: prod\nserver.port: 2222\n",
+            ));
+        let sealed = block_on(seal_environment_with(inputs, &loaders)).expect("seals");
+        assert_eq!(
+            sealed.env.get("server.port").unwrap().raw,
+            "2222",
+            "the profile-activated document out-ranks the base document"
+        );
     }
 }
