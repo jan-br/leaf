@@ -3,13 +3,6 @@
 //! Run:  `cargo run -p storefront`   Test: `cargo test -p storefront`.
 //! Features-by-package (DDD): `platform` (infra beans), `catalog`, `orders`, `pricing`.
 
-// The annotation macros emit absolute `::leaf_core::`/`::leaf_cache::`/`::leaf_tx::`
-// paths; these source aliases of the single `leaf` dep make them resolve umbrella-only
-// (NOT new Cargo deps — `Cargo.toml` still names only `leaf`).
-extern crate leaf as leaf_core;
-extern crate leaf as leaf_cache;
-extern crate leaf as leaf_tx;
-
 mod catalog;
 mod orders;
 mod platform;

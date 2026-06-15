@@ -47,7 +47,7 @@ pub mod runtime;
 // (TOOLKIT §discovery). An absolute `::crate` path resolves ONLY against the
 // consuming crate's EXTERN PRELUDE (its direct Cargo deps), which a re-export cannot
 // inject. So an umbrella-ONLY downstream (one `leaf` dependency, the blessed path)
-// makes those roots resolve with a one-line-per-root source alias in its crate root:
+// needs each concern-crate root to be a SOURCE alias of the one `leaf` dep:
 //
 // ```ignore
 // extern crate leaf as leaf_core;   // ::leaf_core::X  → leaf::X (re-exported below)
@@ -55,13 +55,18 @@ pub mod runtime;
 // extern crate leaf as leaf_tx;     // ::leaf_tx::X    → leaf::X (the #[transactional] root)
 // ```
 //
-// `extern crate <dep> as <name>` is a SOURCE alias of an existing direct dependency
-// (the `leaf` umbrella), NOT a new Cargo dependency — so the downstream still names
-// exactly ONE `leaf` dependency. For each alias to satisfy the macro paths, the
-// umbrella re-exports the macro-referenced surface of each crate AT ITS ROOT (below):
-// `leaf::Descriptor` (= leaf-core's), `leaf::linkme`, `leaf::CacheOp`,
+// The user does NOT write these: `#[leaf::main]` AUTO-EMITS them from the binary crate
+// root (alongside its `force_link!()` anchor — see leaf_codegen::emit_main), so the
+// blessed-path entry is ONLY `use leaf::prelude::*;` + beans + `#[leaf::main]`. Crate-
+// root `extern crate` is visible crate-wide, so every module's macro-emitted
+// `::leaf_core::` path resolves. `extern crate <dep> as <name>` is a SOURCE alias of an
+// existing direct dependency (the `leaf` umbrella), NOT a new Cargo dependency — so the
+// downstream still names exactly ONE `leaf` dependency. For each alias to satisfy the
+// macro paths, the umbrella re-exports the macro-referenced surface of each crate AT ITS
+// ROOT (below): `leaf::Descriptor` (= leaf-core's), `leaf::linkme`, `leaf::CacheOp`,
 // `leaf::TxPointcut`, … — so `::leaf_core::Descriptor` resolves to `leaf::Descriptor`,
-// etc. This is the maximal-magic umbrella-only DX completed.
+// etc. This is the maximal-magic umbrella-only DX completed. (A non-`#[leaf::main]`
+// entry — a hand-written `#[tokio::main]` — still writes the three aliases by hand.)
 #[doc(hidden)]
 pub use leaf_core::*;
 

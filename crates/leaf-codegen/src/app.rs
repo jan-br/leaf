@@ -140,6 +140,25 @@ pub fn emit_main(binary_crate: &str, args: &MainArgs, user_fn: &syn::ItemFn) -> 
     let umbrella_force_link = quote! { ::leaf::force_link!(); };
     let anti_dce = quote! { #force_link #umbrella_force_link #manifest };
 
+    // The umbrella-only facade aliases (emitted from the binary crate root, where
+    // `#[leaf::main]` sits). The annotation macros emit ABSOLUTE crate-root paths
+    // (`::leaf_core::`/`::leaf_cache::`/`::leaf_tx::`), which resolve against the crate's
+    // direct deps — and an umbrella-only app's only dep is `leaf`. These source aliases
+    // (NOT Cargo deps) bind each concern-crate root to the one `leaf` dependency, so a
+    // user writes ONLY `use leaf::prelude::*;` + beans + `#[leaf::main]` — no hand-written
+    // `extern crate leaf as leaf_core;`. Crate-root `extern crate` is visible crate-wide,
+    // so every module's macro-emitted `::leaf_core::` path resolves. `#[allow]` because an
+    // app using no `#[cacheable]`/`#[transactional]` leaves the cache/tx alias unused.
+    let facade_aliases = quote! {
+        #[allow(unused_extern_crates)]
+        extern crate leaf as leaf_core;
+        #[allow(unused_extern_crates)]
+        extern crate leaf as leaf_cache;
+        #[allow(unused_extern_crates)]
+        extern crate leaf as leaf_tx;
+    };
+    let anti_dce = quote! { #facade_aliases #anti_dce };
+
     // The user body, renamed so the generated `fn main` owns the entrypoint symbol.
     let mut inner = user_fn.clone();
     inner.sig.ident = format_ident!("__leaf_async_main");
@@ -366,6 +385,12 @@ mod tests {
         // The umbrella's feature-gated force-link, invoked from the binary crate so the
         // USER never hand-writes `leaf::force_link!();` (the encapsulated anti-DCE anchor).
         assert!(s.contains("::leaf::force_link!()"), "got: {s}");
+        // The umbrella-only facade aliases are AUTO-EMITTED (the user never hand-writes
+        // `extern crate leaf as leaf_core;`) so an annotation's `::leaf_core::`/
+        // `::leaf_cache::`/`::leaf_tx::` path resolves crate-wide from the one `leaf` dep.
+        assert!(s.contains("externcrateleafasleaf_core;"), "got: {s}");
+        assert!(s.contains("externcrateleafasleaf_cache;"), "got: {s}");
+        assert!(s.contains("externcrateleafasleaf_tx;"), "got: {s}");
         // The binary crate itself is always force-linked.
         assert!(s.contains(r#"::leaf_core::SourceTag("my-app")"#), "got: {s}");
         // A real synchronous `fn main` returning the umbrella-rooted LeafError is emitted.
