@@ -16,10 +16,9 @@
 //!   pointcut.
 //!
 //! The pointcut is [`ValidationPointcut`] — leaf-validation's own const-constructible
-//! predicate (matching by the bean's concrete `TypeId` or a validation
-//! [`MarkerId`]), since the kernel `within`/`annotated_marker` combinators are not
-//! const-constructible into a `&'static` row (the same reason leaf-tx owns
-//! `TxPointcut`).
+//! predicate (matching by the bean's concrete `TypeId`), since the kernel `within`
+//! combinator is not const-constructible into a `&'static` row (the same reason
+//! leaf-tx owns `TxPointcut`).
 //!
 //! ## The `#[validated]` declarative annotation
 //!
@@ -36,7 +35,7 @@ use std::sync::Arc;
 
 use leaf_core::{
     AdvisorPairingRow, BoxFuture, Container, ContractId, Interceptor, JoinPointMeta, LeafError,
-    MakeInterceptor, MarkerId, OrderKey, OrderSource, Pointcut, Role, VALIDATE_ORDER,
+    MakeInterceptor, OrderKey, OrderSource, Pointcut, Role, VALIDATE_ORDER,
 };
 
 use crate::interceptor::MethodValidationInterceptor;
@@ -55,18 +54,10 @@ pub const fn validation_order_key() -> OrderKey {
     OrderKey { value: VALIDATE_ORDER, source: OrderSource::Interface }
 }
 
-/// The default validation marker the auto-wire advisor keys on (the marker a future
-/// `#[validated]` macro emits onto the advised bean's `AnnotationMetadata`).
-#[must_use]
-pub const fn validation_marker() -> MarkerId {
-    MarkerId::of("leaf::validation::Validated")
-}
-
 // ────────────────────────────── ValidationPointcut ──────────────────────────
 
 /// leaf-validation's const-constructible pointcut: matches a join point whose bean
-/// is one of the named concrete `TypeId`s OR carries one of the named validation
-/// [`MarkerId`]s.
+/// is one of the named concrete `TypeId`s.
 ///
 /// `&'static ValidationPointcut` is usable as a `&'static dyn Pointcut` on the const
 /// [`AdvisorPairingRow`]. `TypeId::of::<T>()` is callable in an inline `const {}`
@@ -77,19 +68,17 @@ pub const fn validation_marker() -> MarkerId {
 /// use leaf_validation::ValidationPointcut;
 /// struct MyBean;
 /// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
-/// static P: ValidationPointcut = ValidationPointcut::new(&TYPES, &[]);
+/// static P: ValidationPointcut = ValidationPointcut::new(&TYPES);
 /// ```
 pub struct ValidationPointcut {
     types: &'static [TypeId],
-    markers: &'static [MarkerId],
 }
 
 impl ValidationPointcut {
-    /// A pointcut matching beans whose concrete type is in `types` OR that carry a
-    /// marker in `markers`.
+    /// A pointcut matching beans whose concrete type is in `types`.
     #[must_use]
-    pub const fn new(types: &'static [TypeId], markers: &'static [MarkerId]) -> Self {
-        ValidationPointcut { types, markers }
+    pub const fn new(types: &'static [TypeId]) -> Self {
+        ValidationPointcut { types }
     }
 
     /// The concrete `TypeId`s this pointcut matches by exact type.
@@ -97,38 +86,19 @@ impl ValidationPointcut {
     pub fn types(&self) -> &'static [TypeId] {
         self.types
     }
-
-    /// The validation markers this pointcut matches by `AnnotationMetadata` presence.
-    #[must_use]
-    pub fn markers(&self) -> &'static [MarkerId] {
-        self.markers
-    }
 }
 
 impl Pointcut for ValidationPointcut {
     fn matches(&self, jp: &JoinPointMeta<'_>) -> bool {
-        if self.types.contains(&jp.bean_type) {
-            return true;
-        }
-        self.markers
-            .iter()
-            .any(|m| jp.markers.markers.contains(m) || jp.markers.qualifiers.contains(m))
+        self.types.contains(&jp.bean_type)
     }
 }
 
 impl std::fmt::Debug for ValidationPointcut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ValidationPointcut")
-            .field("types", &self.types.len())
-            .field("markers", &self.markers.len())
-            .finish()
+        f.debug_struct("ValidationPointcut").field("types", &self.types.len()).finish()
     }
 }
-
-/// The auto-wire default pointcut: matches the leaf-validation [`validation_marker`]
-/// on a bean. (A `#[validated]` bean would carry this marker once the macro lands.)
-pub static VALIDATED_MARKER_POINTCUT: ValidationPointcut =
-    ValidationPointcut::new(&[], &[MarkerId::of("leaf::validation::Validated")]);
 
 // ──────────────────────────── make_interceptor builders ─────────────────────
 
@@ -191,6 +161,9 @@ mod tests {
     struct Bean;
     struct Other;
 
+    static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
+    static BEAN_POINTCUT: ValidationPointcut = ValidationPointcut::new(&BEAN_TYPES);
+
     #[derive(Debug)]
     struct Arg {
         name: String,
@@ -213,7 +186,7 @@ mod tests {
 
     #[test]
     fn validation_advisor_is_infrastructure_at_validate_order_outermost() {
-        let p: &'static dyn Pointcut = &VALIDATED_MARKER_POINTCUT;
+        let p: &'static dyn Pointcut = &BEAN_POINTCUT;
         let row = validation_advisor_pairing::<Arg>(p);
         assert_eq!(row.role, Role::Infrastructure, "validation is framework infrastructure");
         assert_eq!(row.order.value, VALIDATE_ORDER, "the pinned VALIDATE_ORDER chain slot (100)");
@@ -232,28 +205,10 @@ mod tests {
 
     #[test]
     fn pointcut_matches_by_concrete_type() {
-        static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
-        let pc = ValidationPointcut::new(&BEAN_TYPES, &[]);
+        let pc = ValidationPointcut::new(&BEAN_TYPES);
         let empty = AnnotationMetadata::EMPTY;
         assert!(pc.matches(&jp(TypeId::of::<Bean>(), &empty)), "matches the named type");
         assert!(!pc.matches(&jp(TypeId::of::<Other>(), &empty)), "does NOT match an unrelated bean");
-    }
-
-    #[test]
-    fn marker_pointcut_matches_a_validated_marker() {
-        static MARKED: AnnotationMetadata = AnnotationMetadata {
-            markers: &[MarkerId::of("leaf::validation::Validated")],
-            ..AnnotationMetadata::EMPTY
-        };
-        let other = AnnotationMetadata::EMPTY;
-        let bean_ty = TypeId::of::<Bean>();
-        assert!(VALIDATED_MARKER_POINTCUT.matches(&jp(bean_ty, &MARKED)));
-        assert!(!VALIDATED_MARKER_POINTCUT.matches(&jp(bean_ty, &other)));
-    }
-
-    #[test]
-    fn marker_pointcut_equals_the_public_marker() {
-        assert_eq!(validation_marker(), MarkerId::of("leaf::validation::Validated"));
     }
 
     #[test]

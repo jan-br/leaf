@@ -491,7 +491,7 @@ fn pointcut_statics(
         static #types_ident: [::core::any::TypeId; 1] =
             [const { ::core::any::TypeId::of::<#self_ty>() }];
         #[allow(non_upper_case_globals)]
-        static #pointcut_ident: #pointcut_ty = #pointcut_ty::new(&#types_ident, &[]);
+        static #pointcut_ident: #pointcut_ty = #pointcut_ty::new(&#types_ident);
     }
 }
 

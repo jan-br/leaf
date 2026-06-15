@@ -62,8 +62,8 @@ pub mod value;
 leaf_core::declare_source!("leaf-cache");
 
 pub use advisor::{
-    build_cache_interceptor, cache_advisor_contract, cache_advisor_pairing, cache_marker,
-    cache_order_key, enable_caching, resolve_manager, CachePointcut, CACHE_MARKER_POINTCUT,
+    build_cache_interceptor, cache_advisor_contract, cache_advisor_pairing, cache_order_key,
+    enable_caching, resolve_manager, CachePointcut,
 };
 pub use interceptor::{unit_key_fn, CacheInterceptor, CacheKeyFn, CacheOp, CacheRule};
 pub use manager::{FlightError, InMemoryCache, InMemoryCacheManager};

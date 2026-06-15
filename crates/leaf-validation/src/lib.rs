@@ -90,8 +90,7 @@ leaf_core::declare_source!("leaf-validation");
 
 pub use advisor::{
     enable_validation, single_arg_make_interceptor, validation_advisor_contract,
-    validation_advisor_pairing, validation_marker, validation_order_key, ValidationPointcut,
-    VALIDATED_MARKER_POINTCUT,
+    validation_advisor_pairing, validation_order_key, ValidationPointcut,
 };
 pub use bind_handler::{
     canonical_key, validate_config, validate_config_dyn, ValidationBindHandler,

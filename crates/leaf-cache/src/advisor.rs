@@ -16,10 +16,8 @@
 //!   concrete manager + a finer pointcut + the per-method [`CacheOpMeta`] + key fn.
 //!
 //! The pointcut is [`CachePointcut`] — leaf-cache's own const-constructible
-//! predicate (matching by the bean's concrete `TypeId` or a cache
-//! [`MarkerId`](leaf_core::MarkerId)), since the kernel
-//! `within`/`annotated_marker` combinators are not const-constructible into a
-//! `&'static` row.
+//! predicate (matching by the bean's concrete `TypeId`), since the kernel `within`
+//! combinator is not const-constructible into a `&'static` row.
 //!
 //! ## The `#[cacheable]` / `#[cache_put]` / `#[cache_evict]` declarative annotations
 //!
@@ -38,7 +36,7 @@ use std::sync::Arc;
 
 use leaf_core::{
     AdvisorPairingRow, BeanKey, Cardinality, Container, ContractId, Interceptor, JoinPointMeta,
-    LeafError, MakeInterceptor, MarkerId, OrderKey, OrderSource, Pointcut, Role, Strictness,
+    LeafError, MakeInterceptor, OrderKey, OrderSource, Pointcut, Role, Strictness,
     CACHE_ORDER,
 };
 
@@ -58,43 +56,31 @@ pub const fn cache_order_key() -> OrderKey {
     OrderKey { value: CACHE_ORDER, source: OrderSource::Interface }
 }
 
-/// The default cache marker the auto-wire advisor keys on (the marker a future
-/// `#[cacheable]` bean-attribute would emit onto the advised bean's
-/// `AnnotationMetadata`).
-#[must_use]
-pub const fn cache_marker() -> MarkerId {
-    MarkerId::of("leaf::cache::Cacheable")
-}
-
 // ───────────────────────────────── CachePointcut ────────────────────────────
 
 /// leaf-cache's const-constructible pointcut: matches a join point whose bean is
-/// one of the named concrete `TypeId`s OR carries one of the named cache
-/// [`MarkerId`]s.
+/// one of the named concrete `TypeId`s.
 ///
 /// `&'static CachePointcut` is usable as a `&'static dyn Pointcut` on the const
-/// [`AdvisorPairingRow`] — the kernel `within`/`annotated_marker` combinators are
-/// not const-constructible into a `&'static` row, so leaf-cache owns this one. A
-/// binding site writes:
+/// [`AdvisorPairingRow`] — the kernel `within` combinator is not const-constructible
+/// into a `&'static` row, so leaf-cache owns this one. A binding site writes:
 ///
 /// ```no_run
 /// use std::any::TypeId;
 /// use leaf_cache::CachePointcut;
 /// struct MyBean;
 /// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
-/// static P: CachePointcut = CachePointcut::new(&TYPES, &[]);
+/// static P: CachePointcut = CachePointcut::new(&TYPES);
 /// ```
 pub struct CachePointcut {
     types: &'static [TypeId],
-    markers: &'static [MarkerId],
 }
 
 impl CachePointcut {
-    /// A pointcut matching beans whose concrete type is in `types` OR that carry a
-    /// marker in `markers`.
+    /// A pointcut matching beans whose concrete type is in `types`.
     #[must_use]
-    pub const fn new(types: &'static [TypeId], markers: &'static [MarkerId]) -> Self {
-        CachePointcut { types, markers }
+    pub const fn new(types: &'static [TypeId]) -> Self {
+        CachePointcut { types }
     }
 
     /// The concrete `TypeId`s this pointcut matches by exact type.
@@ -102,38 +88,19 @@ impl CachePointcut {
     pub fn types(&self) -> &'static [TypeId] {
         self.types
     }
-
-    /// The cache markers this pointcut matches by `AnnotationMetadata` presence.
-    #[must_use]
-    pub fn markers(&self) -> &'static [MarkerId] {
-        self.markers
-    }
 }
 
 impl Pointcut for CachePointcut {
     fn matches(&self, jp: &JoinPointMeta<'_>) -> bool {
-        if self.types.contains(&jp.bean_type) {
-            return true;
-        }
-        self.markers
-            .iter()
-            .any(|m| jp.markers.markers.contains(m) || jp.markers.qualifiers.contains(m))
+        self.types.contains(&jp.bean_type)
     }
 }
 
 impl std::fmt::Debug for CachePointcut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachePointcut")
-            .field("types", &self.types.len())
-            .field("markers", &self.markers.len())
-            .finish()
+        f.debug_struct("CachePointcut").field("types", &self.types.len()).finish()
     }
 }
-
-/// The auto-wire default pointcut: matches the leaf-cache [`cache_marker`] on a
-/// bean. (A `#[cacheable]` bean would carry this marker once the macro emits it.)
-pub static CACHE_MARKER_POINTCUT: CachePointcut =
-    CachePointcut::new(&[], &[MarkerId::of("leaf::cache::Cacheable")]);
 
 // ──────────────────────────── make_interceptor builders ─────────────────────
 
@@ -244,6 +211,9 @@ mod tests {
 
     struct Bean;
 
+    static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
+    static BEAN_POINTCUT: CachePointcut = CachePointcut::new(&BEAN_TYPES);
+
     static USERS: leaf_core::CacheOpMeta = leaf_core::CacheOpMeta {
         cache_names: &["users"],
         all_entries: false,
@@ -276,7 +246,7 @@ mod tests {
 
     #[test]
     fn cache_advisor_is_infrastructure_at_cache_order() {
-        let p: &'static dyn Pointcut = &CACHE_MARKER_POINTCUT;
+        let p: &'static dyn Pointcut = &BEAN_POINTCUT;
         let row = cache_advisor_pairing(p, make_users_cache());
         assert_eq!(row.role, Role::Infrastructure, "cache advice is framework infrastructure");
         assert_eq!(row.order.value, CACHE_ORDER, "the pinned CACHE_ORDER chain slot (400)");
@@ -292,37 +262,13 @@ mod tests {
 
     #[test]
     fn cache_pointcut_matches_by_concrete_type() {
-        static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
-        let pc = CachePointcut::new(&BEAN_TYPES, &[]);
+        let pc = CachePointcut::new(&BEAN_TYPES);
         let empty = AnnotationMetadata::EMPTY;
         assert!(pc.matches(&jp(TypeId::of::<Bean>(), &empty)), "matches the named concrete type");
         assert!(
             !pc.matches(&jp(TypeId::of::<InMemoryCacheManager>(), &empty)),
             "does NOT match an unrelated bean (never advises the manager itself)"
         );
-    }
-
-    #[test]
-    fn cache_marker_pointcut_matches_a_cacheable_marker() {
-        static MARKED: AnnotationMetadata = AnnotationMetadata {
-            markers: &[MarkerId::of("leaf::cache::Cacheable")],
-            ..AnnotationMetadata::EMPTY
-        };
-        let other = AnnotationMetadata::EMPTY;
-        let bean_ty = TypeId::of::<Bean>();
-        assert!(
-            CACHE_MARKER_POINTCUT.matches(&jp(bean_ty, &MARKED)),
-            "matches a bean carrying the cache marker"
-        );
-        assert!(
-            !CACHE_MARKER_POINTCUT.matches(&jp(bean_ty, &other)),
-            "does NOT match an unmarked bean"
-        );
-    }
-
-    #[test]
-    fn cache_marker_equals_the_public_marker() {
-        assert_eq!(cache_marker(), MarkerId::of("leaf::cache::Cacheable"));
     }
 
     #[test]

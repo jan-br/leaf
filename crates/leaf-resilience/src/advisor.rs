@@ -13,9 +13,8 @@
 //!   builders a binding site / integration crate uses.
 //!
 //! The pointcut is [`ResiliencePointcut`] — leaf-resilience's own const-constructible
-//! predicate (by concrete `TypeId` or a resilience [`MarkerId`]), since the kernel
-//! `within`/`annotated_marker` combinators are not const-constructible into a
-//! `&'static` row.
+//! predicate (by concrete `TypeId`), since the kernel `within` combinator is not
+//! const-constructible into a `&'static` row.
 //!
 //! ## The `#[retryable]` / `#[concurrency_limit]` declarative annotations
 //!
@@ -40,7 +39,7 @@ use std::sync::Arc;
 
 use leaf_core::{
     AdvisorPairingRow, BackoffPolicy, BoxFuture, ConcurrencyGate, Container, ContractId,
-    Interceptor, JoinPointMeta, MakeInterceptor, MarkerId, OrderKey, OrderSource, Pointcut,
+    Interceptor, JoinPointMeta, MakeInterceptor, OrderKey, OrderSource, Pointcut,
     ResolveError, RetryPolicy, Role, CONCURRENCY_ORDER, RETRY_ORDER,
 };
 
@@ -74,25 +73,10 @@ pub const fn concurrency_order_key() -> OrderKey {
     OrderKey { value: CONCURRENCY_ORDER, source: OrderSource::Interface }
 }
 
-/// The marker the auto-wire retry advisor keys on (the marker the
-/// `#[retryable]` macro emits onto the advised bean's `AnnotationMetadata`).
-#[must_use]
-pub const fn retryable_marker() -> MarkerId {
-    MarkerId::of("leaf::resilience::Retryable")
-}
-
-/// The marker the auto-wire concurrency-limit advisor keys on (the marker the
-/// `#[concurrency_limit]` macro emits).
-#[must_use]
-pub const fn concurrency_limit_marker() -> MarkerId {
-    MarkerId::of("leaf::resilience::ConcurrencyLimit")
-}
-
 // ──────────────────────────────── ResiliencePointcut ────────────────────────
 
 /// leaf-resilience's const-constructible pointcut: matches a join point whose bean
-/// is one of the named concrete `TypeId`s OR carries one of the named resilience
-/// [`MarkerId`]s.
+/// is one of the named concrete `TypeId`s.
 ///
 /// `&'static ResiliencePointcut` is usable as a `&'static dyn Pointcut` on a const
 /// [`AdvisorPairingRow`] (the kernel combinators are not const-constructible into a
@@ -104,19 +88,17 @@ pub const fn concurrency_limit_marker() -> MarkerId {
 /// use leaf_resilience::ResiliencePointcut;
 /// struct MyBean;
 /// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
-/// static P: ResiliencePointcut = ResiliencePointcut::new(&TYPES, &[]);
+/// static P: ResiliencePointcut = ResiliencePointcut::new(&TYPES);
 /// ```
 pub struct ResiliencePointcut {
     types: &'static [TypeId],
-    markers: &'static [MarkerId],
 }
 
 impl ResiliencePointcut {
-    /// A pointcut matching beans whose concrete type is in `types` OR that carry a
-    /// marker in `markers`.
+    /// A pointcut matching beans whose concrete type is in `types`.
     #[must_use]
-    pub const fn new(types: &'static [TypeId], markers: &'static [MarkerId]) -> Self {
-        ResiliencePointcut { types, markers }
+    pub const fn new(types: &'static [TypeId]) -> Self {
+        ResiliencePointcut { types }
     }
 
     /// The concrete `TypeId`s this pointcut matches by exact type.
@@ -124,42 +106,19 @@ impl ResiliencePointcut {
     pub fn types(&self) -> &'static [TypeId] {
         self.types
     }
-
-    /// The resilience markers this pointcut matches by `AnnotationMetadata` presence.
-    #[must_use]
-    pub fn markers(&self) -> &'static [MarkerId] {
-        self.markers
-    }
 }
 
 impl Pointcut for ResiliencePointcut {
     fn matches(&self, jp: &JoinPointMeta<'_>) -> bool {
-        if self.types.contains(&jp.bean_type) {
-            return true;
-        }
-        self.markers
-            .iter()
-            .any(|m| jp.markers.markers.contains(m) || jp.markers.qualifiers.contains(m))
+        self.types.contains(&jp.bean_type)
     }
 }
 
 impl std::fmt::Debug for ResiliencePointcut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResiliencePointcut")
-            .field("types", &self.types.len())
-            .field("markers", &self.markers.len())
-            .finish()
+        f.debug_struct("ResiliencePointcut").field("types", &self.types.len()).finish()
     }
 }
-
-/// The auto-wire default retry pointcut: matches the [`retryable_marker`] on a bean.
-pub static RETRYABLE_MARKER_POINTCUT: ResiliencePointcut =
-    ResiliencePointcut::new(&[], &[MarkerId::of("leaf::resilience::Retryable")]);
-
-/// The auto-wire default concurrency-limit pointcut: matches the
-/// [`concurrency_limit_marker`] on a bean.
-pub static CONCURRENCY_LIMIT_MARKER_POINTCUT: ResiliencePointcut =
-    ResiliencePointcut::new(&[], &[MarkerId::of("leaf::resilience::ConcurrencyLimit")]);
 
 // ──────────────────────────── make_interceptor builders ─────────────────────
 
@@ -287,6 +246,9 @@ mod tests {
 
     struct Bean;
 
+    static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
+    static BEAN_POINTCUT: ResiliencePointcut = ResiliencePointcut::new(&BEAN_TYPES);
+
     // A local gate type so the pairing builder has a concrete `G` to bind (the
     // gate is resolved from the container at run time; the row only needs the type).
     struct DummyGate;
@@ -318,7 +280,7 @@ mod tests {
 
     #[test]
     fn retry_advisor_is_infrastructure_at_retry_order() {
-        let p: &'static dyn Pointcut = &RETRYABLE_MARKER_POINTCUT;
+        let p: &'static dyn Pointcut = &BEAN_POINTCUT;
         let row = retry_advisor_pairing::<ThreeTries>(p);
         assert_eq!(row.role, Role::Infrastructure, "retry is framework infrastructure");
         assert_eq!(row.order.value, RETRY_ORDER, "the pinned RETRY_ORDER (200)");
@@ -328,7 +290,7 @@ mod tests {
 
     #[test]
     fn concurrency_advisor_is_infrastructure_at_concurrency_order() {
-        let p: &'static dyn Pointcut = &CONCURRENCY_LIMIT_MARKER_POINTCUT;
+        let p: &'static dyn Pointcut = &BEAN_POINTCUT;
         let row = concurrency_advisor_pairing::<DummyGate>(p);
         assert_eq!(row.role, Role::Infrastructure);
         assert_eq!(row.order.value, CONCURRENCY_ORDER, "the pinned CONCURRENCY_ORDER (550)");
@@ -350,21 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_pointcut_matches_by_marker() {
-        static MARKED: AnnotationMetadata = AnnotationMetadata {
-            markers: &[MarkerId::of("leaf::resilience::Retryable")],
-            ..AnnotationMetadata::EMPTY
-        };
-        let empty = AnnotationMetadata::EMPTY;
-        let ty = TypeId::of::<Bean>();
-        assert!(RETRYABLE_MARKER_POINTCUT.matches(&jp(ty, &MARKED)), "matches a #[retryable] bean");
-        assert!(!RETRYABLE_MARKER_POINTCUT.matches(&jp(ty, &empty)), "ignores an unmarked bean");
-    }
-
-    #[test]
     fn pointcut_matches_by_concrete_type() {
-        static TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
-        let pc = ResiliencePointcut::new(&TYPES, &[]);
+        let pc = ResiliencePointcut::new(&BEAN_TYPES);
         let empty = AnnotationMetadata::EMPTY;
         assert!(pc.matches(&jp(TypeId::of::<Bean>(), &empty)));
         assert!(!pc.matches(&jp(TypeId::of::<u8>(), &empty)));
@@ -376,11 +325,5 @@ mod tests {
         assert_eq!(ids[0], retry_advisor_contract(), "the retry advisor identity");
         assert_eq!(ids[1], concurrency_advisor_contract(), "the concurrency-limit advisor identity");
         assert_ne!(ids[0], ids[1], "two DISTINCT advisor identities");
-    }
-
-    #[test]
-    fn markers_are_the_public_markers() {
-        assert_eq!(retryable_marker(), MarkerId::of("leaf::resilience::Retryable"));
-        assert_eq!(concurrency_limit_marker(), MarkerId::of("leaf::resilience::ConcurrencyLimit"));
     }
 }

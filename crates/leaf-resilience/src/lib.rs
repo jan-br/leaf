@@ -58,11 +58,9 @@ pub mod retry;
 pub mod template;
 
 pub use advisor::{
-    concurrency_advisor_contract, concurrency_advisor_pairing, concurrency_limit_marker,
-    concurrency_order_key, enable_resilient_methods, make_concurrency_interceptor,
-    make_retry_interceptor, retry_advisor_contract, retry_advisor_pairing, retry_order_key,
-    retryable_marker, ResiliencePointcut, RetrySpec, CONCURRENCY_LIMIT_MARKER_POINTCUT,
-    RETRYABLE_MARKER_POINTCUT,
+    concurrency_advisor_contract, concurrency_advisor_pairing, concurrency_order_key,
+    enable_resilient_methods, make_concurrency_interceptor, make_retry_interceptor,
+    retry_advisor_contract, retry_advisor_pairing, retry_order_key, ResiliencePointcut, RetrySpec,
 };
 pub use backoff::{
     immediate_sleeper, BackoffPolicy, ExponentialBackoff, FixedBackoff, ImmediateSleeper, NoBackoff,

@@ -16,9 +16,8 @@
 //!   concrete manager + a finer pointcut.
 //!
 //! The pointcut is [`TxPointcut`] — leaf-tx's own const-constructible predicate
-//! (matching by the bean's concrete `TypeId` or a tx [`MarkerId`]), since the
-//! kernel `within`/`annotated_marker` combinators are not const-constructible into
-//! a `&'static` row.
+//! (matching by the bean's concrete `TypeId`), since the kernel `within` combinator
+//! is not const-constructible into a `&'static` row.
 //!
 //! ## The `#[transactional]` declarative annotation
 //!
@@ -37,7 +36,7 @@ use std::sync::Arc;
 
 use leaf_core::{
     AdvisorPairingRow, BeanKey, BoxFuture, Cardinality, Container, ContractId, Interceptor,
-    JoinPointMeta, LeafError, MakeInterceptor, MarkerId, OrderKey, OrderSource, Pointcut, Role,
+    JoinPointMeta, LeafError, MakeInterceptor, OrderKey, OrderSource, Pointcut, Role,
     Strictness, TransactionManager, TxAttribute, TX_ORDER,
 };
 
@@ -56,42 +55,33 @@ pub const fn tx_order_key() -> OrderKey {
     OrderKey { value: TX_ORDER, source: OrderSource::Interface }
 }
 
-/// The default tx marker the auto-wire advisor keys on (the marker the
-/// `#[transactional]` macro emits onto the advised bean's `AnnotationMetadata`).
-#[must_use]
-pub const fn tx_marker() -> MarkerId {
-    MarkerId::of("leaf::tx::Transactional")
-}
-
 // ───────────────────────────────── TxPointcut ───────────────────────────────
 
 /// leaf-tx's const-constructible pointcut: matches a join point whose bean is one
-/// of the named concrete `TypeId`s OR carries one of the named tx [`MarkerId`]s.
+/// of the named concrete `TypeId`s.
 ///
 /// `&'static TxPointcut` is usable as a `&'static dyn Pointcut` on the const
-/// [`AdvisorPairingRow`] — the kernel `within`/`annotated_marker` combinators are
-/// not const-constructible into a `&'static` row (their fields are private), so
-/// leaf-tx owns this one. `TypeId::of::<T>()` is callable in an inline `const {}`
-/// block (stable), so a binding site writes:
+/// [`AdvisorPairingRow`] — the kernel `within` combinator is not const-constructible
+/// into a `&'static` row (its fields are private), so leaf-tx owns this one.
+/// `TypeId::of::<T>()` is callable in an inline `const {}` block (stable), so a
+/// binding site writes:
 ///
 /// ```no_run
 /// use std::any::TypeId;
 /// use leaf_tx::TxPointcut;
 /// struct MyBean;
 /// static TYPES: [TypeId; 1] = [const { TypeId::of::<MyBean>() }];
-/// static P: TxPointcut = TxPointcut::new(&TYPES, &[]);
+/// static P: TxPointcut = TxPointcut::new(&TYPES);
 /// ```
 pub struct TxPointcut {
     types: &'static [TypeId],
-    markers: &'static [MarkerId],
 }
 
 impl TxPointcut {
-    /// A pointcut matching beans whose concrete type is in `types` OR that carry a
-    /// marker in `markers`.
+    /// A pointcut matching beans whose concrete type is in `types`.
     #[must_use]
-    pub const fn new(types: &'static [TypeId], markers: &'static [MarkerId]) -> Self {
-        TxPointcut { types, markers }
+    pub const fn new(types: &'static [TypeId]) -> Self {
+        TxPointcut { types }
     }
 
     /// The concrete `TypeId`s this pointcut matches by exact type.
@@ -99,38 +89,19 @@ impl TxPointcut {
     pub fn types(&self) -> &'static [TypeId] {
         self.types
     }
-
-    /// The tx markers this pointcut matches by `AnnotationMetadata` presence.
-    #[must_use]
-    pub fn markers(&self) -> &'static [MarkerId] {
-        self.markers
-    }
 }
 
 impl Pointcut for TxPointcut {
     fn matches(&self, jp: &JoinPointMeta<'_>) -> bool {
-        if self.types.contains(&jp.bean_type) {
-            return true;
-        }
-        self.markers
-            .iter()
-            .any(|m| jp.markers.markers.contains(m) || jp.markers.qualifiers.contains(m))
+        self.types.contains(&jp.bean_type)
     }
 }
 
 impl std::fmt::Debug for TxPointcut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TxPointcut")
-            .field("types", &self.types.len())
-            .field("markers", &self.markers.len())
-            .finish()
+        f.debug_struct("TxPointcut").field("types", &self.types.len()).finish()
     }
 }
-
-/// The auto-wire default pointcut: matches the leaf-tx [`tx_marker`] on a bean.
-/// (A `#[transactional]` bean would carry this marker once the macro lands.)
-pub static TX_MARKER_POINTCUT: TxPointcut =
-    TxPointcut::new(&[], &[MarkerId::of("leaf::tx::Transactional")]);
 
 // ──────────────────────────── make_interceptor builders ─────────────────────
 
@@ -269,6 +240,9 @@ mod tests {
 
     struct Bean;
 
+    static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
+    static BEAN_POINTCUT: TxPointcut = TxPointcut::new(&BEAN_TYPES);
+
     fn jp<'a>(bean_type: TypeId, markers: &'a AnnotationMetadata) -> JoinPointMeta<'a> {
         JoinPointMeta {
             bean_type,
@@ -281,7 +255,7 @@ mod tests {
 
     #[test]
     fn tx_advisor_is_infrastructure_at_tx_order() {
-        let p: &'static dyn Pointcut = &TX_MARKER_POINTCUT;
+        let p: &'static dyn Pointcut = &BEAN_POINTCUT;
         let row = tx_advisor_pairing::<InMemoryTransactionManager>(p);
         assert_eq!(row.role, Role::Infrastructure, "tx advice is framework infrastructure");
         assert_eq!(row.order.value, TX_ORDER, "the pinned TX_ORDER chain slot (500)");
@@ -294,37 +268,13 @@ mod tests {
         // A pointcut over the bean's concrete TypeId matches it (the recursion-safe
         // form — never advises the manager bean itself). The const TypeId-of seam
         // mints a 'static slice exactly as a binding site does.
-        static BEAN_TYPES: [TypeId; 1] = [const { TypeId::of::<Bean>() }];
-        let pc = TxPointcut::new(&BEAN_TYPES, &[]);
+        let pc = TxPointcut::new(&BEAN_TYPES);
         let empty = AnnotationMetadata::EMPTY;
         assert!(pc.matches(&jp(TypeId::of::<Bean>(), &empty)), "matches the named concrete type");
         assert!(
             !pc.matches(&jp(TypeId::of::<InMemoryTransactionManager>(), &empty)),
             "does NOT match an unrelated bean"
         );
-    }
-
-    #[test]
-    fn tx_marker_pointcut_matches_a_transactional_marker() {
-        static MARKED: AnnotationMetadata = AnnotationMetadata {
-            markers: &[MarkerId::of("leaf::tx::Transactional")],
-            ..AnnotationMetadata::EMPTY
-        };
-        let other = AnnotationMetadata::EMPTY;
-        let bean_ty = TypeId::of::<Bean>();
-        assert!(
-            TX_MARKER_POINTCUT.matches(&jp(bean_ty, &MARKED)),
-            "matches a bean carrying the tx marker"
-        );
-        assert!(
-            !TX_MARKER_POINTCUT.matches(&jp(bean_ty, &other)),
-            "does NOT match an unmarked bean"
-        );
-    }
-
-    #[test]
-    fn tx_marker_pointcut_equals_the_public_marker() {
-        assert_eq!(tx_marker(), MarkerId::of("leaf::tx::Transactional"));
     }
 
     #[test]
