@@ -107,6 +107,47 @@ impl FlakyService {
     }
 }
 
+// ───────────────────── the TIMED-BACKOFF retry-advised service ──────────────
+
+/// The fixed-backoff delay the timed-retry service uses (ms). Two attempts (fail
+/// once, succeed) ⇒ exactly ONE backoff wait of this length, so the call must take
+/// at least ~this long ONLY IF the runtime sleeper is actually consulted.
+const BACKOFF_MS: u64 = 60;
+
+/// A service whose `slow_flaky` method FAILS ONCE then SUCCEEDS, with a
+/// `#[retryable(max = 2, backoff = fixed(BACKOFF_MS))]`. The headline BEHAVIOR
+/// PROOF: with leaf-tokio's `TokioSleeper` installed as the process default, the
+/// single backoff between the two attempts is a REAL timed wait — so the advised
+/// call elapses >= ~BACKOFF_MS. Before the sleeper wiring this slept ZERO (the hole).
+struct TimedFlakyService {
+    attempts: AtomicU32,
+}
+register_component!(TimedFlakyService);
+
+#[advisable]
+impl TimedFlakyService {
+    fn new() -> Self {
+        TimedFlakyService { attempts: AtomicU32::new(0) }
+    }
+
+    /// Fails on attempt 1 (a retryable `Cancelled`), succeeds on attempt 2 — so
+    /// exactly ONE `fixed(BACKOFF_MS)` backoff wait occurs between them.
+    #[retryable(max = 2, backoff = fixed(60))]
+    fn slow_flaky(&self, base: i64) -> Result<i64, LeafError> {
+        let n = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if n < 2 {
+            Err(LeafError::new(ErrorKind::Cancelled))
+        } else {
+            Ok(base + n as i64)
+        }
+    }
+
+    /// How many times `slow_flaky` actually ran.
+    fn attempts(&self) -> u32 {
+        self.attempts.load(Ordering::SeqCst)
+    }
+}
+
 // ─────────────────────── the CONCURRENCY-advised service ─────────────────────
 
 /// A service whose `guarded` method records the PEAK number of bodies live at once
@@ -239,6 +280,72 @@ async fn resilience_advisors_auto_advise_through_run() {
     assert!(peak <= 2, "the concurrency-limit gate (limit 2) capped concurrent entries (peak {peak})");
 
     // ── shutdown drains cleanly ──
+    let report = running.shutdown().await;
+    assert_eq!(report.run_state, leaf_core::RunState::Closed, "the context closed");
+}
+
+/// THE BACKOFF-IS-REAL PROOF: a `#[retryable(max = 2, backoff = fixed(60ms))]`
+/// method that fails once then succeeds performs a REAL timed backoff once
+/// leaf-tokio's `TokioSleeper` is installed as the process default — the advised
+/// call elapses >= ~BACKOFF_MS. This closes the hole: the macro-emitted retry
+/// interceptor now binds `default_sleeper()`, so `fixed(n)` is no longer a silent
+/// zero-time no-op.
+///
+/// RED-first witness: without the sleeper wiring (the emitted interceptor used
+/// `ImmediateSleeper`), this call elapsed ~0ms and the >= BACKOFF_MS assertion
+/// failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_backoff_actually_sleeps_through_run() {
+    leaf_tokio::install_ambient_store().ok();
+    // Install the timer-backed sleeper as the process default (the runtime install
+    // the emitted retry interceptor's `default_sleeper()` consults). Idempotent.
+    leaf_tokio::install_tokio_sleeper();
+
+    let module = module_path!();
+    let timed_contract = ContractId::of(&format!("{module}::TimedFlakyService"));
+    let spawner: Arc<dyn leaf_core::Spawner> = Arc::new(TokioExecutionFacility::new());
+
+    let running = Application::new()
+        .with_name("timed-backoff-app")
+        .with_spawner(spawner)
+        .run(SealInputs::new(), RunOverlay::none())
+        .await
+        .expect("the app auto-wires and runs to Ready");
+
+    let timed_id = running
+        .context()
+        .engine()
+        .registry()
+        .by_contract(timed_contract)
+        .expect("TimedFlakyService in registry");
+    assert!(running.is_advised(timed_id), "TimedFlakyService is auto-advised by the retry advisor");
+
+    let start = std::time::Instant::now();
+    let out = running
+        .invoke_advised(
+            timed_id,
+            MethodKey::of("TimedFlakyService::slow_flaky"),
+            ErasedArgs::pack((10_i64,)),
+        )
+        .await
+        .expect("the advised call routes through the auto-installed retry chain");
+    let elapsed = start.elapsed();
+
+    let ret: Result<i64, LeafError> = out.unpack().expect("the Result<i64,_> return");
+    assert_eq!(ret.expect("Ok after one retry"), 12, "attempt 2 won (base 10 + attempt 2)");
+
+    let timed = running.context().get::<TimedFlakyService>().await.expect("resolves");
+    assert_eq!(timed.attempts(), 2, "the method ran twice (one retry after the backoff)");
+
+    // The ONE fixed(BACKOFF_MS) backoff between the two attempts was a REAL timed
+    // wait (a small margin below BACKOFF_MS to tolerate timer coarseness). Before the
+    // fix this was ~0ms.
+    assert!(
+        elapsed >= Duration::from_millis(BACKOFF_MS - 10),
+        "the fixed backoff actually slept (elapsed {elapsed:?}, expected >= ~{BACKOFF_MS}ms) — \
+         the timed backoff is no longer a silent no-op"
+    );
+
     let report = running.shutdown().await;
     assert_eq!(report.run_state, leaf_core::RunState::Closed, "the context closed");
 }

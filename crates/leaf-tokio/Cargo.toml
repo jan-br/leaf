@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+# The timer-backed `Sleeper` impl (`TokioSleeper`) implements leaf-resilience's
+# runtime-agnostic `Sleeper` seam over `tokio::time::sleep`. The dependency
+# direction is leaf-tokio -> leaf-resilience (the runtime crate implements the
+# abstract seam); leaf-resilience depends on leaf-tokio only as a DEV-dependency
+# (its integration test), so this is NOT a build cycle.
+leaf-resilience.workspace = true
 futures.workspace = true
 once_cell.workspace = true
 

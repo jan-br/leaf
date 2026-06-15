@@ -63,8 +63,8 @@ pub use advisor::{
     retry_advisor_contract, retry_advisor_pairing, retry_order_key, ResiliencePointcut, RetrySpec,
 };
 pub use backoff::{
-    immediate_sleeper, BackoffPolicy, ExponentialBackoff, FixedBackoff, ImmediateSleeper, NoBackoff,
-    Sleeper,
+    default_sleeper, immediate_sleeper, install_default_sleeper, BackoffPolicy, ExponentialBackoff,
+    FixedBackoff, ImmediateSleeper, NoBackoff, Sleeper,
 };
 pub use concurrency::ConcurrencyLimitInterceptor;
 pub use retry::{result_classifier, RetryInterceptor, ReturnClassifier};

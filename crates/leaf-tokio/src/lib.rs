@@ -52,6 +52,7 @@ pub mod exec;
 pub mod resource;
 pub mod scheduler;
 pub mod shutdown;
+pub mod sleeper;
 
 // The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in
 // the link-collected `SOURCES` slice so the binary's expected-vs-found self-check
@@ -74,6 +75,7 @@ pub use exec::{
 pub use resource::{FileResource, FileResourceProvider};
 pub use scheduler::TokioSchedulerCore;
 pub use shutdown::TokioShutdownTrigger;
+pub use sleeper::{install_tokio_sleeper, TokioSleeper};
 
 use std::sync::Arc;
 

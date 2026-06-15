@@ -55,6 +55,11 @@ pub fn bootstrap(name: &'static str) -> Application {
     // (so the ambient Cx rides a work-stealing hop). Idempotent: an `Err` means it
     // was already installed by an earlier bootstrap — harmless, so ignore it.
     let _ = leaf_tokio::install_ambient_store();
+    // Fill leaf-resilience's process-default `Sleeper` slot with the tokio timer-backed
+    // sleeper, so an auto-wired `#[retryable(backoff = ..)]` interceptor actually sleeps
+    // (its `default_sleeper()` consults this slot). Idempotent / at-most-once; a `false`
+    // return means an earlier bootstrap already filled it — harmless.
+    let _ = leaf_tokio::install_tokio_sleeper();
 
     let spawner: Arc<dyn leaf_core::Spawner> = Arc::new(TokioExecutionFacility::new());
     let scheduler: Arc<dyn leaf_core::SchedulerCore> =

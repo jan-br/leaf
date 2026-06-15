@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 leaf-core.workspace = true
 leaf-cron.workspace = true
+once_cell.workspace = true
 
 [dev-dependencies]
 # The integration test drives a REAL annotated bean through Application::run, so it

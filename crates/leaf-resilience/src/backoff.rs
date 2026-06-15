@@ -59,6 +59,52 @@ pub fn immediate_sleeper() -> Arc<dyn Sleeper> {
     Arc::new(ImmediateSleeper)
 }
 
+// ───────────────────────── the process-default sleeper ──────────────────────
+
+/// The PROCESS-WIDE default reactive [`Sleeper`] — the runtime install seam.
+///
+/// leaf-resilience ships NO runtime; it cannot name a timer-backed sleeper
+/// (`tokio::time::sleep` lives in leaf-tokio, the runtime half). The auto-wired
+/// retry advisor's emitted interceptor (and `#[retryable]` codegen) therefore has
+/// no concrete sleeper TYPE to resolve through the container — unlike the tx
+/// advisor, whose concrete manager `M` is named at the macro site.
+///
+/// The clean no-ABI-change seam (mirroring leaf-core's
+/// [`install_ambient_store`](leaf_core::install_ambient_store)): a single
+/// at-most-once `OnceCell<Arc<dyn Sleeper>>` a runtime crate fills ONCE at boot
+/// (leaf-tokio's [`install_tokio_sleeper`](../../leaf_tokio/sleeper/fn.install_tokio_sleeper.html)).
+/// Until then the default is the runtime-free [`ImmediateSleeper`] (a retry off a
+/// runtime degrades to zero-delay, NEVER a panic).
+static DEFAULT_SLEEPER: once_cell::sync::OnceCell<Arc<dyn Sleeper>> =
+    once_cell::sync::OnceCell::new();
+
+/// Install the process-wide default reactive [`Sleeper`] the auto-wired retry
+/// advisor consults (the runtime install at boot, before refresh — the
+/// [`install_ambient_store`](leaf_core::install_ambient_store) analogue for the
+/// backoff timer).
+///
+/// At-most-once: returns `true` if THIS call installed the default, `false` if one
+/// was already installed (one timer-backed sleeper per process; a second install
+/// is a no-op, NOT a panic — so re-running the same boot path in a test harness is
+/// safe).
+pub fn install_default_sleeper(sleeper: Arc<dyn Sleeper>) -> bool {
+    DEFAULT_SLEEPER.set(sleeper).is_ok()
+}
+
+/// The process-wide default reactive [`Sleeper`]: the one
+/// [`install_default_sleeper`] filled (a runtime crate's timer-backed sleeper), or
+/// the runtime-free [`ImmediateSleeper`] when none was installed.
+///
+/// The auto-wired retry advisor's emitted interceptor binds THIS as its sleeper
+/// (`RetryInterceptor::with_sleeper(default_sleeper())`) so `#[retryable(backoff =
+/// fixed(n))]` performs a REAL timed backoff once a runtime sleeper is installed,
+/// while still degrading to zero-delay (never a busy-poll, never a panic) off a
+/// runtime.
+#[must_use]
+pub fn default_sleeper() -> Arc<dyn Sleeper> {
+    DEFAULT_SLEEPER.get().cloned().unwrap_or_else(immediate_sleeper)
+}
+
 /// No backoff: retry IMMEDIATELY (zero delay) on every attempt while the policy
 /// still permits one. (`next_delay` yields `Some(ZERO)` — the loop still consults
 /// the [`RetryPolicy`](leaf_core::RetryPolicy) for `max_attempts`/retryability.)
@@ -209,5 +255,40 @@ mod tests {
         let s = ImmediateSleeper;
         // The future is Ready on first poll — no busy-poll, nothing to wait for.
         futures::executor::block_on(s.sleep(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn default_sleeper_is_immediate_until_one_is_installed() {
+        // Before any runtime install, the process default sleeper is the
+        // runtime-free ImmediateSleeper (so a retry interceptor that consults it
+        // off a runtime degrades to zero-delay, never a panic). A RECORDING
+        // sleeper installed via `install_default_sleeper` is then consulted.
+        //
+        // (This test owns the global install; it MUST be the only test that
+        // installs, since the slot is process-wide and at-most-once. It asserts
+        // the API exists + the install path is consulted by `default_sleeper`.)
+        #[derive(Default)]
+        struct FlagSleeper(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Sleeper for FlagSleeper {
+            fn sleep(&self, _d: Duration) -> BoxFuture<'static, ()> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(std::future::ready(()))
+            }
+        }
+
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let installed = install_default_sleeper(Arc::new(FlagSleeper(Arc::clone(&flag))));
+        assert!(installed, "the first install succeeds");
+
+        // `default_sleeper()` now returns the installed sleeper; awaiting it sets
+        // the flag (proof the install is what `default_sleeper` hands back).
+        futures::executor::block_on(default_sleeper().sleep(Duration::from_millis(1)));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "the installed sleeper was consulted");
+
+        // A second install is rejected (one default per process).
+        assert!(
+            !install_default_sleeper(Arc::new(ImmediateSleeper)),
+            "a second install is rejected (at-most-once)"
+        );
     }
 }

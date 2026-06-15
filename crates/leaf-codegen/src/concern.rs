@@ -723,7 +723,22 @@ fn emit_retryable(
                         ::leaf_core::RetryPolicy::new(#max),
                         #backoff,
                     );
+                    // Bind the PROCESS-DEFAULT reactive sleeper (the runtime install
+                    // seam): a timer-backed sleeper if a runtime crate installed one
+                    // (e.g. leaf-tokio's `install_tokio_sleeper`), else the
+                    // runtime-free `ImmediateSleeper`. Without this the timed backoff
+                    // would silently sleep ZERO. leaf-codegen names no runtime crate,
+                    // so it consults the process-default slot rather than resolving a
+                    // concrete sleeper type from the container.
+                    // Bind the PROCESS-DEFAULT reactive sleeper (the runtime install
+                    // seam): a timer-backed sleeper if a runtime crate installed one
+                    // (e.g. leaf-tokio's `install_tokio_sleeper`), else the
+                    // runtime-free `ImmediateSleeper`. Without this the timed backoff
+                    // would silently sleep ZERO. leaf-codegen names no runtime crate,
+                    // so it consults the process-default slot rather than resolving a
+                    // concrete sleeper type from the container.
                     let __interceptor = ::leaf_resilience::RetryInterceptor::new(__retry)
+                        .with_sleeper(::leaf_resilience::default_sleeper())
                         .with_return_classifier(::leaf_resilience::result_classifier::<#ret>());
                     ::core::result::Result::Ok(
                         ::std::sync::Arc::new(__interceptor) as ::std::sync::Arc<dyn ::leaf_core::Interceptor>,
@@ -1234,6 +1249,10 @@ mod tests {
         // The `Result<i64,_>` Ok-type classifier so a business `Err` drives the retry.
         assert!(s.contains("::leaf_resilience::result_classifier::<i64>()"), "got: {s}");
         assert!(s.contains("::leaf_resilience::retry_order_key()"), "got: {s}");
+        // The emitted interceptor binds the PROCESS-DEFAULT reactive sleeper so a
+        // timed backoff is REAL once a runtime sleeper is installed (it degrades to
+        // the runtime-free ImmediateSleeper when none is — never a no-op silently).
+        assert!(s.contains(".with_sleeper(::leaf_resilience::default_sleeper())"), "got: {s}");
     }
 
     #[test]
