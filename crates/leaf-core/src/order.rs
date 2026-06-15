@@ -221,7 +221,7 @@ mod tests {
         let hi = key(20, OrderSource::Implicit);
         assert_eq!(cmp_order(&lo, &hi), Ordering::Less);
         assert_eq!(cmp_order(&hi, &lo), Ordering::Greater);
-        // Negative orders sort before positive (ascending integer precedence).
+        // Negative order sort before positive (ascending integer precedence).
         assert_eq!(
             cmp_order(&key(-1, OrderSource::Implicit), &key(0, OrderSource::Implicit)),
             Ordering::Less

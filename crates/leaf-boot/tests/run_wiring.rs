@@ -212,7 +212,7 @@ fn config_properties_thunk_joins_by_contract_and_binds_from_the_env() {
     b.add_last(Arc::new(MapPropertySource::from_pairs(
         "test",
         [
-            ("svc.name".to_string(), "orders".to_string()),
+            ("svc.name".to_string(), "order".to_string()),
             ("svc.retries".to_string(), "3".to_string()),
         ],
     )));
@@ -231,7 +231,7 @@ fn config_properties_thunk_joins_by_contract_and_binds_from_the_env() {
     // eager-EXCLUDED-because-PREBOUND: the slot now holds the bound config bean.
     let bound = registry.singleton_cell(cfg_id).get().expect("the config bean is pre-bound");
     let props = bound.downcast_ref::<SvcProps>().expect("downcasts to SvcProps");
-    assert_eq!(*props, SvcProps { name: "orders".into(), retries: 3 });
+    assert_eq!(*props, SvcProps { name: "order".into(), retries: 3 });
 }
 
 /// A trivial default-returning provider for the SvcProps slot (the C2 thunk pre-binds

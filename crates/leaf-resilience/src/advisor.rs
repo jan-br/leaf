@@ -301,7 +301,7 @@ mod tests {
     fn the_canonical_chain_order_holds() {
         // VALIDATE(100) < RETRY(200) < TX(500) < CONCURRENCY(550): retry is OUTSIDE
         // tx (each attempt a fresh tx) and concurrency-limit is INSIDE tx. Read the
-        // orders through the advisor's order-key fns (the runtime chain-sort input).
+        // order through the advisor's order-key fns (the runtime chain-sort input).
         let retry = retry_order_key().value;
         let concurrency = concurrency_order_key().value;
         assert!(VALIDATE_ORDER < retry, "retry inside validation");

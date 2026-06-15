@@ -411,7 +411,7 @@ mod tests {
         let got = block(b.get(&key(b"1"))).unwrap().unwrap();
         assert_eq!(CachedValue::from_stored(&got).unwrap().peek::<u64>().copied(), Some(9));
         // A different name is a different, empty cache.
-        assert!(mgr.in_memory_cache("orders").is_empty());
+        assert!(mgr.in_memory_cache("order").is_empty());
     }
 
     #[test]

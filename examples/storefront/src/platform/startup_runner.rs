@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use leaf::prelude::*;
 
 use crate::catalog::product_repository::ProductRepository;
-use crate::orders::order_service::OrderService;
+use crate::order::service::OrderService;
 use crate::platform::app_properties::AppProperties;
 
 /// Set once when the runner fires (a process-global so the test can assert it ran).
@@ -11,7 +11,7 @@ pub static RUNNER_FIRED: AtomicUsize = AtomicUsize::new(0);
 
 /// The application's startup driver — leaf's [`Runner`] is Spring's `ApplicationRunner`:
 /// it runs once in the readiness-gate window, so `main` does nothing but hand off to the
-/// framework. Collaborators are constructor-injected across features (`orders`, `catalog`,
+/// framework. Collaborators are constructor-injected across features (`order`, `catalog`,
 /// `platform`).
 #[runner]
 pub struct StartupRunner {

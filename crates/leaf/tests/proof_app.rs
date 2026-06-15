@@ -30,7 +30,7 @@ struct Repository {
 
 impl Repository {
     fn new() -> Self {
-        Repository { name: "orders" }
+        Repository { name: "order" }
     }
 }
 register_component!(Repository);
@@ -66,7 +66,7 @@ async fn the_umbrella_runs_a_real_app_from_the_prelude_alone() {
     // The blessed path: bootstrap the default-runtime Application + run it. The
     // tokio ExecutionFacility (the base runtime) is wired by `leaf::bootstrap`; the
     // per-bean wiring auto-collects from the linkme slices inside `run`.
-    let running = leaf::bootstrap("orders-app")
+    let running = leaf::bootstrap("order-app")
         .run(
             leaf::RunInputs::new()
                 .with_args(["--app.title=Orders", "--app.workers=4"])
@@ -78,7 +78,7 @@ async fn the_umbrella_runs_a_real_app_from_the_prelude_alone() {
 
     // (1) the GRAPH wired: the Service injected the Repository.
     let service = running.context().get::<OrderService>().await.expect("OrderService resolves");
-    assert_eq!(service.repo.name, "orders", "the Repository was injected into the Service");
+    assert_eq!(service.repo.name, "order", "the Repository was injected into the Service");
 
     // (2) the @ConfigurationProperties bean bound from the command-line env.
     let props = running.context().get::<AppProps>().await.expect("AppProps resolves");

@@ -2,14 +2,14 @@
 //!
 //! Run:  `cargo run -p storefront`   Test: `cargo test -p storefront`.
 //! Features-by-package (DDD): `platform` (infra beans + the startup runner), `catalog`,
-//! `orders`, `pricing`.
+//! `order`, `pricing`.
 //!
 //! Like a Spring `main`, this does NOTHING but hand off to the framework — all work runs
 //! in beans. The demo (place an order, print a summary) lives in `platform::StartupRunner`
 //! (leaf's `Runner` = Spring's `ApplicationRunner`), which fires in the readiness window.
 
 mod catalog;
-mod orders;
+mod order;
 mod platform;
 mod pricing;
 

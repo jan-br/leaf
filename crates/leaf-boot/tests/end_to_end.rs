@@ -43,7 +43,7 @@ struct Repository {
 
 impl Repository {
     fn new() -> Self {
-        Repository { name: "orders" }
+        Repository { name: "order" }
     }
 }
 register_component!(Repository);
@@ -158,7 +158,7 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
     // `.with_runner` handle (the programmatic Runner escape hatch this test exercises
     // alongside the auto-collected wiring). ──
     let running = Application::new()
-        .with_name("orders-app")
+        .with_name("order-app")
         .with_spawner(spawner)
         .with_runner(Arc::new(StartupRunner))
         .run(
@@ -170,7 +170,7 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
 
     // ── (1) the GRAPH wired: Service injected Repository; AppProps bound ──
     let service = running.context().get::<OrderService>().await.expect("OrderService resolves");
-    assert_eq!(service.repo.name, "orders", "the Repository was injected into the Service");
+    assert_eq!(service.repo.name, "order", "the Repository was injected into the Service");
     let props = running.context().get::<AppProps>().await.expect("AppProps resolves");
     assert_eq!(props.title, "Orders", "AppProps bound app.title from the env");
     assert_eq!(props.workers, 4, "AppProps bound app.workers from the env");
@@ -250,8 +250,8 @@ async fn the_whole_stack_wires_runs_advises_and_shuts_down_cleanly() {
         })
     });
     let out = chain.invoke(&call, &*tail).await.expect("the advised call");
-    // 40 + len("orders")=6 = 46.
-    assert_eq!(out.unpack::<i64>().unwrap(), 46, "the real advised method ran (40 + 6)");
+    // 40 + len("order")=5 = 45.
+    assert_eq!(out.unpack::<i64>().unwrap(), 45, "the real advised method ran (40 + 5)");
     assert_eq!(
         *ADVICE_LOG.lock().unwrap(),
         vec!["before", "after"],

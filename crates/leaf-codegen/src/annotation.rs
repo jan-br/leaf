@@ -153,7 +153,7 @@ impl MergedAnnotation {
     /// The distance (BFS hop count from the root) at which `marker` was first
     /// reached, or `None` if it is not in the closure.
     ///
-    /// This is the rank nearest-wins attribute resolution orders on: a nearer
+    /// This is the rank nearest-wins attribute resolution order on: a nearer
     /// source overrides a farther one.
     #[must_use]
     pub fn distance_of(&self, marker: &str) -> Option<usize> {

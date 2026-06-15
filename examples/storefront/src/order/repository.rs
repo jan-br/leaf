@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use leaf::prelude::*;
 
-use crate::orders::order::Order;
+use crate::order::Order;
 
-/// A `@Repository` recording placed orders. Lock-light: a saved-count and a next-id
+/// A `@Repository` recording placed order. Lock-light: a saved-count and a next-id
 /// counter (no `Mutex`) stand in for a datastore.
 #[derive(Debug)]
 pub struct OrderRepository {

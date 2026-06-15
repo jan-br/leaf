@@ -42,7 +42,7 @@ struct Repository {
 }
 impl Repository {
     fn new() -> Self {
-        Repository { name: "orders" }
+        Repository { name: "order" }
     }
 }
 register_component!(Repository);
@@ -143,7 +143,7 @@ async fn a_real_annotated_app_auto_wires_from_the_slices_alone() {
 
     // ── drive the FULL run pipeline with NOTHING but annotations + the spawner ──
     let running = Application::new()
-        .with_name("orders-app")
+        .with_name("order-app")
         .with_spawner(spawner)
         .run(
             SealInputs::new().with_args(["--app.title=Orders", "--app.workers=4"]),
@@ -159,7 +159,7 @@ async fn a_real_annotated_app_auto_wires_from_the_slices_alone() {
 
     // ── the graph wired: OrderService injected its Repository ──
     let service = running.context().get::<OrderService>().await.expect("OrderService resolves");
-    assert_eq!(service.repo.name, "orders", "the Repository was auto-injected into the Service");
+    assert_eq!(service.repo.name, "order", "the Repository was auto-injected into the Service");
 
     // ── (2) the runner ran automatically (auto-collected) ──
     assert_eq!(*RUNNER_LOG.lock().unwrap(), vec!["migrated"], "the runner auto-ran once");
@@ -185,7 +185,7 @@ async fn a_real_annotated_app_auto_wires_from_the_slices_alone() {
         .invoke_advised(svc_id, MethodKey::of("OrderService::place_order"), ErasedArgs::pack((40_i64,)))
         .await
         .expect("the advised call routes through the auto-installed chain");
-    assert_eq!(out.unpack::<i64>().unwrap(), 46, "the real method ran (40 + len(\"orders\"))");
+    assert_eq!(out.unpack::<i64>().unwrap(), 45, "the real method ran (40 + len(\"order\"))");
     assert_eq!(
         *ADVICE_LOG.lock().unwrap(),
         vec!["before", "after"],

@@ -160,7 +160,7 @@ fn config_properties_emits_a_public_c2_bind_thunk_that_binds_from_the_env() {
     b.add_last(Arc::new(MapPropertySource::from_pairs(
         "test",
         [
-            ("app.name".to_string(), "orders".to_string()),
+            ("app.name".to_string(), "order".to_string()),
             ("app.workers".to_string(), "4".to_string()),
         ],
     )));
@@ -169,7 +169,7 @@ fn config_properties_emits_a_public_c2_bind_thunk_that_binds_from_the_env() {
     let published = thunk(&env, StartupValidation::Strict).expect("the bind thunk binds cleanly");
     let bean = published.into_shared().expect("the bound config bean is a shared publication");
     let props = bean.downcast_ref::<AppProps>().expect("downcasts to AppProps");
-    assert_eq!(*props, AppProps { name: "orders".into(), workers: 4 });
+    assert_eq!(*props, AppProps { name: "order".into(), workers: 4 });
 }
 
 #[test]

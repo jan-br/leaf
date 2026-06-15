@@ -12,8 +12,8 @@ use leaf::LeafError;
 static APP_BOOT: Mutex<()> = Mutex::new(());
 
 use crate::catalog::catalog_service::{CatalogService, PRICE_LOOKUPS};
-use crate::orders::order_repository::OrderRepository;
-use crate::orders::order_service::OrderService;
+use crate::order::repository::OrderRepository;
+use crate::order::service::OrderService;
 use crate::platform::app_properties::AppProperties;
 use crate::platform::startup_runner::RUNNER_FIRED;
 use crate::platform::transaction_manager::LocalTransactionManager;
@@ -71,7 +71,7 @@ fn the_storefront_wires_advises_runs_and_shuts_down() {
         assert!(running.is_advised(orders_id), "the transactional bean is auto-advised");
         // StartupRunner already placed one order at boot; assert the delta from THIS call.
         let saved_before = repo.saved_count();
-        let placed: Result<crate::orders::order::Order, LeafError> = running
+        let placed: Result<crate::order::Order, LeafError> = running
             .invoke_advised(
                 orders_id,
                 MethodKey::of("OrderService::place_order"),
