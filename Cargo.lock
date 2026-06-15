@@ -208,10 +208,14 @@ dependencies = [
 name = "leaf-boot"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "leaf-codegen",
  "leaf-conditions",
  "leaf-config",
  "leaf-core",
+ "leaf-macros",
+ "leaf-tokio",
+ "tokio",
 ]
 
 [[package]]

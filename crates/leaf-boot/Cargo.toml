@@ -4,8 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# The default `tokio` flavor force-links leaf-tokio so its ExecutionFacility /
+# scheduler / shutdown-trigger / ambient-store SPIs are link-collected by default
+# (charter: async-first, a real runtime out of the box). A `--no-default-features`
+# build drops the runtime force-link for an embedder that brings its own.
+default = ["tokio"]
+tokio = ["dep:leaf-tokio"]
+
 [dependencies]
 leaf-core.workspace = true
 leaf-conditions.workspace = true
 leaf-config.workspace = true
 leaf-codegen.workspace = true
+leaf-tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Integration tests use the thin #[component]/#[leaf::main] macros + a real
+# runtime, so they pull leaf-tokio + leaf-macros (and futures for block_on).
+# The refresh/teardown integration test drives the template under a real
+# multi-thread tokio runtime (#[tokio::test]) to exercise Background spawn/join.
+leaf-tokio.workspace = true
+leaf-macros.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
