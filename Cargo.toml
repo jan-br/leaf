@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+# `examples/*` — downstream proof apps that depend on the umbrella ALONE (the
+# headline DX: one `leaf` dependency + annotations). They are workspace members so
+# `cargo test`/`cargo clippy --workspace` cover them, but they name NO internal
+# `leaf-*` crate (only `leaf`), proving the umbrella-only contract end to end.
+members = ["crates/*", "examples/*"]
 
 [workspace.package]
 version = "0.1.0"

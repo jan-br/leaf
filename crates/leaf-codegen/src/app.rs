@@ -93,16 +93,28 @@ pub fn parse_main_args(attr: TokenStream) -> Result<MainArgs, EmitError> {
 
 /// Emit the `#[leaf::main]` artifact: the anti-DCE force-link shim + the const
 /// `ExpectedManifest` (over the participating set) PLUS a real `fn main()` that
-/// drives the run engine over the user's `async fn` body.
+/// drives the run engine over the user's `async fn` body — the umbrella-only
+/// maximal-magic entry (bootstrap-diagnostics phase3/14).
 ///
 /// `binary_crate` is the binary's own Cargo package name (always force-linked); the
 /// `args.scan` list adds further participating crates. The emitted `fn main()`
-/// builds a runtime, runs the user body, then drives
-/// `::leaf_boot::Application::new(Primary).run()` — the run ENGINE is leaf-boot's
-/// (NOTE below); this emits the hand-writable entry shape.
+/// delegates to `::leaf::run_main(name, body)` — the umbrella's default-runtime
+/// entry driver, which builds the tokio runtime the binary owns, bootstraps + runs
+/// the application to Ready (the per-bean wiring + auto-configs + `#[runner]`s all
+/// fire there), hands the live `RunningApp` to the user body, then drains the clean
+/// shutdown. So `#[leaf::main]` + the single `leaf` dependency IS the working app.
 ///
 /// The user's `async fn main` is renamed to `__leaf_async_main` and called from the
-/// generated synchronous `fn main()`.
+/// `run_main` closure. The body may take ZERO params (the bare orchestration form) or
+/// ONE `&::leaf::boot::RunningApp` param (the app-aware form); the call shape adapts.
+///
+/// NOTE (primary source): a `#[leaf::main(Cfg)]` primary application source is parsed
+/// and carried by [`MainArgs`], but the umbrella's `run_main`/`bootstrap` bridge does
+/// not yet thread a typed primary `@SpringBootApplication` config into the run
+/// pipeline (the slice-collected `COMPONENTS`/`AUTO_CONFIGS` ARE the scan today, so
+/// there is no per-app component-scan root). The primary is therefore accepted for
+/// forward compatibility but is a `compile_error!`-free no-op; the bare `#[leaf::main]`
+/// is the landed shape, and wiring the primary through is the bootstrap bridge's seam.
 #[must_use]
 pub fn emit_main(binary_crate: &str, args: &MainArgs, user_fn: &syn::ItemFn) -> TokenStream {
     // The force-link shim covers OTHER crates only: the binary crate is always
@@ -121,11 +133,30 @@ pub fn emit_main(binary_crate: &str, args: &MainArgs, user_fn: &syn::ItemFn) -> 
     inner.sig.ident = format_ident!("__leaf_async_main");
     let inner_ident = &inner.sig.ident;
 
-    // The primary source for `Application::new(...)` — the named type's `::default()`
-    // value, or the unit source when unspecified.
-    let primary = match &args.primary {
-        Some(path) => quote! { <#path as ::core::default::Default>::default() },
-        None => quote! { () },
+    // The call shape adapts to the user fn's arity: the app-aware form takes the live
+    // `&RunningApp`, the bare orchestration form ignores it. Anything else is a loud
+    // compile_error! steering to the two sanctioned shapes.
+    let arity = user_fn.sig.inputs.len();
+    let body_call = match arity {
+        // The closure returns a BoxFuture borrowing the &RunningApp (run_main's body
+        // shape) — `Box::pin` erases the user future into the lifetime-tied boxed
+        // future. The bare form ignores the app; the app-aware form threads it.
+        0 => quote! {
+            (|_app: &::leaf::boot::RunningApp| ::std::boxed::Box::pin(#inner_ident()))
+        },
+        1 => quote! {
+            (|__app: &::leaf::boot::RunningApp| ::std::boxed::Box::pin(#inner_ident(__app)))
+        },
+        _ => {
+            return quote! {
+                #user_fn
+                ::core::compile_error!(
+                    "#[leaf::main] async fn main takes either no parameters (the bare \
+                     orchestration form) or one `&leaf::boot::RunningApp` parameter (the \
+                     app-aware form)"
+                );
+            };
+        }
     };
 
     quote! {
@@ -135,16 +166,13 @@ pub fn emit_main(binary_crate: &str, args: &MainArgs, user_fn: &syn::ItemFn) -> 
         // The user's annotated body, preserved verbatim under a private name.
         #inner
 
-        // NOTE (cross-crate, leaf-boot): the run ENGINE
-        // (`::leaf_boot::Application::new(Primary).run()` — the App<Define→Resolve→
-        // Wired→Running> phase machine + Context::refresh) lives in leaf-boot, which
-        // is out of this unit's scope. The generated entrypoint emits the
-        // hand-writable shape that constructs the Application over the primary source
-        // and drives it, then runs the user body; binding it to the real engine is
-        // leaf-boot's concern (this unit owns the binary-crate anti-DCE seam +
-        // the entry shape).
-        fn main() -> ::core::result::Result<(), ::leaf_core::LeafError> {
-            ::leaf_boot::Application::new(#primary).run(#inner_ident)
+        // The real entrypoint: drive the run engine through the umbrella's
+        // default-runtime entry driver. `run_main` builds the tokio runtime, bootstraps
+        // + runs the app to Ready (runners fire, the graph wires, auto-configs
+        // participate), hands the live RunningApp to the user body, then drains the
+        // clean shutdown — `#[leaf::main]` + one `leaf` dependency IS the app.
+        fn main() -> ::core::result::Result<(), ::leaf::LeafError> {
+            ::leaf::run_main(#binary_crate, #body_call)
         }
     }
 }
@@ -310,11 +338,12 @@ mod tests {
     #[test]
     fn main_emits_the_anti_dce_seam_and_a_runnable_main() {
         // The headline: #[leaf::main] splices in the force-link shim + the const
-        // ExpectedManifest, and wraps the user body in a real `fn main()`.
+        // ExpectedManifest, and wraps the user body in a real `fn main()` that drives
+        // the umbrella's default-runtime entry driver.
         let ts = emit_main(
             "my-app",
             &MainArgs::default(),
-            &func("async fn main() { println!(\"hi\"); }"),
+            &func("async fn main() -> Result<(), ::leaf::LeafError> { Ok(()) }"),
         );
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
@@ -323,12 +352,47 @@ mod tests {
         assert!(s.contains("__LEAF_EXPECTED_MANIFEST"), "got: {s}");
         // The binary crate itself is always force-linked.
         assert!(s.contains(r#"::leaf_core::SourceTag("my-app")"#), "got: {s}");
-        // A real synchronous `fn main` is emitted.
-        assert!(s.contains("fnmain()->::core::result::Result<(),::leaf_core::LeafError>"), "got: {s}");
+        // A real synchronous `fn main` returning the umbrella-rooted LeafError is emitted.
+        assert!(s.contains("fnmain()->::core::result::Result<(),::leaf::LeafError>"), "got: {s}");
         // The user body is preserved under a private name.
-        assert!(s.contains("async fn__leaf_async_main()") || s.contains("asyncfn__leaf_async_main()"), "got: {s}");
-        // It drives the leaf-boot run engine entry shape.
-        assert!(s.contains("::leaf_boot::Application::new"), "got: {s}");
+        assert!(s.contains("asyncfn__leaf_async_main()"), "got: {s}");
+        // It drives the umbrella's run_main entry driver, keyed by the binary name.
+        assert!(s.contains(r#"::leaf::run_main("my-app","#), "got: {s}");
+        // The bare (zero-param) body is invoked ignoring the RunningApp handle, boxed
+        // into the lifetime-tied future run_main's body closure returns.
+        assert!(
+            s.contains("|_app:&::leaf::boot::RunningApp|::std::boxed::Box::pin(__leaf_async_main())"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn main_with_an_app_param_passes_the_running_app() {
+        // The app-aware form: a single `&RunningApp` param receives the live app.
+        let ts = emit_main(
+            "my-app",
+            &MainArgs::default(),
+            &func(
+                "async fn main(app: &::leaf::boot::RunningApp) -> Result<(), ::leaf::LeafError> { Ok(()) }",
+            ),
+        );
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("|__app:&::leaf::boot::RunningApp|::std::boxed::Box::pin(__leaf_async_main(__app))"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn main_rejects_more_than_one_parameter() {
+        let ts = emit_main(
+            "my-app",
+            &MainArgs::default(),
+            &func("async fn main(a: u8, b: u8) -> Result<(), ::leaf::LeafError> { Ok(()) }"),
+        );
+        let s = flat(&ts);
+        assert!(s.contains("compile_error!"), "more than one param is a hard error: {s}");
     }
 
     #[test]
@@ -336,7 +400,11 @@ mod tests {
         let args = parse_main_args(syn::parse_str(r#"scan("leaf-redis", "leaf-tokio")"#).unwrap())
             .expect("parses");
         assert_eq!(args.scan, vec!["leaf-redis".to_string(), "leaf-tokio".to_string()]);
-        let s = flat(&emit_main("my-app", &args, &func("async fn main() {}")));
+        let s = flat(&emit_main(
+            "my-app",
+            &args,
+            &func("async fn main() -> Result<(), ::leaf::LeafError> { Ok(()) }"),
+        ));
         assert!(s.contains("useleaf_redisas_;"), "got: {s}");
         assert!(s.contains("useleaf_tokioas_;"), "got: {s}");
         assert!(s.contains(r#"::leaf_core::SourceTag("leaf-redis")"#), "got: {s}");
@@ -348,26 +416,30 @@ mod tests {
         // inside its own crate would not compile. So the force-link shim must NOT
         // reference the binary crate — but the ExpectedManifest MUST (it contributes
         // its own rows, so the self-check expects its SourceTag).
-        let s = flat(&emit_main("my-app", &MainArgs::default(), &func("async fn main() {}")));
+        let s = flat(&emit_main(
+            "my-app",
+            &MainArgs::default(),
+            &func("async fn main() -> Result<(), ::leaf::LeafError> { Ok(()) }"),
+        ));
         assert!(!s.contains("usemy_appas_;"), "the binary must not self-force-link: {s}");
         assert!(s.contains(r#"::leaf_core::SourceTag("my-app")"#), "got: {s}");
     }
 
     #[test]
-    fn main_passes_the_primary_source_to_the_application() {
+    fn main_parses_but_does_not_yet_thread_a_primary_source() {
+        // A primary application source is parsed + carried for forward compat, but the
+        // bridge does not thread it through yet (see the emit_main NOTE) — it is a
+        // no-op, never a compile_error, so `#[leaf::main(Cfg)]` still emits a runnable
+        // main over the slice-collected scan.
         let args = parse_main_args(syn::parse_str("MyConfig").unwrap()).expect("parses");
         assert!(args.primary.is_some());
-        let s = flat(&emit_main("my-app", &args, &func("async fn main() {}")));
-        assert!(
-            s.contains("::leaf_boot::Application::new(<MyConfigas::core::default::Default>::default())"),
-            "got: {s}"
-        );
-    }
-
-    #[test]
-    fn main_with_no_primary_uses_the_unit_source() {
-        let s = flat(&emit_main("my-app", &MainArgs::default(), &func("async fn main() {}")));
-        assert!(s.contains("::leaf_boot::Application::new(())"), "got: {s}");
+        let s = flat(&emit_main(
+            "my-app",
+            &args,
+            &func("async fn main() -> Result<(), ::leaf::LeafError> { Ok(()) }"),
+        ));
+        assert!(s.contains(r#"::leaf::run_main("my-app","#), "got: {s}");
+        assert!(!s.contains("compile_error!"), "a primary source is a no-op, not an error: {s}");
     }
 
     #[test]

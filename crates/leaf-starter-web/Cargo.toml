@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# STACK starter — a curated additive bundle over EXISTING non-ecosystem crates.
+#
+# NOTE: the spring-boot-starter-web ideal is `leaf-router + leaf-tokio + leaf-json
+# + leaf-validation` (phase3/03 TOPOLOGY). But leaf-router/leaf-json are real web
+# INTEGRATION crates = ECOSYSTEM, which the charter's non-ecosystem scope excludes.
+# So this is a REPRESENTATIVE stack starter over the non-ecosystem crates that DO
+# exist (leaf-tokio + leaf-validation + leaf-cache) — enough to prove the
+# stack-starter SHAPE (a curated additive bundle, not an XOR/backend choice).
+# Real web bindings (leaf-router, leaf-json) follow the leaf-redis integration
+# pattern and slot in here as extra dependencies when the ecosystem ships them.
 [dependencies]
 leaf-tokio.workspace = true
 leaf-validation.workspace = true
+leaf-cache.workspace = true

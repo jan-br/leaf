@@ -4,10 +4,60 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# The UMBRELLA / facade crate (phase3 TOPOLOGY "Starters & BOM"): the BOM
+# coordination point + the single dependency a downstream app names. It is the
+# unique DAG SINK — it depends on the starters + the optional integration set,
+# and NOTHING depends on it (wiring the other way would be a hard Cargo cycle).
+#
+# DOWNSTREAM BOM: because this version-pinned umbrella re-exports EXACT internal
+# versions of every starter/integration crate (the `version`-pinned
+# workspace.dependencies), picking ONE umbrella version transitively pins the
+# whole aligned set — `leaf` IS the BOM surrogate (Cargo has no native BOM).
+
+[features]
+# DEP-HIDDEN CAPABILITY FEATURES (the capability vocabulary). A feature name is a
+# capability, NOT a crate name: enabling it `dep:`-pulls the matching STARTER
+# (which transitively pulls its integration crate + runtime peer) into the
+# force-link / ExpectedManifest participating set. The `dep:` prefix HIDES the
+# optional dependency from the implicit-feature namespace, so the ONLY public
+# vocabulary is `redis`/`web`.
+default = []
+# `redis` — the CAPABILITY starter (leaf-redis + its tokio runtime peer).
+redis = ["dep:leaf-starter-redis"]
+# `web` — the STACK starter (the curated additive web bundle).
+web = ["dep:leaf-starter-web"]
+
 [dependencies]
+# THE BASE (always pulled): the kernel ABI, the thin macros, the bootstrap/run
+# engine, and the DEFAULT tokio ExecutionFacility runtime (charter §2.6:
+# async-first, a real runtime out of the box). leaf-boot's own default `tokio`
+# feature force-links leaf-tokio, but the umbrella ALSO names leaf-tokio directly
+# so its runtime surface (the Spawner facility, the ambient store) is reachable
+# from `leaf::runtime` for the bootstrap bridge.
 leaf-core.workspace = true
 leaf-macros.workspace = true
 leaf-boot.workspace = true
 leaf-tokio.workspace = true
-leaf-starter-redis.workspace = true
-leaf-starter-web.workspace = true
+
+# The cross-cutting-concern crates the prelude's `#[transactional]`/`#[cacheable]`
+# markers lower into (the macros emit `::leaf_tx::`/`::leaf_cache::` paths). They are
+# leaf-core-only crates; the umbrella always carries them so declarative advice wires
+# from an umbrella-only app, and re-exports their surface so the facade-path aliases
+# (`extern crate leaf as leaf_tx;`/`as leaf_cache;`) resolve.
+leaf-cache.workspace = true
+leaf-tx.workspace = true
+
+# The default-runtime entry driver (`leaf::run_main`, the `#[leaf::main]` body)
+# builds the multi-thread tokio runtime the binary owns + drives the run pipeline on
+# it — so the umbrella names tokio directly (the executor the bootstrap bridge wires
+# leaf-tokio's facility onto). Only the runtime builder is used here.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+# The optional starters, dep-hidden behind the capability features above.
+leaf-starter-redis = { workspace = true, optional = true }
+leaf-starter-web = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The end-to-end umbrella proof drives a real run pipeline under a tokio runtime.
+futures.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

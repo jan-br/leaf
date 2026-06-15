@@ -415,6 +415,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "leaf",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -543,12 +550,16 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "leaf"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "leaf-boot",
+ "leaf-cache",
  "leaf-core",
  "leaf-macros",
  "leaf-starter-redis",
  "leaf-starter-web",
  "leaf-tokio",
+ "leaf-tx",
+ "tokio",
 ]
 
 [[package]]
@@ -713,6 +724,7 @@ dependencies = [
 name = "leaf-starter-web"
 version = "0.1.0"
 dependencies = [
+ "leaf-cache",
  "leaf-tokio",
  "leaf-validation",
 ]
