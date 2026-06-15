@@ -55,7 +55,7 @@ pub enum Severity {
 /// are PLAIN DATA: leaf-core defines the shape (no `proc_macro` dependency); the
 /// `#[component]`/`#[value]` macros and the config-data loaders fill them later
 /// with `file!()`/`line!()`/`column!()` and the parsed file path+line.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Origin {
     /// No location information available.
     #[default]

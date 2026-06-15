@@ -36,10 +36,15 @@
 //!   the deterministic LOCAL planner ([`plan_sync`]) + the pure applier.
 //!   NOTE: the activation `IllegalActivationDocument` hard-rule and import-cycle
 //!   idempotency are document-activation concerns layered THERE.
-//! - the interned `OriginStore` (fine `file:line` `OriginId`s) is not yet in the
-//!   leaf-core ABI; loaders stamp the always-available coarse
-//!   [`leaf_core::Origin::Native`] carrier so provenance is never blank.
-//!   NOTE: a future leaf-core `OriginStore` unit refines this to file:line.
+//! - the interned [`leaf_core::OriginStore`] / [`leaf_core::OriginId`] dense
+//!   layer now lives in the leaf-core ABI, and the FILE loaders (JSON/YAML)
+//!   stamp a fine `Origin::File { path, line }` per value: YAML carries the
+//!   precise source line (via yaml-rust2's `Marker`), JSON degrades gracefully
+//!   to a path-only file origin (no per-value line). The env/config-tree loaders
+//!   keep the coarse [`leaf_core::Origin::Native`] carrier (no line to stamp).
+//!   FOLLOW-UP: threading the load-local `OriginStore` to the error RENDERER
+//!   (so a config error resolves a value's `OriginId` to its file:line) is a
+//!   small leaf-boot `seal_environment` hook, deferred to keep this unit local.
 //! - cloud-platform detection / SAJ transport population / the `@PropertySource`
 //!   `App<Resolve>` contribution step are leaf-boot's (they sequence around this
 //!   crate's loaders + rungs).
@@ -58,7 +63,7 @@ pub mod precedence;
 
 pub use error::{ConfigDataError, ConfigDataErrorKind, ConfigDataLocation, LocationScheme};
 
-pub use flatten::{flatten, FlatEntry, Node};
+pub use flatten::{flatten, FlatEntry, Node, OriginSpec};
 
 pub use loader::{
     ConfigDataLoader, ConfigTreeLoader, EnvVarLoader, JsonLoader, LoadCtx, LoadedDocument,

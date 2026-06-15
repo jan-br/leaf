@@ -12,10 +12,41 @@
 //! [`crate::flatten::Node`] shape and run the ONE [`crate::flatten::flatten`]
 //! pass, so JSON and YAML share identical segment/null-as-absent semantics.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use leaf_core::{BoxFuture, Origin, PropertyValue};
 
 use crate::error::{ConfigDataError, ConfigDataLocation, LocationScheme};
-use crate::flatten::{flatten, Node};
+use crate::flatten::{flatten, Node, OriginSpec};
+
+/// Intern a config-file path to a process-`'static` slice so the file loaders can
+/// stamp `Origin::File { path, line }` (whose `path` is `&'static str`, mirroring
+/// the macro-emitted `file!()` strings) from a RUNTIME location path.
+///
+/// Deduplicated behind a `Mutex<HashMap>` so each DISTINCT path is leaked at most
+/// once: config load is a once-at-startup, bounded operation over a handful of
+/// files, so the lock is uncontended and the leak is sound and tiny — the path
+/// lives for the whole process exactly like the `file!()` strings it sits beside.
+fn intern_path(path: &str) -> &'static str {
+    static PATHS: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let map = PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("config-path interner poisoned");
+    if let Some(&s) = guard.get(path) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(path.to_owned().into_boxed_str());
+    guard.insert(path.to_owned(), leaked);
+    leaked
+}
+
+/// The fine file-origin spec for the config file at `loc` (path interned to
+/// `'static`); per-scalar lines are filled by the parser where available.
+fn file_origin(loc: &ConfigDataLocation) -> OriginSpec {
+    OriginSpec::File {
+        path: intern_path(loc.path()),
+    }
+}
 
 /// One loaded config document: its flattened properties.
 ///
@@ -137,11 +168,10 @@ impl JsonLoader {
         let value: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| ConfigDataError::malformed(loc.raw(), e.to_string()))?;
         let node = json_to_node(&value);
-        // The loader's coarse origin is a native source tag (the fine file:line
-        // OriginId the design names needs the interned OriginStore — deferred to
-        // the leaf-boot seal_environment pass; we stamp the always-available
-        // coarse carrier here so provenance is never blank).
-        let props = flatten(&node, Origin::Native { crate_name: Some("leaf-config::json") });
+        // serde_json exposes no per-value source line, so JSON stamps a path-only
+        // file origin (line 0 = "line unknown") — graceful degradation. The path
+        // still points the reader at the offending file.
+        let props = flatten(&node, file_origin(loc));
         Ok(vec![LoadedDocument::new(props)])
     }
 }
@@ -149,9 +179,10 @@ impl JsonLoader {
 fn json_to_node(v: &serde_json::Value) -> Node {
     match v {
         serde_json::Value::Null => Node::Null,
-        serde_json::Value::Bool(b) => Node::Scalar(b.to_string()),
-        serde_json::Value::Number(n) => Node::Scalar(n.to_string()),
-        serde_json::Value::String(s) => Node::Scalar(s.clone()),
+        // No per-value line from serde_json: scalars are line-unknown.
+        serde_json::Value::Bool(b) => Node::scalar(b.to_string()),
+        serde_json::Value::Number(n) => Node::scalar(n.to_string()),
+        serde_json::Value::String(s) => Node::scalar(s.clone()),
         serde_json::Value::Array(items) => Node::Seq(items.iter().map(json_to_node).collect()),
         serde_json::Value::Object(map) => {
             Node::Map(map.iter().map(|(k, v)| (k.clone(), json_to_node(v))).collect())
@@ -198,15 +229,15 @@ pub struct YamlLoader;
 
 impl YamlLoader {
     fn parse(text: &str, loc: &ConfigDataLocation) -> Result<Vec<LoadedDocument>, ConfigDataError> {
-        let docs = yaml_rust2::YamlLoader::load_from_str(text)
+        // Drive the marked event parser so each scalar carries its 1-based source
+        // line (the default `Yaml` tree discards markers). Each `---` document
+        // becomes one node tree; a wholly-empty document is skipped.
+        let docs = parse_marked_yaml(text)
             .map_err(|e| ConfigDataError::malformed(loc.raw(), e.to_string()))?;
-        let origin = Origin::Native {
-            crate_name: Some("leaf-config::yaml"),
-        };
+        let spec = file_origin(loc);
         let mut out = Vec::with_capacity(docs.len());
-        for doc in &docs {
-            let node = yaml_to_node(doc);
-            let props = flatten(&node, origin);
+        for node in &docs {
+            let props = flatten(node, spec);
             // Skip a wholly-empty document (e.g. a trailing `---`).
             if !props.is_empty() {
                 out.push(LoadedDocument::new(props));
@@ -216,36 +247,154 @@ impl YamlLoader {
     }
 }
 
-fn yaml_to_node(y: &yaml_rust2::Yaml) -> Node {
-    use yaml_rust2::Yaml;
-    match y {
-        Yaml::Null | Yaml::BadValue => Node::Null,
-        Yaml::Boolean(b) => Node::Scalar(b.to_string()),
-        Yaml::Integer(i) => Node::Scalar(i.to_string()),
-        Yaml::Real(s) => Node::Scalar(s.clone()),
-        Yaml::String(s) => Node::Scalar(s.clone()),
-        Yaml::Array(items) => Node::Seq(items.iter().map(yaml_to_node).collect()),
-        Yaml::Hash(map) => Node::Map(
-            map.iter()
-                .map(|(k, v)| (yaml_key_to_string(k), yaml_to_node(v)))
-                .collect(),
-        ),
-        // An alias is a forward-ref we do not resolve (yaml-rust2 resolves
-        // anchors at parse for the common case); treat as absent.
-        Yaml::Alias(_) => Node::Null,
+/// Parse a (possibly multi-document) YAML stream into one [`Node`] tree per
+/// document, tagging every scalar with its 1-based source line via yaml-rust2's
+/// `Marker`. Mirrors the previous tree's null-as-absent / alias-as-absent and
+/// stringly-typed-key semantics — only now with line provenance.
+fn parse_marked_yaml(text: &str) -> Result<Vec<Node>, yaml_rust2::ScanError> {
+    let mut parser = yaml_rust2::parser::Parser::new(text.chars());
+    let mut recv = MarkedNodeBuilder::default();
+    parser.load(&mut recv, true)?;
+    Ok(recv.docs)
+}
+
+/// A partially-built container on the construction stack.
+enum Frame {
+    /// A mapping; `pending_key` holds the most recent key awaiting its value.
+    Map {
+        entries: Vec<(String, Node)>,
+        pending_key: Option<String>,
+    },
+    /// A sequence (array).
+    Seq(Vec<Node>),
+}
+
+/// Builds [`Node`] trees from marked YAML events, recording each scalar's line.
+#[derive(Default)]
+struct MarkedNodeBuilder {
+    /// Completed document trees (one per `---`).
+    docs: Vec<Node>,
+    /// Open containers (innermost last).
+    stack: Vec<Frame>,
+    /// Anchor id → resolved node, so an alias can copy the anchored value
+    /// (matching yaml-rust2's at-parse anchor resolution for the common case).
+    anchors: std::collections::HashMap<usize, Node>,
+    /// The current document's root once the stack empties.
+    current_root: Option<Node>,
+}
+
+impl MarkedNodeBuilder {
+    /// Feed a finished node up into its parent container (or set it as the
+    /// document root), registering `anchor_id` if non-zero.
+    fn emit(&mut self, node: Node, anchor_id: usize) {
+        if anchor_id > 0 {
+            self.anchors.insert(anchor_id, node.clone());
+        }
+        match self.stack.last_mut() {
+            None => self.current_root = Some(node),
+            Some(Frame::Seq(items)) => items.push(node),
+            Some(Frame::Map { entries, pending_key }) => match pending_key.take() {
+                // No pending key => this node IS the key (rendered to string).
+                None => *pending_key = Some(node_to_key_string(&node)),
+                // We have a key => (key, node) is a complete entry.
+                Some(k) => entries.push((k, node)),
+            },
+        }
     }
 }
 
-/// Render a YAML mapping KEY to its string form (keys are stringly-typed in the
-/// config stack; a non-string key is rendered via its scalar form).
-fn yaml_key_to_string(y: &yaml_rust2::Yaml) -> String {
-    use yaml_rust2::Yaml;
-    match y {
-        Yaml::String(s) => s.clone(),
-        Yaml::Boolean(b) => b.to_string(),
-        Yaml::Integer(i) => i.to_string(),
-        Yaml::Real(s) => s.clone(),
-        Yaml::Null => "null".to_string(),
+impl yaml_rust2::parser::MarkedEventReceiver for MarkedNodeBuilder {
+    fn on_event(&mut self, ev: yaml_rust2::Event, mark: yaml_rust2::scanner::Marker) {
+        use yaml_rust2::Event;
+        match ev {
+            Event::DocumentStart => {
+                self.current_root = None;
+            }
+            Event::DocumentEnd => {
+                // An empty document yields no root → contribute an empty map
+                // (flatten drops it as zero-prop, matching the old skip).
+                let root = self.current_root.take().unwrap_or(Node::Map(Vec::new()));
+                self.docs.push(root);
+            }
+            Event::Scalar(value, style, anchor_id, tag) => {
+                // yaml-rust2's Marker line is 1-based; clamp to u32 defensively.
+                let line = u32::try_from(mark.line()).unwrap_or(0);
+                let node = resolve_scalar(value, style, tag, line);
+                self.emit(node, anchor_id);
+            }
+            Event::SequenceStart(_anchor, _tag) => {
+                self.stack.push(Frame::Seq(Vec::new()));
+            }
+            Event::SequenceEnd => {
+                if let Some(Frame::Seq(items)) = self.stack.pop() {
+                    self.emit(Node::Seq(items), 0);
+                }
+            }
+            Event::MappingStart(_anchor, _tag) => {
+                self.stack.push(Frame::Map {
+                    entries: Vec::new(),
+                    pending_key: None,
+                });
+            }
+            Event::MappingEnd => {
+                if let Some(Frame::Map { entries, .. }) = self.stack.pop() {
+                    self.emit(Node::Map(entries), 0);
+                }
+            }
+            Event::Alias(anchor_id) => {
+                // Resolve to the anchored node if known, else absent (Null) —
+                // matching the previous loader's alias-as-absent degradation.
+                let node = self.anchors.get(&anchor_id).cloned().unwrap_or(Node::Null);
+                self.emit(node, 0);
+            }
+            Event::Nothing | Event::StreamStart | Event::StreamEnd => {}
+        }
+    }
+}
+
+/// Resolve a YAML scalar event into a [`Node`], reproducing yaml-rust2's
+/// null-as-absent rule so existing semantics are preserved: a PLAIN (unquoted)
+/// `""`/`~`/`null`, or an explicit `!!null` tag over `~`/`null`, becomes
+/// [`Node::Null`] (dropped at flatten); every other scalar is kept verbatim as
+/// its source string (the config stack is stringly-typed) WITH its source line.
+/// Quoted scalars are never treated as null (so `key: "null"` stays the string).
+fn resolve_scalar(
+    value: String,
+    style: yaml_rust2::scanner::TScalarStyle,
+    tag: Option<yaml_rust2::parser::Tag>,
+    line: u32,
+) -> Node {
+    use yaml_rust2::scanner::TScalarStyle;
+    // A quoted/block scalar is always a string, even if it reads like `null`.
+    if style != TScalarStyle::Plain {
+        return Node::scalar_at(value, line);
+    }
+    // An explicit core-schema `!!null` tag.
+    if let Some(tag) = &tag
+        && tag.handle == "tag:yaml.org,2002:"
+        && tag.suffix == "null"
+    {
+        return match value.as_str() {
+            "~" | "null" | "" => Node::Null,
+            _ => Node::scalar_at(value, line),
+        };
+    }
+    // Untagged plain scalar: only the canonical null spellings are null-as-absent
+    // (numbers/bools/strings are all kept as their raw source string for the
+    // stringly-typed stack — type recovery is `FromConfigValue`'s job later).
+    match value.as_str() {
+        "" | "~" | "null" => Node::Null,
+        _ => Node::scalar_at(value, line),
+    }
+}
+
+/// Render an already-built scalar/null [`Node`] to its mapping-KEY string form
+/// (keys are stringly-typed in the config stack; a non-scalar key degrades to an
+/// empty string, matching the previous loader).
+fn node_to_key_string(node: &Node) -> String {
+    match node {
+        Node::Scalar(s, _) => s.clone(),
+        Node::Null => "null".to_string(),
         _ => String::new(),
     }
 }

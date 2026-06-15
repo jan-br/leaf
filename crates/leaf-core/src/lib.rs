@@ -107,7 +107,8 @@ pub use future::BoxFuture;
 pub use handle::{downcast_owned, downcast_ref, Bean, ErasedBean, Published, Ref};
 
 pub use identity::{
-    contract_hash, derive_default_name, BeanId, BeanKey, BeanName, ContractId, MarkerId,
+    contract_hash, derive_default_name, BeanId, BeanKey, BeanName, ContractId, MarkerId, OriginId,
+    OriginStore,
 };
 
 pub use order::{
