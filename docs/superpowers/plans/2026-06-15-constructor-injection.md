@@ -292,7 +292,7 @@ impl OrderRepository {
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add examples/storefront/src/order/repository.rs examples/storefront/src/catalog/product_repository.rs
+git add examples/storefront/src/order/repository.rs examples/storefront/src/catalog/repository
 git commit -m "storefront: repositories use #[repository] + #[inject] constructor (drop register_component!)"
 ```
 

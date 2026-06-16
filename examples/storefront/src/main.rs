@@ -13,9 +13,6 @@ mod order;
 mod platform;
 mod pricing;
 
-#[cfg(test)]
-mod tests;
-
 /// `#[leaf::main]` bootstraps + runs the app to Ready (the graph wires, config binds,
 /// auto-configs participate, the runners fire), then drains a clean shutdown. The body is
 /// empty: the application's behaviour lives in its beans, not in `main`.

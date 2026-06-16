@@ -1,6 +1,6 @@
 use leaf::prelude::*;
 
-use crate::catalog::r#mod::Product;
+use crate::catalog::product::Product;
 
 /// The seeded catalog (a small fixed inventory).
 const CATALOG: &[Product] = &[
@@ -9,17 +9,13 @@ const CATALOG: &[Product] = &[
     Product { sku: "FILTER", name: "Paper Filters", price_cents: 449 },
 ];
 
-/// A `@Repository` holding the mod inventory.
+/// A `@Repository` holding the product inventory.
+#[repository]
 #[derive(Debug)]
 pub struct ProductRepository;
-register_component!(ProductRepository);
 
 impl ProductRepository {
-    fn new() -> Self {
-        ProductRepository
-    }
-
-    /// Look up a mod by SKU.
+    /// Look up a product by SKU.
     pub fn find(&self, sku: &str) -> Option<Product> {
         CATALOG.iter().find(|p| p.sku == sku).cloned()
     }

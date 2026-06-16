@@ -1,14 +1,14 @@
 use leaf::prelude::*;
+use leaf::InMemoryTransactionManager;
 
-use crate::catalog::catalog_service::CatalogService;
+use crate::catalog::service::CatalogService;
 use crate::order::Order;
 use crate::order::repository::OrderRepository;
-use crate::platform::transaction_manager::LocalTransactionManager;
 
 /// A `@Component` injecting [`CatalogService`] + [`OrderRepository`] whose `place_order`
 /// is `#[transactional]` (commit on `Ok`, rollback on `Err`). It demonstrates the tx
 /// concern, while `CatalogService` carries the cache concern — two concerns, two services.
-#[component]
+#[service]
 #[derive(Debug)]
 pub struct OrderService {
     catalog: Ref<CatalogService>,
@@ -17,13 +17,9 @@ pub struct OrderService {
 
 #[advisable]
 impl OrderService {
-    fn new(catalog: Ref<CatalogService>, orders: Ref<OrderRepository>) -> Self {
-        OrderService { catalog, orders }
-    }
-
     /// Price the SKU (via the cached catalog lookup), total it, save, and return the
     /// order. `Ok` commits the surrounding tx; `Err` rolls it back.
-    #[transactional(manager = LocalTransactionManager)]
+    #[transactional(manager = InMemoryTransactionManager)]
     pub fn place_order(&self, sku: String, qty: u32) -> Result<Order, LeafError> {
         let unit = self.catalog.price_of(sku.clone())?;
         let order = Order {

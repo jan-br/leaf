@@ -8,10 +8,6 @@ use leaf::prelude::*;
 pub struct DiscountPolicy;
 
 impl DiscountPolicy {
-    fn new() -> Self {
-        DiscountPolicy
-    }
-
     /// A flat 10% discount on the order total (cents).
     pub fn discount_cents(&self, total_cents: i64) -> i64 {
         total_cents / 10

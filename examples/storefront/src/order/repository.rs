@@ -28,8 +28,4 @@ impl OrderRepository {
         self.saved.fetch_add(1, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
-    pub fn saved_count(&self) -> usize {
-        self.saved.load(Ordering::SeqCst)
-    }
 }

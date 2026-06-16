@@ -1,3 +1,5 @@
+pub mod repository;
+
 /// A catalog product. A plain domain value, not a bean.
 #[derive(Debug, Clone)]
 pub struct Product {
