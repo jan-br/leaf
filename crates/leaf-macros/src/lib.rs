@@ -66,7 +66,22 @@ const CONCERN_ATTRS: &[&str] = &[
 /// row (+ `ProviderSeed`/`InjectionPlan`/`Bean` impl) for the annotated struct.
 ///
 /// Attribute args (all optional): `name = "…"` (override the derived default name),
-/// `scope = "singleton" | "prototype" | "request"`.
+/// `scope = "singleton" | "prototype" | "request"`, `role = "application" |
+/// "support" | "infrastructure"`, and `constructor = <path>`.
+///
+/// Two construction paths:
+/// - **No `constructor` arg (the default): FIELD injection.** Every struct field is an
+///   injection point, resolved through `<FieldTy as ::leaf_core::Injectable>::inject`
+///   (trait dispatch, never a type-name match). A field whose type is not `Injectable`
+///   (internal state like `AtomicI64`) is a loud compile error — use a referenced
+///   constructor instead.
+/// - **`constructor = <path>` (opt-in): a REFERENCED constructor.** The bean is built by
+///   `construct_with(<path>, ctx)`, which resolves each of the referenced constructor's
+///   parameters through `Injectable` and calls it; the struct's FIELDS are NOT lowered,
+///   so a STATE-HOLDING bean compiles (the `new()` seeds the state). `<path>` is a bare
+///   method ident (`new` → `Self::new`) or a full path (`OrderRepository::new`); the
+///   macro references it verbatim and NEVER parses or counts its parameters. This is the
+///   path a real repository uses: `#[repository(constructor = OrderRepository::new)]`.
 #[proc_macro_attribute]
 pub fn component(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_stereotype(attr, item, Stereotype::Component)
@@ -177,9 +192,15 @@ pub fn bean(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `register_component!(Concrete)` — register a CONCRETE type as a `@component`
 /// (the escape hatch for a generic component: `register_component!(Repo<u32>)`).
 ///
-/// Emits the same const `::leaf_core::Descriptor` row as a no-dependency
-/// `#[component]` constructed via `Concrete::new()`. This is the `compile_error!`
-/// remediation a generic `#[component]`/`#[bean]` points at.
+/// This is the `constructor = new` ALIAS: a PLAIN concrete type references its own
+/// `Concrete::new` through the SAME referenced-constructor drivers a
+/// `#[component(constructor = new)]` stereotype uses (`construct_with(Concrete::new, …)`
+/// / `ctor_deps(Concrete::new)`), so a no-injected-deps / state-holding bean is
+/// constructed by its arity-0 `new()`. (A concrete GENERIC instantiation
+/// `register_component!(Repo<u32>)` is the one documented exception: `Repo<u32>::new`
+/// is not a spellable expression path, so it keeps the bare `<Repo<u32>>::new()`
+/// recipe.) This is the `compile_error!` remediation a generic `#[component]`/`#[bean]`
+/// points at.
 ///
 /// Optional trailing `key = "value"` args (the SAME vocabulary as `#[component]`):
 /// `register_component!(Concrete, role = "infrastructure", name = "applicationTaskExecutor")`

@@ -551,7 +551,7 @@ fn emit_config_bean_registration(
 
         // The seed pairing so from_slices JOINs the AUTO_CONFIGS row to its seed (the
         // anti-DCE per-bean JOIN — an unconstructible bean must never silently vanish).
-        // A config-properties bean is bound from the env (no `#[inject]` ctor), so this
+        // A config-properties bean is bound from the env (no `constructor =` arg), so this
         // is a FIELD-DEFAULT-class seed row.
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
@@ -933,7 +933,7 @@ mod tests {
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
             "got: {s}"
         );
-        // A config-properties bean is env-bound (no `#[inject]` ctor), so its seed row
+        // A config-properties bean is env-bound (no `constructor =` arg), so its seed row
         // is a FIELD-DEFAULT-class row.
         assert!(
             s.contains("::leaf_core::SeedPairingRow::field_default("),

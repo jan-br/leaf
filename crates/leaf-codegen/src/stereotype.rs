@@ -8,10 +8,18 @@
 //! whole parse-to-[`BeanInput`] lowering, so the proc-macro stays thin: it parses
 //! with `syn`, calls `component` (or the per-stereotype entry), and emits.
 //!
-//! The lowering reads the struct's FIELDS as the constructor's injection points
-//! (each field's ident is the implicit string qualifier; its type is the
-//! collaborator resolved through the one `Engine::get` seam). A generic target is a
-//! Tier-0 hard error carrying the `register_component!(Concrete)` hint.
+//! Two construction paths, selected by the optional `constructor = <path>` arg:
+//! - DEFAULT (no `constructor`): FIELD injection — each struct field is an injection
+//!   point (its ident is the implicit string qualifier) resolved through `<FieldTy as
+//!   ::leaf_core::Injectable>::inject` (trait dispatch, never a type-name match).
+//! - OPT-IN (`constructor = <path>`): a REFERENCED constructor — the macro emits a
+//!   `construct_with(<path>, ctx)` provider + `ctor_deps(<path>)` plan and SKIPS the
+//!   field-default, so a state-holding struct (a non-`Injectable` field the `new()`
+//!   seeds) compiles. The macro references the path verbatim and NEVER parses or counts
+//!   its parameters. `register_component!(Concrete)` is the `constructor = new` alias.
+//!
+//! A generic target is a Tier-0 hard error carrying the `register_component!(Concrete)`
+//! hint.
 
 use syn::punctuated::Punctuated;
 use syn::{Expr, ExprLit, Fields, FnArg, ItemFn, Lit, Meta, Pat, ReturnType, Token, Type};
@@ -355,14 +363,50 @@ pub fn register_input_with(
     let meta = resolve(&Stereotype::Component.annotation()).map_err(|e| EmitError {
         message: e.to_string(),
     })?;
-    let mut input = BeanInput::new(ty.clone(), ident.clone(), ident);
+    let mut input = BeanInput::new(ty.clone(), ident.clone(), ident.clone());
     input.module_qualified = true;
     input.meta = meta;
     input.explicit_name = explicit_name;
     if let Some(role) = explicit_role {
         input.role = role;
     }
+    // `register_component!(Concrete)` IS the `constructor = new` alias (the spec): a
+    // PLAIN concrete type references its own `Concrete::new` through the SAME
+    // referenced-constructor drivers a `#[component(constructor = new)]` stereotype
+    // uses (`construct_with(Concrete::new, …)` / `ctor_deps(Concrete::new)`), so the
+    // two no-field-injection construction paths are ONE. The user's `new()` is the
+    // zero-parameter constructor; `ctor_deps` infers the (empty) arity — the macro
+    // never parses it.
+    //
+    // The documented EXCEPTION: a concrete GENERIC instantiation
+    // (`register_component!(Repo<u32>)`) cannot be referenced by an expression path
+    // (`Repo<u32>::new` is invalid; it would need the angle-bracket-qualified
+    // `<Repo<u32>>::new`, which `construct_with(<path>)` cannot spell), so it keeps the
+    // bare `<Repo<u32>>::new()` recipe (`referenced_ctor = None`).
+    if !has_generic_args(ty) {
+        input.referenced_ctor = Some(syn::parse_str(&format!("{ident}::new")).map_err(|e| {
+            EmitError {
+                message: format!("`{ident}::new` is not a valid constructor path: {e}"),
+            }
+        })?);
+    }
     Ok(input)
+}
+
+/// Whether a type carries generic arguments on its leading path segment
+/// (`Repo<u32>` → `true`, `LocalTransactionManager` → `false`). A generic
+/// instantiation cannot be referenced by an expression path (`Repo<u32>::new` is not
+/// valid; only the angle-bracket-qualified `<Repo<u32>>::new` is), so it stays on the
+/// bare `::new()` recipe rather than the referenced-constructor alias.
+fn has_generic_args(ty: &Type) -> bool {
+    match ty {
+        Type::Path(tp) => tp
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| !matches!(s.arguments, syn::PathArguments::None)),
+        _ => false,
+    }
 }
 
 /// Emit the const registration artifact for a `register_component!(Concrete)`
@@ -530,8 +574,9 @@ fn sig_to_deps(func: &ItemFn) -> Result<Vec<Dependency>, EmitError> {
 /// Injectable>::inject`, so a re-exported/aliased `Ref` is irrelevant (trait dispatch,
 /// not `seg.ident == "Ref"`). A field whose type is not `Injectable` (a bare bean type
 /// or internal state) is a loud compile error at the field's injection site — the
-/// design's no-bare-type, no-name-based-escape-hatch rule (use an `#[inject]`
-/// constructor for a state-holding bean).
+/// design's no-bare-type, no-name-based-escape-hatch rule (a state-holding bean opts
+/// into `#[stereotype(constructor = <path>)]`, whose referenced `new()` seeds the
+/// state and SKIPS this field-default).
 fn fields_to_deps(fields: &Fields) -> Vec<Dependency> {
     match fields {
         Fields::Named(named) => named
@@ -677,7 +722,7 @@ mod tests {
     fn field_default_resolves_through_the_injectable_trait_not_a_name_strip() {
         // Task 4: the struct field-default path routes through `Injectable` (trait
         // dispatch), NOT a name-stripped `Bar` TypeId. For `#[component] struct Foo {
-        // dep: Ref<Bar> }` (no `#[inject]` ctor) the field-default InjectionPoint is
+        // dep: Ref<Bar> }` (no `constructor =` arg) the field-default InjectionPoint is
         // built from `<Ref<Bar> as Injectable>::RESOLVABLE` and the provider resolves
         // via `<Ref<Bar> as Injectable>::inject` — the emitted tokens reference
         // `Injectable`, never the legacy `__engine.get::<Bar>()` name-strip.
@@ -898,6 +943,53 @@ mod tests {
     }
 
     #[test]
+    fn register_component_of_a_plain_type_is_the_constructor_new_alias() {
+        // The spec: `register_component!(Concrete)` is equivalent to a stereotype with
+        // `constructor = new` over a zero-parameter `new()`. For a PLAIN concrete type
+        // (the common case) the lowering takes the referenced-constructor path: it
+        // references `Concrete::new` and emits the SAME `construct_with(Concrete::new …)`
+        // / `ctor_deps(Concrete::new …)` provider+plan a `constructor = new` stereotype
+        // does — no separate `<Concrete>::new()` recipe, one unified construction path.
+        let ty: Type = syn::parse_str("LocalTransactionManager").expect("a concrete type");
+        let input = register_input(&ty).expect("lowers");
+        assert!(input.deps.is_empty(), "no field injection on the register form");
+        let s = flat(&input);
+        assert!(
+            s.contains("construct_with(LocalTransactionManager::new"),
+            "the plain register form references `Concrete::new` (the constructor = new alias): {s}"
+        );
+        assert!(
+            s.contains("ctor_deps(LocalTransactionManager::new"),
+            "the plain register form emits the referenced-constructor dep plan: {s}"
+        );
+        // The legacy bare `<Concrete>::new()` self-construct is GONE for a plain type —
+        // it is now the referenced-constructor alias.
+        assert!(
+            !s.contains("<LocalTransactionManager>::new()"),
+            "the plain register form no longer uses the bare ::new() recipe: {s}"
+        );
+    }
+
+    #[test]
+    fn register_component_of_a_generic_instantiation_keeps_the_bare_new_recipe() {
+        // The documented EXCEPTION to the `constructor = new` alias: a concrete generic
+        // instantiation (`register_component!(Repo<u32>)`) cannot reference `Repo<u32>::new`
+        // as an expression path (it must be angle-bracket-qualified `<Repo<u32>>::new`,
+        // which `construct_with(<path>)` cannot spell), so the generic-instantiation
+        // escape hatch keeps the bare `<Repo<u32>>::new()` recipe and does NOT take the
+        // referenced-constructor path.
+        let ty: Type = syn::parse_str("Repo<u32>").expect("a concrete type");
+        let input = register_input(&ty).expect("lowers");
+        assert!(input.referenced_ctor.is_none(), "a generic instantiation stays on ::new()");
+        let s = flat(&input);
+        assert!(s.contains("<Repo<u32>>::new()"), "the generic escape hatch keeps ::new(): {s}");
+        assert!(
+            !s.contains("construct_with("),
+            "a generic instantiation cannot reference its constructor by path: {s}"
+        );
+    }
+
+    #[test]
     fn emit_register_emits_a_components_row() {
         let ty: Type = syn::parse_str("Repo<u32>").expect("type");
         let ts = emit_register(&ty).expect("emits");
@@ -929,8 +1021,10 @@ mod tests {
         let s = flat(&input);
         assert!(s.contains("role:::leaf_core::Role::Infrastructure"), "got: {s}");
         assert!(s.contains(r#"Some("applicationTaskExecutor")"#), "got: {s}");
-        // The provider constructs via the arity-0 `::new()` (construct-and-publish).
-        assert!(s.contains("<TokioExecutionFacility>::new()"), "got: {s}");
+        // The provider constructs via the arity-0 `new()` THROUGH the referenced-constructor
+        // alias (`register_component!` = `constructor = new`): a plain concrete type
+        // references `Concrete::new` via the SAME `construct_with` driver a stereotype uses.
+        assert!(s.contains("construct_with(TokioExecutionFacility::new"), "got: {s}");
     }
 
     #[test]
