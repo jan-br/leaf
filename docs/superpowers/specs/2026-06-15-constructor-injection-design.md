@@ -1,212 +1,223 @@
-# Constructor injection via a trait — design
+# Constructor injection via a referenced constructor — design
 
-Status: **approved (design), pending spec review → implementation plan**
-Date: 2026-06-15
+Status: **approved (design), superseded the `#[inject]`-marker approach 2026-06-16**
+Date: 2026-06-15 (revised 2026-06-16)
+
+> **Revision note (2026-06-16).** The first cut of this design used an `#[inject]`
+> marker on a constructor, lowered by the impl-level `#[advisable]` macro, with a
+> runtime merge that let the constructor pairing override the struct field-default.
+> It was implemented through Task 5 (commits `774dfce`..`231c831`) but hit a wall at
+> the storefront migration: a stereotype on a *state-holding* struct still emitted a
+> field-default provider (`R::new(all_fields)`) that cannot compile, because the
+> struct macro cannot see the `#[inject]` constructor in the separate `impl` to
+> suppress it. The fix below removes that whole class of problem by having the
+> **stereotype macro reference the constructor by path** (an attribute it can read on
+> the struct itself), resolving its parameters through a "magic constructor" trait
+> and type inference — never parsing or introspecting the constructor. Feasibility
+> was confirmed with a standalone spike (inference picks arities 0/1/2 from a bare
+> `Type::new` value, no turbofish). **Tasks 1, 4, 6 (the `Injectable` trait,
+> field-injection-through-`Injectable`, the `produced_ty` deletion, and the `#[bean]`
+> migration) stand. Tasks 2, 3, 5 (the `#[inject]` marker, the `#[advisable]`
+> constructor lowering, the runtime merge) are removed.**
 
 ## Problem
 
-leaf's stereotype/`#[runner]`/`#[auto_config]` macros derive injection from **struct
-fields**: `fields_to_deps` lowers *every* field to a dependency and `emit_provider`
-calls `Ty::new(all_fields)`. Two consequences:
+leaf's stereotype macros derive injection from **struct fields**: every field is
+lowered to a dependency and the provider calls `Self::new(all_fields)`. Two original
+consequences (and their current status):
 
 1. **No internal state.** A bean cannot hold a non-bean field (`AtomicI64` counter,
-   seeded `Vec`) — the macro tries to *inject* it as a bean and fails. State-holding
-   beans are forced onto `register_component!` (construct-via-`new()`, no injection),
-   so a real repository can't wear `#[repository]`.
-2. **Name-based handle detection.** `produced_ty` decides "this field is a `Ref<T>`
-   handle, resolve `T`" by matching `seg.ident == "Ref"`. A proc-macro sees only
-   tokens, and `Ref` is aliasable/re-exportable (`use leaf::Ref as R;`, `crate::Ref`,
-   a glob), so name-matching is fragile. **Hard rule: leaf macros must never decide
-   semantics from a type's textual name.**
+   seeded `Vec`) — the field-default tries to *inject* it as a bean and fails to
+   compile (the field is not `Injectable`, and the all-fields arity does not match a
+   hand-written constructor). State-holding beans are forced onto
+   `register_component!`, so a real repository cannot wear `#[repository]`. **Still
+   open — this design closes it.**
+2. **Name-based handle detection** (`produced_ty`'s `seg.ident == "Ref"`). **Closed**
+   — Tasks 1/4/6 routed all injection lowering through the `Injectable` trait and
+   deleted the name-checks. (`rg 'seg.ident == "Ref"' crates/leaf-codegen/src` is
+   clean of live code.)
 
-`#[bean]` methods already avoid (1) — they inject via method *parameters*, decoupled
-from the produced type's fields — but they still hit (2) (`method_deps` →
-`produced_ty`). The fix generalizes the `#[bean]`-method model to all injection points
-and replaces name-matching with trait dispatch.
+A hard, standing rule frames the fix: **leaf macros must never decide semantics from
+a type's textual name** — resolution is trait dispatch, not token matching.
 
 ## Design overview
 
-Two pieces:
+Two construction paths, the first kept exactly as today, the second new:
 
-1. **An `Injectable` trait** carries, per parameter/field type, *how to resolve it*.
-   Trait dispatch — never name matching — handles `Ref<T>`/`Lookup<T>`/… semantics, so
-   aliases are irrelevant. It exposes both a **const dependency descriptor** (for the
-   static wave-planner, so the dependency graph is known before instantiation) and an
-   **async `inject(ctx)`** (runtime resolution).
+1. **Field injection — the default, no constructor required.** A stereotype with no
+   `constructor` argument lowers each field to an injection point via `<FieldTy as
+   Injectable>::RESOLVABLE` and constructs the bean from its fields (today's behavior,
+   already routed through `Injectable`). Field attributes (`@Qualifier`, names) are
+   visible to the macro and continue to work. This is the path for ordinary beans
+   whose every field is a dependency.
 
-2. **An `#[inject]` constructor**, processed by the existing impl-level `#[advisable]`
-   macro. The constructor's *parameters* are the injection points; it is called on
-   instantiation; its body initializes state fields with ordinary Rust. If a bean has
-   no `#[inject]` constructor, the stereotype falls back to today's field injection
-   (also routed through `Injectable`).
+2. **A referenced constructor — opt-in, for state-holding or complex beans.** The
+   stereotype carries `constructor = <path>` (e.g. `#[repository(constructor =
+   OrderRepository::new)]`). The macro emits a provider that calls `construct_with(<path>,
+   ctx)` and a plan that calls `ctor_deps(<path>)`; a per-arity `InjectableCtor` trait
+   plus type inference resolve the constructor's *parameters* through `Injectable` and
+   then call it. The constructor's body builds the struct, state and all. The presence
+   of the argument tells the macro to **skip the field-default**, so a state-holding
+   struct compiles.
 
-Net effect: `#[repository] struct OrderRepository { next_id: AtomicI64 }` +
-`#[advisable] impl OrderRepository { #[inject] fn new() -> Self { … } }` works (the
-constructor seeds state; zero injected params), subsuming `register_component!`. And a
-mixed bean `#[service] struct OrderService { catalog: Ref<CatalogService>, hits:
-AtomicU64 }` + `#[advisable] impl { #[inject] fn new(catalog: Ref<CatalogService>) ->
-Self { Self { catalog, hits: AtomicU64::new(0) } } }` injects `catalog` and seeds
-`hits`.
+Net effect: `#[repository] struct OrderRepository { next_id: AtomicI64 }` was
+impossible; `#[repository(constructor = OrderRepository::new)]` + `fn new() -> Self {
+… }` works (the constructor seeds state; zero injected params), subsuming
+`register_component!`. A mixed bean `#[service(constructor = OrderService::new)] struct
+OrderService { catalog: Ref<CatalogService>, hits: AtomicU64 }` + `fn new(catalog:
+Ref<CatalogService>) -> Self { Self { catalog, hits: AtomicU64::new(0) } }` injects
+`catalog` (by type, via `Injectable`) and seeds `hits`.
 
-## Component: the `Injectable` trait (leaf-core)
+## Component: the `Injectable` trait (leaf-core) — unchanged, in place
+
+Per-parameter/field resolution. Trait dispatch decides HOW each type is resolved — never
+type-name matching. Exposes a const dependency descriptor (`RESOLVABLE`, for the static
+wave-planner) and an async `inject(ctx)`. Impls live in leaf-core for the handle family
+only (`Ref<T>`, `Lookup<T>`, `LazyRef<T>`, …). A bare-typed parameter is therefore not
+`Injectable` — a clear compile error steering to `Ref<T>`. **This component is already
+implemented (Task 1, commit `774dfce`) and is the primitive both construction paths build
+on.**
+
+## Component: the `InjectableCtor` trait + inference drivers (leaf-core) — new
+
+A "magic constructor" trait, implemented once per arity, lets the macro reference a
+constructor by path without ever seeing its parameter list:
 
 ```rust
-/// A type obtainable from the container as a constructor parameter (or injected
-/// field). Trait dispatch decides HOW each is resolved — never type-name matching —
-/// so aliases/re-exports of the handle types are irrelevant.
-pub trait Injectable: Sized + Send + Sync + 'static {
-    /// The static dependency this parameter contributes to the wave-planner: the
-    /// resolvable target (TypeId), cardinality, and strictness. A const so the
-    /// dependency graph is known before any instantiation (cycle detection,
-    /// whole-graph validation, wave ordering). Built with the const `TypeId::of`
-    /// (stable 1.91, already used in the codebase).
-    const DEPENDENCY: Resolvable;
-
-    /// Obtain the value from the container at instantiation.
-    fn inject<'a>(ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Self, LeafError>>;
+/// Implemented for any `Fn(P1, …, Pn) -> T` whose every parameter is `Injectable`.
+/// `Args` is the parameter tuple; the per-arity impls make `Args`/`T` inferable from a
+/// bare `Type::new` value (proven by spike — no turbofish needed at the call site).
+pub trait InjectableCtor<Args, T>: Sized {
+    /// Resolve every parameter via `Injectable`, then call the constructor.
+    fn construct<'a>(self, ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<T, LeafError>>;
+    /// The static dependency plan (each parameter's `Injectable::RESOLVABLE`), for the
+    /// wave-planner. Read from the fn value at assembly — before any instantiation.
+    fn deps(&self) -> Vec<InjectionPoint>;
 }
+
+// arity 0:
+impl<F, T> InjectableCtor<(), T> for F where F: Fn() -> T + Send + Sync + 'static, T: Send + 'static { … }
+// arity 1:
+impl<F, T, P1> InjectableCtor<(P1,), T> for F
+where F: Fn(P1) -> T + Send + Sync + 'static, T: Send + 'static, P1: Injectable { … }
+// … through a chosen max arity N (e.g. 12), generated by a small declarative macro.
 ```
 
-`Resolvable` is the type-derived subset of the existing `InjectionPoint` (produced
-`TypeId` + `CollectionShape` cardinality + strictness/optionality); the macro combines
-it with the *name* (and any `@Qualifier`) it reads structurally from the parameter.
+Two free functions are the inference drivers the stereotype macro emits (they exist so the
+macro never spells `Args`/`T`):
 
-Impls live in leaf-core for the **handle family only** (coherence forbids a blanket
-`impl<T: Bean> Injectable for T` alongside the handle impls):
+```rust
+pub fn construct_with<'a, F, Args, T>(ctor: F, ctx: &'a ResolveCtx<'a>)
+    -> BoxFuture<'a, Result<T, LeafError>> where F: InjectableCtor<Args, T> { ctor.construct(ctx) }
+pub fn ctor_deps<F, Args, T>(ctor: F) -> Vec<InjectionPoint> where F: InjectableCtor<Args, T> { ctor.deps() }
+```
 
-- `impl<T: Bean> Injectable for Ref<T>` — `DEPENDENCY = single(TypeId::of::<T>(),
-  Required)`; `inject` resolves `T` (Strict, Single) and wraps it in `Ref`.
-- `impl<T: Bean> Injectable for Lookup<T>` — deferred/optional: `DEPENDENCY` marks `T`
-  a *soft* dependency (the planner does not force `T` to exist); `inject` builds the
-  `Lookup` handle (always `Ok` — resolution happens later via `get_if_available`).
-- `impl<T: Bean> Injectable for LazyRef<T>` — deferred eager-single, resolved on first
-  use; `DEPENDENCY` as a soft/required single per its existing semantics.
-- `impl<T: Bean> Injectable for Inject<T>` — per `Inject`'s existing semantics
-  (confirm against `leaf-core/src/injection.rs` during implementation).
-- Collection forms (e.g. a multi-injection handle over `T`) follow the same pattern
-  with `CollectionShape`.
+The coherence concern is settled: each arity is a distinct `InjectableCtor<Args, _>`
+instantiation (`()`, `(P1,)`, `(P1, P2)`, …), so the blanket impls do not overlap, and a
+fn item has exactly one arity (the spike compiles all three at once). Send/Sync bounds keep
+the produced `BoxFuture: Send`.
 
-A **bare-typed** parameter (`db: Database`) is therefore *not* `Injectable` — a clear
-compile error steering to `Ref<Database>` (the established handle currency). This is
-intentional: no bare-type injection, no name-based escape hatch.
+## Component: the stereotype macro + the `constructor` argument
 
-## Component: the `#[inject]` constructor + `#[advisable]`
+The stereotype macros (`struct_input` for `#[component]`/`#[service]`/`#[repository]`/
+`#[controller]`/`#[configuration]`) parse an optional `constructor = <path>` argument from
+their own attribute:
 
-`#[inject]` is an inner **marker** (like `#[transactional]`/`#[cacheable]`), added to
-`CONCERN_ATTRS`. A standalone `#[inject]` outside an `#[advisable]` impl is a
-hard-error-with-hint (mirrors `concern_marker_only`). The impl-level `#[advisable]`
-macro (kept under that name) processes it:
+- **Argument absent →** today's field-injection path (each field via `Injectable`,
+  field attributes honored). Unchanged.
+- **Argument present →** the macro emits a provider whose `provide` returns
+  `construct_with(<path>, ctx)` and a plan thunk `ctor_deps(<path>)`, keyed by the bean's
+  `ContractId`, and **does not emit the field-default**. `<path>` accepts either a full
+  path (`OrderRepository::new`) or a bare method name (`new` → `Self::new` via the struct
+  type the macro is attached to).
 
-- Find the lone method marked `#[inject]` whose return is `Self`/the impl's self-type
-  (the **constructor**). More than one `#[inject]` constructor is a Tier-0
-  `compile_error!`.
-- Lower each constructor **parameter** to an `InjectionPoint` = `<ParamTy as
-  Injectable>::DEPENDENCY` (type-derived) + the parameter's binding name (structural).
-  This is the per-bean `InjectionPlan`.
-- Emit a provider whose `provide` awaits `<P_i as Injectable>::inject(ctx)` for each
-  param in order, then calls `Self::new(p_1, …, p_n)`. The constructor body initializes
-  state fields.
-- Submit the provider's `ProviderSeed` + the `InjectionPlan` into `SEED_PAIRINGS` /
-  `INJECTION_PLAN_PAIRINGS`, keyed by the impl self-type's `ContractId`.
+Because the argument lives on the struct's attribute, the macro reads it directly — there
+is no struct-cannot-see-the-`impl` problem, and there is exactly **one** provider per bean
+(no runtime merge). `register_component!` is preserved as a thin alias: it is equivalent to
+a stereotype with `constructor = new` over a zero-parameter `new()`.
 
-Mechanics rationale (why not a method-only macro): a method-position attribute macro
-(a) cannot see its enclosing `impl`'s self-type (sees `Self`, not `OrderService`) and
-(b) cannot emit the module-scope `#[distributed_slice]` rows the wiring needs. The
-impl-level macro sees both. This is exactly today's `#[advisable]`/`#[transactional]`
-split.
+`#[runner]`/`#[auto_config]` keep field injection for now; adding `constructor = …` to them
+is a trivial, deferred follow-up if a stateful runner/auto-config appears.
 
-Method/setter injection (a `#[inject]` fn that is *not* the constructor) is a
-deliberate **future** extension on the same marker, out of scope here.
+## Limitation (deliberate): by-type resolution for referenced constructors
 
-## Component: the stereotype macro + the merge
-
-The stereotype macro (`struct_input` for `#[component]`/`#[service]`/`#[repository]`/
-`#[controller]`/`#[configuration]`, plus `runner_input`, `auto_config_input`) keeps
-emitting the **descriptor** (identity, role, slice). It ALSO emits a **default
-field-injection** provider/plan (today's behavior, now routed through `Injectable`):
-each field's `InjectionPoint` = `<FieldTy as Injectable>::DEPENDENCY` + field name, and
-the provider calls `Self::new(all_fields)`.
-
-The `#[advisable]`-emitted constructor provider/plan and the struct's field-default are
-JOINed by `ContractId` in `Application::collect_from_slices` / the assembly pass. **The
-constructor pairing wins** when present (an explicit `merge_by_contract` precedence:
-`#[inject]`-constructor rows override the struct field-default rows). A bean with state
-fields therefore *must* supply an `#[inject]` constructor — the field-default would try
-to inject a state field and fail with a loud `NoSuchBean`, which is correct.
+Because the macro references the constructor rather than parsing it, it cannot see the
+parameters' **names** or `@Qualifier`/`@Primary` attributes. A `constructor = <path>`
+bean therefore resolves each parameter **by type** through `Injectable` (the planner gets
+the `RESOLVABLE` descriptor; injection-point names are positional, e.g. `arg0`). Qualified
+or by-name injection uses the **field-injection path**, where the struct macro parses the
+fields and their attributes. State-holding beans do not need qualifiers, so this does not
+block the current goal. A parsed-constructor form that recovers per-parameter qualifiers is
+a possible future extension on the same `constructor =` surface.
 
 ## Where it applies
 
-Every struct/constructor-injection surface routes through `Injectable`:
-`struct_input` (5 stereotypes), `register_input`/`register_input_with`
-(`register_component!`), `runner_input` (`#[runner]`), `auto_config_input`
-(`#[auto_config]` struct form), `config_method_input`/`method_deps` (`#[bean]`
-methods), and `emit_injection_points`. `register_component!` is preserved as a thin,
-possibly-deprecated alias — it is now equivalent to a stereotype with a zero-param
-`#[inject]` constructor.
-
-## Cleanup (the no-type-names rule)
-
-- Remove the name-based handle detection: `produced_ty`'s `seg.ident == "Ref"` in BOTH
-  `descriptor.rs:461` and `stereotype.rs:477`. Resolution is the trait's job; the macro
-  passes the parameter/field type to `<Ty as Injectable>` verbatim.
-- **Follow-up (flagged, not in this spec's scope):** the same anti-pattern lives in
-  `config.rs`/`validate.rs` (`seg.ident == "Vec"` — collection-shape detection for
-  binding/validation) and `concern.rs` (`seg.ident == "Result"` — return-type
-  unwrapping). These are binding/return concerns, not injection; they want the same
-  trait-based treatment in a later pass. (`.ident.to_string()` uses that read a type's
-  *name as the bean name* are legitimate and stay.)
+Field injection (default) and `constructor = <path>` (opt-in) cover the five stereotypes
+via `struct_input`. `register_component!` becomes the `constructor = new` alias. `#[bean]`
+methods already inject by parameter (parsed, qualifier-aware) through `Injectable` (Task 6)
+and are unchanged. `emit_injection_points` and the field-default recipe stay for the
+no-argument path.
 
 ## Runtime data flow
 
-1. Link time: `#[component]` struct → descriptor + field-default rows; `#[advisable]` +
-   `#[inject]` → constructor provider/plan rows. Both into the linkme slices.
-2. Assembly (`collect_from_slices`): JOIN by `ContractId`; constructor rows override
-   field-default rows. The `InjectionPlan` (from `Injectable::DEPENDENCY`) feeds the
-   wave-planner (cycle detection, ordering, whole-graph validation) — no instantiation.
-3. Instantiation: the provider awaits `<P_i as Injectable>::inject(ctx)` per param,
-   then `Self::new(resolved…)`; the constructor body seeds state.
+1. Link time: a no-`constructor` stereotype emits descriptor + field-default rows (fields
+   via `Injectable`); a `constructor = <path>` stereotype emits descriptor + a single
+   provider/plan pair built from `construct_with`/`ctor_deps`.
+2. Assembly (`collect_from_slices`): one provider/plan per `ContractId` — no JOIN, no
+   precedence. The plan (`ctor_deps(<path>)` or the field `RESOLVABLE`s) feeds the
+   wave-planner (cycle detection, ordering, whole-graph validation) with no instantiation.
+3. Instantiation: the provider awaits `construct_with(<path>, ctx)` — which awaits each
+   parameter's `Injectable::inject` and calls the constructor — or the field-default's
+   per-field `inject` + `Self::new(fields)`.
 
 ## Error handling
 
 - A constructor parameter typed as a non-`Injectable` (a bare bean type, or a non-bean)
-  → a clear trait-bound error at the user's `#[inject]` site, steering to `Ref<T>`.
-- A field-default bean with a state field → `NoSuchBean` at resolution (correct; use an
-  `#[inject]` constructor).
-- More than one `#[inject]` constructor in an impl, or `#[inject]` outside `#[advisable]`
-  → Tier-0 `compile_error!` with a hint.
+  → a clear trait-bound error steering to `Ref<T>`. (A `#[diagnostic::on_unimplemented]`
+  on `Injectable`/`InjectableCtor` can sharpen the message.)
+- A constructor whose arity exceeds the generated max → a trait-bound error (raise the max
+  if it ever bites).
+- A `constructor = <path>` naming a missing/mismatched function → an ordinary unresolved-path
+  error at the generated call site.
 - All resolution failures ride the existing single `LeafError` causal chain.
 
 ## Backward compatibility & migration
 
 - **Existing beans are unchanged.** Today's `#[component] struct Foo { a: Ref<A> }` +
-  `fn new(a)` has all-`Ref` fields → the field-default path resolves them via
-  `Injectable` (same `TypeId`, same `Self::new(a)` call). No source change, no behavior
-  change.
-- **`register_component!`** keeps working (subsumed; thin alias).
-- **The storefront repositories** migrate from `register_component!` to real
-  `#[repository]` + `#[advisable] impl { #[inject] fn new() … }` as the proof.
-- The `Vec`/`Result` name-detection cleanup is a separate, later pass.
+  `fn new(a)` stays on the field-injection path (no `constructor` argument, all-`Ref`
+  fields resolved via `Injectable`).
+- **`register_component!`** keeps working (the `constructor = new` alias).
+- **The storefront repositories** migrate from `register_component!` to
+  `#[repository(constructor = …)]` as the proof of the state-holding path.
+- The committed `#[inject]` marker, `#[advisable]` constructor lowering, and runtime
+  merge-precedence are **removed** (they are superseded by `constructor = <path>`).
 
 ## Testing strategy
 
-- leaf-core unit tests for each `Injectable` impl: `DEPENDENCY` (TypeId/cardinality/
-  strictness) and `inject` (resolves/wraps; `Lookup`/`LazyRef` are always-constructible
-  deferred handles).
-- leaf-codegen token tests: `#[advisable]` emits the constructor provider/plan from the
-  `#[inject]` params (not the struct fields); the stereotype still emits the descriptor
-  + field-default; the merge precedence; the error paths (two ctors, marker outside
-  `#[advisable]`).
-- End-to-end (leaf-boot tests + the storefront): a stateful `#[repository]` resolves and
-  carries its state; a mixed `#[service]` injects deps + seeds state; existing
-  field-injection beans stay green (backward-compat); the wave-planner sees the
-  `Injectable`-derived dependencies (cycle/validation unaffected).
+- leaf-core: an `InjectableCtor` test mirroring the spike — `construct_with(Type::new, ctx)`
+  builds for arities 0/1/2 from a bare fn value (no turbofish); `ctor_deps` returns the
+  per-parameter `RESOLVABLE`s; a non-`Injectable` parameter fails to compile (trybuild or a
+  documented compile-fail).
+- leaf-codegen token tests: a `constructor = <path>` stereotype emits a `construct_with`/
+  `ctor_deps` provider+plan and **no** field-default; a no-argument stereotype still emits
+  the field-default; a bare `new` resolves to `Self::new`.
+- End-to-end (leaf-boot + storefront): a stateful `#[repository(constructor = new)]`
+  resolves and carries its state; a mixed `#[service(constructor = new)]` injects deps and
+  seeds state; existing field-injection beans stay green; the wave-planner sees the
+  `ctor_deps`-derived dependencies (cycle/validation unaffected).
+- Removal is verified: the `#[inject]` attribute, `emit_wiring_only`, the `from_constructor`
+  row flag, and the merge are gone; the full workspace gate stays green.
 
 ## Decisions made
 
-- Attribute: `#[inject]` (JSR-330 flavor) — not `#[autowired]`.
-- Impl macro: keep the name `#[advisable]` (it now covers construction + advice).
-- Mechanism: trait dispatch (`Injectable`) with a const dependency descriptor — no
-  type-name matching anywhere in injection.
-- Scope this round: constructor injection across all struct-injection points + the
-  `produced_ty` cleanup. Method/setter injection and the `Vec`/`Result` name-detection
-  cleanups are explicit follow-ups.
+- Surface: `constructor = <path>` on the stereotype attribute (full path or bare method →
+  `Self::method`). No `#[inject]` marker, no `(inject)` flag, no `#[advisable]`-for-construction.
+- Mechanism: a per-arity `InjectableCtor` "magic constructor" trait + `construct_with`/
+  `ctor_deps` inference drivers — the macro references the constructor, never parses it.
+- Field injection remains the default; `constructor = <path>` is opt-in.
+- By-type resolution for referenced constructors (no per-parameter qualifiers) is an
+  accepted limitation; qualified injection uses field injection.
+- Tasks 1/4/6 stand; Tasks 2/3/5 are removed.
+- Follow-ups (flagged, out of scope): `constructor = …` on `#[runner]`/`#[auto_config]`;
+  a parsed-constructor form recovering per-parameter qualifiers; the `Vec`/`Result`
+  `seg.ident` name-detection cleanup in config.rs/validate.rs/concern.rs.
