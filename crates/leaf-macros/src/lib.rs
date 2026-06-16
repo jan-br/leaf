@@ -60,11 +60,6 @@ const CONCERN_ATTRS: &[&str] = &[
     "validated",
     "retryable",
     "concurrency_limit",
-    // `#[inject]` marks the constructor of an `#[advisable]` impl: the impl-block macro
-    // reads the marked `fn` and lowers its params to the constructor provider/plan rows
-    // (a method-position attr alone cannot emit those sibling rows). It is STRIPPED from
-    // the re-emitted impl here, exactly like the declarative concern markers.
-    "inject",
 ];
 
 /// `#[component]` — the base stereotype. Emits one const `::leaf_core::Descriptor`
@@ -914,26 +909,6 @@ fn concern_marker_only(item: TokenStream, kw: &str) -> TokenStream {
          advisor row (a method-position attribute alone cannot emit the sibling \
          `ADVISOR_PAIRINGS` row). Put the `#[advisable]` attribute on the impl block."
     );
-    quote! { #parsed ::core::compile_error!(#message); }.into()
-}
-
-/// `#[inject]` — mark the CONSTRUCTOR of an `#[advisable] impl Bean { .. }` block: the
-/// constructor's *parameters* are the bean's injection points, lowered (through the
-/// `Injectable` trait) to the per-bean `InjectionPlan` + the constructor provider that
-/// calls `Bean::new(resolved…)`. Like the declarative concern markers, the impl-block
-/// macro OWNS that lowering (a method-position attribute alone cannot emit the sibling
-/// `SEED_PAIRINGS`/`INJECTION_PLAN_PAIRINGS` rows), so this attr is STRIPPED before it
-/// expands inside an `#[advisable]` impl; applied STANDALONE it is a loud
-/// `compile_error!` steering to that form.
-#[proc_macro_attribute]
-pub fn inject(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let parsed: proc_macro2::TokenStream = item.into();
-    let message = "`#[inject]` marks the constructor of an `#[advisable] impl Bean \
-                   { .. }` block: the impl-block macro reads the marked constructor and \
-                   lowers its parameters to the bean's injection plan + provider (a \
-                   method-position attribute alone cannot emit the sibling \
-                   `SEED_PAIRINGS`/`INJECTION_PLAN_PAIRINGS` rows). Put the \
-                   `#[advisable]` attribute on the enclosing impl block.";
     quote! { #parsed ::core::compile_error!(#message); }.into()
 }
 

@@ -87,42 +87,20 @@ impl std::fmt::Debug for SeedPairing {
 /// slice, so `from_slices` discovers it generically. The binary's explicit `pairings`
 /// arg OVERRIDES this base on a `ContractId` collision (the escape hatch).
 ///
-/// The CONSTRUCTOR-OVER-FIELD-DEFAULT merge (Task 5): a stateful/mixed bean wears
-/// BOTH a struct stereotype (the FIELD-DEFAULT seed row) AND an `#[inject]`
-/// constructor (the CONSTRUCTOR seed row), so two rows ride the slice for one
-/// `contract`. The `#[inject]`-constructor row (`from_constructor == true`) WINS over
-/// the field-default — the constructor is the explicit construction recipe. A genuine
-/// double-emitted `__leaf_seed_*` (two rows of the SAME precedence for one contract)
-/// is still a loud build-seam error here.
+/// There is exactly ONE seed pairing per `contract` (the struct field-default recipe,
+/// the `#[bean]` factory, or the `constructor = <path>` referenced-constructor recipe —
+/// a bean carries one and only one). A second row for the same `contract` is therefore a
+/// genuine double-emitted `__leaf_seed_*`: a loud build-seam error.
 ///
 /// # Errors
-/// A [`LeafError`] (`ErrorKind::AntiDce`) if one contract has two rows of the SAME
-/// precedence in the link-collected `SEED_PAIRINGS` slice (a double-emitted seed —
-/// two field-defaults or two constructors, never resolvable by precedence).
+/// A [`LeafError`] (`ErrorKind::AntiDce`) if one contract has two rows in the
+/// link-collected `SEED_PAIRINGS` slice (a double-emitted seed).
 fn slice_seed_index() -> Result<HashMap<ContractId, ProviderSeed>, LeafError> {
     let rows = collect_slice(&SEED_PAIRINGS);
-    // Track the winning row's precedence per contract so the constructor row overrides
-    // the field-default (and vice-versa is rejected) regardless of slice order.
     let mut seed_of: HashMap<ContractId, ProviderSeed> = HashMap::with_capacity(rows.len());
-    let mut from_ctor: HashMap<ContractId, bool> = HashMap::with_capacity(rows.len());
     for row in rows {
-        match from_ctor.get(&row.contract).copied() {
-            // First row for this contract — take it.
-            None => {
-                seed_of.insert(row.contract, row.seed);
-                from_ctor.insert(row.contract, row.from_constructor);
-            }
-            // Same precedence as the winner already held → a true double-emit.
-            Some(held) if held == row.from_constructor => {
-                return Err(duplicate_pairing(row.contract));
-            }
-            // A constructor row supersedes the field-default already held.
-            Some(_held_is_field_default) if row.from_constructor => {
-                seed_of.insert(row.contract, row.seed);
-                from_ctor.insert(row.contract, true);
-            }
-            // A field-default row arriving after the constructor winner — ignore it.
-            Some(_held_is_constructor) => {}
+        if seed_of.insert(row.contract, row.seed).is_some() {
+            return Err(duplicate_pairing(row.contract));
         }
     }
     Ok(seed_of)

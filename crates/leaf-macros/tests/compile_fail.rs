@@ -41,14 +41,10 @@ fn ui() {
     // method-position attr alone cannot emit the sibling ADVISOR_PAIRINGS row). The
     // WORKING impl-block form is exercised by the concern crates' auto_advise tests.
     t.compile_fail("tests/ui/concern_outside_advisable_is_a_hard_error.rs");
-    // `#[inject]` applied STANDALONE (not on the constructor of an `#[advisable] impl`)
-    // is a loud error: a method-position attr alone cannot emit the sibling
-    // SEED_PAIRINGS/INJECTION_PLAN_PAIRINGS constructor rows. It steers to the
-    // impl-block form (`#[inject]` marks the constructor of an `#[advisable]` impl).
-    t.compile_fail("tests/ui/inject_outside_advisable_is_a_hard_error.rs");
-    // A state-holding `#[component]` with NO `#[inject]` constructor fails to compile
-    // LOUDLY: the field-default routes every field through `Injectable` (trait
+    // A state-holding `#[component]` with NO `constructor = <path>` argument fails to
+    // compile LOUDLY: the field-default routes every field through `Injectable` (trait
     // dispatch, no name strip), and a plain state field is not `Injectable`. The
-    // remediation is an `#[inject]` constructor (Task 4 — the no-type-names rule).
+    // remediation is a `constructor = <path>` referenced constructor (the no-type-names
+    // rule) that seeds the state and injects only the `Ref<…>` collaborators.
     t.compile_fail("tests/ui/state_field_without_inject_ctor_is_not_injectable.rs");
 }

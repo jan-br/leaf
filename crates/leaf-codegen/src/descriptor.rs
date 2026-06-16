@@ -464,10 +464,9 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         // hand-assembled `.with_seeds`/`.with_injection_plans` required. Binding the
         // plan const through the row also keeps it from being DCE'd before the
         // assembly pass can read it.
-        // The struct stereotype / `#[bean]` / config-method recipe is the
-        // FIELD-DEFAULT (`from_constructor: false`): if an `#[inject]` constructor row
-        // also rides the slice for this contract, leaf-boot's merge selects IT over
-        // this one (the constructor-over-field-default precedence).
+        // The struct stereotype / `#[bean]` / config-method recipe is keyed by the
+        // bean's ContractId — exactly ONE seed pairing per contract (a second row for the
+        // same contract is a loud double-emit build-seam error in leaf-boot).
         #[allow(non_upper_case_globals)]
         #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
         #[linkme(crate = ::leaf_core::linkme)]
@@ -478,98 +477,6 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         #[linkme(crate = ::leaf_core::linkme)]
         static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
             ::leaf_core::InjectionPlanPairingRow::field_default(#contract, #plan_ident);
-    })
-}
-
-/// Emit ONLY the construction WIRING for a bean whose identity (the `Descriptor` +
-/// `COMPONENTS` row + `Bean` impl) is emitted ELSEWHERE — the `#[advisable] impl`
-/// `#[inject]`-constructor case, where the stereotype macro on the struct owns the
-/// `Descriptor` and this contributes the per-bean `InjectionPlan` + the generated
-/// `Provider`/`ProviderSeed`, submitted into the `SEED_PAIRINGS` /
-/// `INJECTION_PLAN_PAIRINGS` slices keyed by the bean's `ContractId`.
-///
-/// The constructor pairing rows carry the SAME `ContractId` as the stereotype's
-/// field-default rows; leaf-boot's `merge_by_contract` selects between them (Task 5 —
-/// the constructor wins). To avoid emitting DUPLICATE item names beside the
-/// stereotype's helpers for the same bean, every helper item here is mangled under a
-/// distinct `__LEAF_CTOR_*` / `__leaf_ctor_seed_*` namespace, and the generated
-/// provider's `descriptor()` references the stereotype-emitted
-/// `__LEAF_DESCRIPTOR_<Ident>` const (the same bean's identity row).
-///
-/// # Errors
-/// [`EmitError`] (→ `compile_error!`) when the target is generic (no single concrete
-/// type to wire) — the same constraint the `Descriptor` emission carries.
-pub fn emit_wiring_only(input: &BeanInput) -> Result<TokenStream, EmitError> {
-    if input.is_generic {
-        return Err(EmitError {
-            message: format!(
-                "`{}` is generic: a generic bean has no single concrete type to wire a \
-                 `#[inject]` constructor for. Register a concrete instantiation with \
-                 `register_component!({}<Concrete>)`.",
-                input.ident, input.ident
-            ),
-        });
-    }
-
-    let self_ty = &input.self_ty;
-    let contract = emit_contract(input);
-
-    let mangled = mangle(&input.ident);
-    // Distinct `__LEAF_CTOR_*` namespace so these helpers never collide with the
-    // stereotype's own `__LEAF_*`/`__leaf_seed_*` items for the same bean ident.
-    let points_ident = format_ident!("__LEAF_CTOR_POINTS_{}", mangled);
-    let plan_ident = format_ident!("__LEAF_CTOR_PLAN_{}", mangled);
-    let provider_ident = format_ident!("__LeafCtorProvider_{}", mangled);
-    let seed_ident = format_ident!("__leaf_ctor_seed_{}", mangled);
-    let seed_row_ident = format_ident!("__LEAF_CTOR_SEED_PAIRING_{}", mangled);
-    let plan_row_ident = format_ident!("__LEAF_CTOR_PLAN_PAIRING_{}", mangled);
-    // The stereotype macro on the struct emits this descriptor const (the bean's
-    // identity row); the ctor provider borrows it for its `descriptor()` return.
-    let desc_ident = format_ident!("__LEAF_DESCRIPTOR_{}", mangled);
-
-    let points = emit_injection_points(&input.deps, input.inject_via_trait);
-    let provider_impl = emit_provider(
-        self_ty,
-        input.ctor.as_ref(),
-        input.receiver_ty.as_ref(),
-        &input.deps,
-        input.inject_via_trait,
-        // `emit_wiring_only` is the legacy `#[inject]`-constructor wiring path (removed
-        // in Task 3); it never uses the referenced-constructor provider.
-        None,
-        &provider_ident,
-        &desc_ident,
-    );
-
-    Ok(quote! {
-        // ── the per-bean InjectionPlan (one point per CONSTRUCTOR parameter) ──
-        #[allow(non_upper_case_globals)]
-        const #points_ident: &[::leaf_core::InjectionPoint] = &[ #(#points),* ];
-        #[allow(non_upper_case_globals)]
-        const #plan_ident: ::leaf_core::InjectionPlan =
-            ::leaf_core::InjectionPlan { points: #points_ident };
-
-        // ── the generated Provider + its PUBLIC const ProviderSeed (the ctor recipe) ──
-        #provider_impl
-        #[allow(non_upper_case_globals)]
-        #[doc(hidden)]
-        pub const #seed_ident: ::leaf_core::ProviderSeed =
-            || ::std::sync::Arc::new(#provider_ident);
-
-        // ── the wiring-pairing submissions, keyed by the bean ContractId ──
-        // Both rows carry the SAME contract as the stereotype's field-default rows AND
-        // are tagged `from_constructor` (the precedence flag): leaf-boot's merge
-        // selects the constructor over the field-default (Task 5).
-        #[allow(non_upper_case_globals)]
-        #[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]
-        #[linkme(crate = ::leaf_core::linkme)]
-        static #seed_row_ident: ::leaf_core::SeedPairingRow =
-            ::leaf_core::SeedPairingRow::from_constructor(#contract, #seed_ident);
-        #[allow(non_upper_case_globals)]
-        #[::leaf_core::linkme::distributed_slice(::leaf_core::INJECTION_PLAN_PAIRINGS)]
-        #[linkme(crate = ::leaf_core::linkme)]
-        static #plan_row_ident: ::leaf_core::InjectionPlanPairingRow =
-            ::leaf_core::InjectionPlanPairingRow::from_constructor(#contract, #plan_ident);
     })
 }
 
@@ -993,12 +900,11 @@ mod tests {
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::SEED_PAIRINGS)]"),
             "got: {s}"
         );
-        // The struct field-default path mints its rows through the FIELD-DEFAULT const
-        // constructors (the `from_constructor: false` precedence — the `#[inject]`
-        // constructor row, if any, wins over it in leaf-boot's merge).
+        // The struct field-default path mints its rows through the `field_default` const
+        // constructor — the single seed/plan pairing per contract.
         assert!(
             s.contains("::leaf_core::SeedPairingRow::field_default("),
-            "the field-default seed row uses the field_default precedence ctor: {s}"
+            "the field-default seed row uses the field_default ctor: {s}"
         );
         assert!(s.contains("__leaf_seed_Foo"), "got: {s}");
         assert!(
@@ -1009,7 +915,7 @@ mod tests {
         );
         assert!(
             s.contains("::leaf_core::InjectionPlanPairingRow::field_default("),
-            "the field-default plan row uses the field_default precedence ctor: {s}"
+            "the field-default plan row uses the field_default ctor: {s}"
         );
     }
 

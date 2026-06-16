@@ -13,7 +13,7 @@
 //! - **Conditions + auto-config:** [`conditional`], [`profile`], [`auto_config`],
 //!   [`import`].
 //! - **Declarative advice / AOP + cross-cutting concerns:** [`advisable`],
-//!   [`aspect`], [`advice`], [`pointcut`], [`inject`], [`transactional`],
+//!   [`aspect`], [`advice`], [`pointcut`], [`transactional`],
 //!   [`cacheable`], [`cache_put`], [`cache_evict`], [`validated`], [`retryable`],
 //!   [`concurrency_limit`].
 //! - **Events + scheduling + resources:** [`event_listener`],
@@ -34,7 +34,7 @@
 pub use leaf_macros::{
     advice, advisable, aspect, auto_config, bean, cache_evict, cache_put, cacheable, catalog,
     component, concurrency_limit, conditional, config_properties, configuration, controller,
-    converter, event_listener, failure_analyzer, import, inject, main, pointcut, profile,
+    converter, event_listener, failure_analyzer, import, main, pointcut, profile,
     register_component, repository, resource, retryable, runner, scheduled, service, transactional,
     transactional_event_listener, validated, value, BindTarget,
 };
