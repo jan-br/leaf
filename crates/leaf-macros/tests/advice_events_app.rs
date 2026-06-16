@@ -124,13 +124,14 @@ impl AuditAspect {
 
 // An `#[aspect]` struct IS the interceptor (the auto-collected ADVISOR_PAIRINGS
 // `make_interceptor` resolves it + upcasts to `Arc<dyn Interceptor>`).
+#[leaf_macros::async_impl]
 impl leaf_core::Interceptor for AuditAspect {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a leaf_core::Call<'a>,
-        mut next: leaf_core::Next<'a>,
-    ) -> leaf_core::BoxFuture<'a, Result<leaf_core::ErasedRet, leaf_core::AdviceError>> {
-        Box::pin(async move { next.proceed(call).await })
+    async fn intercept(
+        &self,
+        call: &leaf_core::Call<'_>,
+        mut next: leaf_core::Next<'_>,
+    ) -> Result<leaf_core::ErasedRet, leaf_core::AdviceError> {
+        next.proceed(call).await
     }
 }
 

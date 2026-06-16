@@ -909,37 +909,35 @@ mod tests {
         descriptor: Descriptor,
         builds: Arc<AtomicUsize>,
     }
+    #[leaf_macros::async_impl]
     impl Provider for BProv {
         fn descriptor(&self) -> &Descriptor {
             &self.descriptor
         }
-        fn provide<'a>(
-            &'a self,
-            _cx: &'a ResolveCtx<'a>,
-        ) -> BoxFuture<'a, Result<Published, LeafError>> {
-            Box::pin(async move {
-                self.builds.fetch_add(1, Ordering::SeqCst);
-                Ok(Published::shared_value(B { tag: "b" }))
-            })
+        async fn provide(
+            &self,
+            _cx: &ResolveCtx<'_>,
+        ) -> Result<Published, LeafError> {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            Ok(Published::shared_value(B { tag: "b" }))
         }
     }
 
     struct AProv {
         descriptor: Descriptor,
     }
+    #[leaf_macros::async_impl]
     impl Provider for AProv {
         fn descriptor(&self) -> &Descriptor {
             &self.descriptor
         }
-        fn provide<'a>(
-            &'a self,
-            cx: &'a ResolveCtx<'a>,
-        ) -> BoxFuture<'a, Result<Published, LeafError>> {
-            Box::pin(async move {
-                let engine = cx.engine().expect("engine threaded");
-                let b = engine.get::<B>().await?;
-                Ok(Published::shared_value(A { b }))
-            })
+        async fn provide(
+            &self,
+            cx: &ResolveCtx<'_>,
+        ) -> Result<Published, LeafError> {
+            let engine = cx.engine().expect("engine threaded");
+            let b = engine.get::<B>().await?;
+            Ok(Published::shared_value(A { b }))
         }
     }
 
@@ -1109,16 +1107,15 @@ mod tests {
             }
         }
         struct SecondProv(Descriptor);
+        #[leaf_macros::async_impl]
         impl Provider for SecondProv {
             fn descriptor(&self) -> &Descriptor {
                 &self.0
             }
-            fn provide<'a>(&'a self, cx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Published, LeafError>> {
-                Box::pin(async move {
-                    let engine = cx.engine().expect("engine");
-                    let first = engine.get::<First>().await?;
-                    Ok(Published::shared_value(Second { first }))
-                })
+            async fn provide(&self, cx: &ResolveCtx<'_>) -> Result<Published, LeafError> {
+                let engine = cx.engine().expect("engine");
+                let first = engine.get::<First>().await?;
+                Ok(Published::shared_value(Second { first }))
             }
         }
 

@@ -169,7 +169,7 @@ impl<'a> ResolveCtx<'a> {
     /// # Errors
     /// [`ErrorKind::ConstructionFailed`](crate::ErrorKind::ConstructionFailed) if no
     /// engine back-reference is threaded; otherwise any
-    /// [`LeafError`](crate::LeafError) from the nested resolution (missing/ambiguous
+    /// [`LeafError`] from the nested resolution (missing/ambiguous
     /// target or a construction fault).
     pub async fn resolve_ref<T: crate::handle::Bean>(
         &self,

@@ -53,6 +53,7 @@
 #![warn(missing_docs)]
 
 pub mod advisor;
+pub mod autoconfig;
 pub mod interceptor;
 pub mod manager;
 pub mod propagation;
@@ -70,6 +71,10 @@ use leaf_core::{Cx, LeafError, TxPhase, TxResourceKey, TxState};
 pub use advisor::{
     enable_transaction_management, make_transaction_interceptor, make_transaction_interceptor_for,
     tx_advisor_contract, tx_advisor_pairing, tx_advisor_pairing_for, tx_order_key, TxPointcut,
+};
+pub use autoconfig::{
+    transaction_manager_descriptor, TxAutoConfig, TRANSACTION_MANAGER_BEAN,
+    TRANSACTION_MANAGER_CONTRACT, TRANSACTION_MANAGER_SEED, TX_AUTO_CONFIG_GUARD,
 };
 pub use interceptor::{result_classifier, ReturnClassifier, TransactionInterceptor};
 pub use manager::{InMemoryTransactionManager, TxResource, TxSync};

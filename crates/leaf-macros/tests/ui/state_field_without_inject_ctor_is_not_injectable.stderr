@@ -15,13 +15,3 @@ help: the following other types implement trait `Injectable`
 ...
    | impl<T: Bean> Injectable for LazyRef<T> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `LazyRef<T>`
-
-error[E0599]: no associated function or constant named `new` found for struct `CounterService` in the current scope
-  --> tests/ui/state_field_without_inject_ctor_is_not_injectable.rs:12:1
-   |
-12 | #[component]
-   | ^^^^^^^^^^^^ associated function or constant not found in `CounterService`
-13 | struct CounterService {
-   | --------------------- associated function or constant `new` not found for this struct
-   |
-   = note: this error originates in the attribute macro `component` (in Nightly builds, run with -Z macro-backtrace for more info)

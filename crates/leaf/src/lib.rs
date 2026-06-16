@@ -114,6 +114,12 @@ pub use leaf_macros as macros;
 #[doc(no_inline)]
 pub use leaf_macros::main;
 
+/// `#[leaf::async_impl]` — write `async fn` in a trait `impl`; desugars each to the
+/// `BoxFuture` form leaf's `dyn` traits require (no visible `Box::pin`/lifetimes). Also
+/// in the prelude.
+#[doc(no_inline)]
+pub use leaf_macros::async_impl;
+
 /// The default async runtime (`tokio`), re-exported so an umbrella-only app can build
 /// the executor it owns (`leaf::tokio::runtime::Builder`) or drive a `block_on` test
 /// without naming `tokio` as a direct dependency — the umbrella provides the runtime.

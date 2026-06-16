@@ -52,7 +52,7 @@ smol = "2"
 # unit-testable without a compiler; leaf-macros is the thin proc-macro that calls it).
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+syn = { version = "2", features = ["full", "extra-traits", "visit", "visit-mut"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

@@ -97,10 +97,6 @@ struct LedgerService;
 
 #[advisable]
 impl LedgerService {
-    fn new() -> Self {
-        LedgerService
-    }
-
     /// A successful transactional write → the tx commits. The `#[transactional]`
     /// annotation auto-wires the tx advisor (binding the `LedgerTxManager` bean + the
     /// `Result<i64,_>` rollback classifier) keyed by this bean's `TypeId`.

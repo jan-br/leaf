@@ -275,6 +275,14 @@ pub fn struct_input(
         None => {
             input.deps = fields_to_deps(&item.fields);
             input.inject_via_trait = true;
+            // Capture the STRUCTURAL field shape so the emitter builds the bean directly
+            // (`Self` / `Self { … }` / `Self( … )`) — no hand-written `fn new` required.
+            // This is the syntactic shape of the fields, never a type-name comparison.
+            input.field_shape = match &item.fields {
+                Fields::Unit => crate::descriptor::FieldShape::Unit,
+                Fields::Named(_) => crate::descriptor::FieldShape::Named,
+                Fields::Unnamed(_) => crate::descriptor::FieldShape::Tuple,
+            };
         }
     }
     Ok(input)

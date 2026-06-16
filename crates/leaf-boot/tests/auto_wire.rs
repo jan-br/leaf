@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use leaf_boot::{Application, RunOverlay, SealInputs};
 use leaf_core::{
-    AdviceError, BoxFuture, Call, ErasedArgs, ErasedRet, Interceptor, LeafError, MethodKey, Next,
+    AdviceError, Call, ErasedArgs, ErasedRet, Interceptor, LeafError, MethodKey, Next,
     Ref, ReadinessState, RunState, Runner,
 };
 use leaf_macros::{advisable, aspect, component, config_properties, register_component, runner};
@@ -55,10 +55,6 @@ struct OrderService {
 }
 #[advisable]
 impl OrderService {
-    fn new(repo: Ref<Repository>) -> Self {
-        OrderService { repo }
-    }
-
     /// The advised business method (auto-routed through the interceptor chain).
     fn place_order(&self, amount: i64) -> i64 {
         amount + self.repo.name.len() as i64
@@ -81,20 +77,14 @@ static RUNNER_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 #[runner]
 #[derive(Debug)]
 struct MigrateRunner;
-impl MigrateRunner {
-    fn new() -> Self {
-        MigrateRunner
-    }
-}
+#[leaf_macros::async_impl]
 impl Runner for MigrateRunner {
-    fn run<'a>(
-        &'a self,
-        _args: &'a leaf_core::ApplicationArguments,
-    ) -> BoxFuture<'a, Result<(), LeafError>> {
-        Box::pin(async move {
-            RUNNER_LOG.lock().unwrap().push("migrated");
-            Ok(())
-        })
+    async fn run(
+        &self,
+        _args: &leaf_core::ApplicationArguments,
+    ) -> Result<(), LeafError> {
+        RUNNER_LOG.lock().unwrap().push("migrated");
+        Ok(())
     }
 }
 
@@ -108,23 +98,17 @@ static ADVICE_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 #[aspect]
 #[derive(Debug)]
 struct AuditAspect;
-impl AuditAspect {
-    fn new() -> Self {
-        AuditAspect
-    }
-}
+#[leaf_macros::async_impl]
 impl Interceptor for AuditAspect {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a Call<'a>,
-        mut next: Next<'a>,
-    ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-        Box::pin(async move {
-            ADVICE_LOG.lock().unwrap().push("before");
-            let r = next.proceed(call).await;
-            ADVICE_LOG.lock().unwrap().push("after");
-            r
-        })
+    async fn intercept(
+        &self,
+        call: &Call<'_>,
+        mut next: Next<'_>,
+    ) -> Result<ErasedRet, AdviceError> {
+        ADVICE_LOG.lock().unwrap().push("before");
+        let r = next.proceed(call).await;
+        ADVICE_LOG.lock().unwrap().push("after");
+        r
     }
 }
 

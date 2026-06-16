@@ -57,12 +57,6 @@ struct OrderService {
 }
 
 impl OrderService {
-    /// The constructor the `#[component]` provider calls with the resolved deps
-    /// (`<OrderService>::new(repo)`).
-    fn new(repo: Ref<Repository>) -> Self {
-        OrderService { repo }
-    }
-
     /// The "advised" business method — a call routes through the interceptor chain
     /// the R4 auto-proxy install builds. Reads the injected collaborator (proving
     /// the graph edge is live).
@@ -95,16 +89,15 @@ static RUNNER_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 /// shared `ApplicationArguments`.
 struct StartupRunner;
 
+#[leaf_macros::async_impl]
 impl Runner for StartupRunner {
-    fn run<'a>(
-        &'a self,
-        args: &'a leaf_core::ApplicationArguments,
-    ) -> BoxFuture<'a, Result<(), LeafError>> {
-        Box::pin(async move {
-            RUNNER_LOG.lock().unwrap().push("ran");
-            let _ = args.source_args();
-            Ok(())
-        })
+    async fn run(
+        &self,
+        args: &leaf_core::ApplicationArguments,
+    ) -> Result<(), LeafError> {
+        RUNNER_LOG.lock().unwrap().push("ran");
+        let _ = args.source_args();
+        Ok(())
     }
 }
 
@@ -116,18 +109,17 @@ static ADVICE_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 /// resolves at the R4 after_init install).
 struct AuditInterceptor;
 
+#[leaf_macros::async_impl]
 impl Interceptor for AuditInterceptor {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a Call<'a>,
-        mut next: Next<'a>,
-    ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-        Box::pin(async move {
-            ADVICE_LOG.lock().unwrap().push("before");
-            let r = next.proceed(call).await;
-            ADVICE_LOG.lock().unwrap().push("after");
-            r
-        })
+    async fn intercept(
+        &self,
+        call: &Call<'_>,
+        mut next: Next<'_>,
+    ) -> Result<ErasedRet, AdviceError> {
+        ADVICE_LOG.lock().unwrap().push("before");
+        let r = next.proceed(call).await;
+        ADVICE_LOG.lock().unwrap().push("after");
+        r
     }
 }
 

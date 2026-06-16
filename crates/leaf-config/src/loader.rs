@@ -190,18 +190,19 @@ fn json_to_node(v: &serde_json::Value) -> Node {
     }
 }
 
+#[leaf_macros::async_impl]
 impl ConfigDataLoader for JsonLoader {
     fn handles(&self, loc: &ConfigDataLocation) -> bool {
         matches!(loc.scheme(), LocationScheme::File)
             && loc.extension().as_deref() == Some("json")
     }
 
-    fn load<'a>(
-        &'a self,
-        loc: &'a ConfigDataLocation,
-        cx: &'a LoadCtx<'a>,
-    ) -> BoxFuture<'a, Result<Vec<LoadedDocument>, ConfigDataError>> {
-        Box::pin(async move { self.load_sync(loc, cx) })
+    async fn load(
+        &self,
+        loc: &ConfigDataLocation,
+        cx: &LoadCtx<'_>,
+    ) -> Result<Vec<LoadedDocument>, ConfigDataError> {
+        self.load_sync(loc, cx)
     }
 }
 
@@ -399,18 +400,19 @@ fn node_to_key_string(node: &Node) -> String {
     }
 }
 
+#[leaf_macros::async_impl]
 impl ConfigDataLoader for YamlLoader {
     fn handles(&self, loc: &ConfigDataLocation) -> bool {
         matches!(loc.scheme(), LocationScheme::File)
             && matches!(loc.extension().as_deref(), Some("yaml" | "yml"))
     }
 
-    fn load<'a>(
-        &'a self,
-        loc: &'a ConfigDataLocation,
-        cx: &'a LoadCtx<'a>,
-    ) -> BoxFuture<'a, Result<Vec<LoadedDocument>, ConfigDataError>> {
-        Box::pin(async move { self.load_sync(loc, cx) })
+    async fn load(
+        &self,
+        loc: &ConfigDataLocation,
+        cx: &LoadCtx<'_>,
+    ) -> Result<Vec<LoadedDocument>, ConfigDataError> {
+        self.load_sync(loc, cx)
     }
 }
 
@@ -500,17 +502,18 @@ impl ConfigTreeLoader {
     }
 }
 
+#[leaf_macros::async_impl]
 impl ConfigDataLoader for ConfigTreeLoader {
     fn handles(&self, loc: &ConfigDataLocation) -> bool {
         matches!(loc.scheme(), LocationScheme::ConfigTree)
     }
 
-    fn load<'a>(
-        &'a self,
-        loc: &'a ConfigDataLocation,
-        cx: &'a LoadCtx<'a>,
-    ) -> BoxFuture<'a, Result<Vec<LoadedDocument>, ConfigDataError>> {
-        Box::pin(async move { self.load_sync(loc, cx) })
+    async fn load(
+        &self,
+        loc: &ConfigDataLocation,
+        cx: &LoadCtx<'_>,
+    ) -> Result<Vec<LoadedDocument>, ConfigDataError> {
+        self.load_sync(loc, cx)
     }
 }
 
@@ -600,17 +603,18 @@ impl EnvVarLoader {
     }
 }
 
+#[leaf_macros::async_impl]
 impl ConfigDataLoader for EnvVarLoader {
     fn handles(&self, loc: &ConfigDataLocation) -> bool {
         matches!(loc.scheme(), LocationScheme::Env)
     }
 
-    fn load<'a>(
-        &'a self,
-        loc: &'a ConfigDataLocation,
-        cx: &'a LoadCtx<'a>,
-    ) -> BoxFuture<'a, Result<Vec<LoadedDocument>, ConfigDataError>> {
-        Box::pin(async move { self.load_sync(loc, cx) })
+    async fn load(
+        &self,
+        loc: &ConfigDataLocation,
+        cx: &LoadCtx<'_>,
+    ) -> Result<Vec<LoadedDocument>, ConfigDataError> {
+        self.load_sync(loc, cx)
     }
 }
 

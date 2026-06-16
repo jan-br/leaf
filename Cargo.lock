@@ -582,6 +582,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "leaf-boot",
+ "leaf-conditions",
  "leaf-core",
  "leaf-macros",
  "leaf-tokio",
@@ -613,6 +614,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "leaf-core",
+ "leaf-macros",
  "serde_json",
  "yaml-rust2",
 ]
@@ -704,6 +706,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "leaf-core",
+ "leaf-macros",
  "once_cell",
  "smol",
 ]
@@ -743,6 +746,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "leaf-boot",
+ "leaf-conditions",
  "leaf-core",
  "leaf-macros",
  "leaf-tokio",

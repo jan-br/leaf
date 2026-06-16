@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use leaf::prelude::*;
 
-use crate::catalog::product_repository::ProductRepository;
+use crate::catalog::product::repository::ProductRepository;
 use crate::platform::cache_manager::InMemoryCache;
 
 /// Body-run count of `price_of` — a process-global so a cache HIT (which short-circuits

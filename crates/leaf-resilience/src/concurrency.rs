@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use leaf_core::{AdviceError, BoxFuture, Call, ConcurrencyGate, ErasedRet, Interceptor, Next};
+use leaf_core::{AdviceError, Call, ConcurrencyGate, ErasedRet, Interceptor, Next};
 
 /// The around-advice [`Interceptor`] that bounds concurrent entries via a
 /// [`ConcurrencyGate`]: acquire a permit, proceed, release on Drop.
@@ -44,19 +44,18 @@ impl ConcurrencyLimitInterceptor {
     }
 }
 
+#[leaf_macros::async_impl]
 impl Interceptor for ConcurrencyLimitInterceptor {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a Call<'a>,
-        mut next: Next<'a>,
-    ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-        Box::pin(async move {
-            // Acquire a permit (parks if saturated — Semaphore-backed, NOT a spin).
-            let _permit = self.gate.acquire().await;
-            // Proceed while HOLDING the permit; `_permit`'s sync RAII Drop releases
-            // the slot on completion AND on cancellation (no leak, no async Drop).
-            next.proceed(call).await
-        })
+    async fn intercept(
+        &self,
+        call: &Call<'_>,
+        mut next: Next<'_>,
+    ) -> Result<ErasedRet, AdviceError> {
+        // Acquire a permit (parks if saturated — Semaphore-backed, NOT a spin).
+        let _permit = self.gate.acquire().await;
+        // Proceed while HOLDING the permit; `_permit`'s sync RAII Drop releases
+        // the slot on completion AND on cancellation (no leak, no async Drop).
+        next.proceed(call).await
     }
 }
 
@@ -69,8 +68,8 @@ mod tests {
 
     use futures::future::join_all;
     use leaf_core::{
-        AdviceChain, BeanKey, ContractId, ErasedArgs, FixedTarget, MethodKey, Permit, PermitSeam,
-        ResolveCtx, Tail,
+        AdviceChain, BeanKey, BoxFuture, ContractId, ErasedArgs, FixedTarget, MethodKey, Permit,
+        PermitSeam, ResolveCtx, Tail,
     };
 
     #[derive(Debug)]

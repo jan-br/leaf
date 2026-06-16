@@ -66,7 +66,7 @@
 #![allow(unsafe_code)]
 
 use crate::bind::ConfigBindThunk;
-use crate::conditions::CondExpr;
+use crate::conditions::{CondExpr, OrderHint};
 use crate::definition::{Descriptor, Role};
 use crate::error::{FailureAnalyzer, LeafError, Origin};
 use crate::handle::ErasedBean;
@@ -408,6 +408,22 @@ pub struct GuardPairingRow {
     pub guard: &'static CondExpr,
 }
 
+/// One auto-config → [`OrderHint`] pairing, keyed by the auto-config's contributed
+/// [`ContractId`] and auto-collected into [`AUTO_CONFIG_ORDERS`]. An auto-config that
+/// wants to register LATER (Spring's `@AutoConfigureAfter` for the simple-cache
+/// default) or EARLIER than its peers submits one row here beside its `AUTO_CONFIGS`
+/// `Descriptor`; leaf-boot's `collect_autoconfig_candidates` JOINs each by `contract`
+/// (defaulting to [`OrderHint::DEFAULT`] when absent — the common case) so the
+/// `run_autoconfig` batch sort visits candidates in the declared order. There is no
+/// type-name coupling: an auto-config only declares its OWN order, never a peer's.
+#[derive(Clone, Copy)]
+pub struct OrderPairingRow {
+    /// The auto-config's contributed stable identity (the JOIN key into `AUTO_CONFIGS`).
+    pub contract: ContractId,
+    /// The auto-config-ordering hint (the `run_autoconfig` batch-sort data).
+    pub order: OrderHint,
+}
+
 /// One macro-emitted advisable-bean → [`BeanJoinPointsSpec`] pairing (the const twin
 /// of leaf-boot's `JoinPointPairing`), keyed by [`ContractId`] and auto-collected into
 /// [`JOINPOINT_PAIRINGS`]. Emitted by `#[advisable]`/`#[aspect]` beside the bean's
@@ -572,6 +588,14 @@ pub static INJECTION_PLAN_PAIRINGS: [InjectionPlanPairingRow] = [..];
 /// emits one [`GuardPairingRow`] (`__leaf_guard_<Ident>`) per gated element.
 #[linkme::distributed_slice]
 pub static GUARD_PAIRINGS: [GuardPairingRow] = [..];
+
+/// The auto-config → [`OrderHint`] pairing channel: an auto-config that declares a
+/// non-default registration order (`@AutoConfigureAfter`/`@AutoConfigureBefore`
+/// analogue) submits one [`OrderPairingRow`] here beside its `AUTO_CONFIGS`
+/// `Descriptor`. An auto-config with no order row keeps [`OrderHint::DEFAULT`] (the
+/// common case).
+#[linkme::distributed_slice]
+pub static AUTO_CONFIG_ORDERS: [OrderPairingRow] = [..];
 
 /// The advisable-bean → [`BeanJoinPointsSpec`] pairing channel: `#[advisable]`/`#[aspect]`
 /// emits one [`JoinPointPairingRow`] (`__leaf_joinpoints_<Ident>`) per advisable bean.

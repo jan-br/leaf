@@ -234,23 +234,22 @@ impl CacheInterceptor {
 // A local alias keeps the trait signature readable.
 type ErasedRetAlias = leaf_core::ErasedRet;
 
+#[leaf_macros::async_impl]
 impl leaf_core::Interceptor for CacheInterceptor {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a Call<'a>,
-        next: Next<'a>,
-    ) -> BoxFuture<'a, Result<ErasedRetAlias, AdviceError>> {
-        Box::pin(async move {
-            // An un-cached method on the advised bean passes straight through.
-            let Some(rule) = self.rule_for(call.method) else {
-                return proceed(next, call).await;
-            };
-            match rule.op {
-                CacheOp::Cacheable => self.run_cacheable(rule, call, next).await,
-                CacheOp::CachePut => self.run_cache_put(rule, call, next).await,
-                CacheOp::CacheEvict => self.run_cache_evict(rule, call, next).await,
-            }
-        })
+    async fn intercept(
+        &self,
+        call: &Call<'_>,
+        next: Next<'_>,
+    ) -> Result<ErasedRetAlias, AdviceError> {
+        // An un-cached method on the advised bean passes straight through.
+        let Some(rule) = self.rule_for(call.method) else {
+            return proceed(next, call).await;
+        };
+        match rule.op {
+            CacheOp::Cacheable => self.run_cacheable(rule, call, next).await,
+            CacheOp::CachePut => self.run_cache_put(rule, call, next).await,
+            CacheOp::CacheEvict => self.run_cache_evict(rule, call, next).await,
+        }
     }
 }
 

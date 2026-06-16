@@ -43,13 +43,6 @@ struct OrderService {
     repo: Ref<Repository>,
 }
 
-impl OrderService {
-    /// The constructor the `#[component]` provider calls with the resolved deps.
-    fn new(repo: Ref<Repository>) -> Self {
-        OrderService { repo }
-    }
-}
-
 /// A `@ConfigurationProperties` type bound from `app.*` — AUTO-REGISTERED + bound +
 /// resolvable purely from the macro-emitted slices (no hand seed/descriptor/thunk).
 #[config_properties(prefix = "app")]

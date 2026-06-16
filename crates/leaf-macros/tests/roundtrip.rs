@@ -30,9 +30,6 @@ use leaf_macros::component;
 struct Greeter;
 
 impl Greeter {
-    fn new() -> Self {
-        Greeter
-    }
     fn greet(&self) -> &'static str {
         "hello"
     }
@@ -46,9 +43,6 @@ struct Loud {
 }
 
 impl Loud {
-    fn new(greeter: leaf_core::Ref<Greeter>) -> Self {
-        Loud { greeter }
-    }
     fn shout(&self) -> String {
         self.greeter.greet().to_uppercase()
     }

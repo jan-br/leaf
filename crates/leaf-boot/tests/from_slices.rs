@@ -17,9 +17,6 @@ use leaf_macros::component;
 struct Widget;
 
 impl Widget {
-    fn new() -> Self {
-        Widget
-    }
     fn tag(&self) -> &'static str {
         "widget"
     }
@@ -32,9 +29,6 @@ struct Gadget {
 }
 
 impl Gadget {
-    fn new(widget: leaf_core::Ref<Widget>) -> Self {
-        Gadget { widget }
-    }
     fn describe(&self) -> String {
         format!("gadget+{}", self.widget.tag())
     }

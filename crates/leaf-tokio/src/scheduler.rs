@@ -319,6 +319,7 @@ impl TokioSchedulerCore {
     }
 }
 
+#[leaf_macros::async_impl]
 impl SchedulerCore for TokioSchedulerCore {
     fn register(
         &self,
@@ -355,41 +356,37 @@ impl SchedulerCore for TokioSchedulerCore {
         Ok(())
     }
 
-    fn arm(&self) -> BoxFuture<'_, Result<(), LeafError>> {
-        Box::pin(async move {
-            if self.armed.swap(true, Ordering::SeqCst) {
-                return Ok(());
+    async fn arm(&self) -> Result<(), LeafError> {
+        if self.armed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Schedule the first fire for every registered task.
+        {
+            let mut inner = self.inner.lock().expect("wheel mutex");
+            let now = now();
+            let n = inner.tasks.len();
+            for idx in 0..n {
+                TokioSchedulerCore::schedule_next(&mut inner, idx, now);
             }
-            // Schedule the first fire for every registered task.
-            {
-                let mut inner = self.inner.lock().expect("wheel mutex");
-                let now = now();
-                let n = inner.tasks.len();
-                for idx in 0..n {
-                    TokioSchedulerCore::schedule_next(&mut inner, idx, now);
-                }
-            }
-            // Launch the single reactive driver (detached: it lives until disarm).
-            self.spawner
-                .spawn(Box::pin(self.clone().drive()))
-                .with_policy(DropPolicy::Detach)
-                .detach();
-            self.notify.notify_one();
-            Ok(())
-        })
+        }
+        // Launch the single reactive driver (detached: it lives until disarm).
+        self.spawner
+            .spawn(Box::pin(self.clone().drive()))
+            .with_policy(DropPolicy::Detach)
+            .detach();
+        self.notify.notify_one();
+        Ok(())
     }
 
-    fn disarm(&self) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            {
-                let mut inner = self.inner.lock().expect("wheel mutex");
-                inner.disarmed = true;
-                inner.heap.clear();
-            }
-            // Wake the driver so it observes `disarmed` and exits.
-            self.notify.notify_waiters();
-            self.notify.notify_one();
-        })
+    async fn disarm(&self) {
+        {
+            let mut inner = self.inner.lock().expect("wheel mutex");
+            inner.disarmed = true;
+            inner.heap.clear();
+        }
+        // Wake the driver so it observes `disarmed` and exits.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 }
 

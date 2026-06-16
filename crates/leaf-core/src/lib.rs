@@ -143,9 +143,10 @@ pub use provider::{FactoryBean, Provider, ProviderSeed, ResolveCtx, ScopeStores}
 pub use discovery::{
     collect_slice, linkme, origin_of, AdvisorPairingRow, AdvisorRow, CatalogRow, ConditionRow,
     ConfigBindPairingRow, ConfigMetadataRow, EventListenerRow, GuardPairingRow,
-    InjectionPlanPairingRow, JoinPointPairingRow, MethodTablePairingRow, Registrar, RegistrarCtx,
-    ResourceRow, RunnerPairingRow, RunnerUpcastFn, ScheduledRow, SeedPairingRow, SourceTag,
-    StereotypeRow, ADVISORS, ADVISOR_PAIRINGS, AUTO_CONFIGS, CATALOGS, COMPONENTS, CONDITIONS,
+    InjectionPlanPairingRow, JoinPointPairingRow, MethodTablePairingRow, OrderPairingRow,
+    Registrar, RegistrarCtx, ResourceRow, RunnerPairingRow, RunnerUpcastFn, ScheduledRow,
+    SeedPairingRow, SourceTag, StereotypeRow, ADVISORS, ADVISOR_PAIRINGS, AUTO_CONFIGS,
+    AUTO_CONFIG_ORDERS, CATALOGS, COMPONENTS, CONDITIONS,
     CONFIG_BIND_PAIRINGS, CONFIG_METADATA, EVENT_LISTENERS, FAILURE_ANALYZERS, GUARD_PAIRINGS,
     INJECTION_PLAN_PAIRINGS, JOINPOINT_PAIRINGS, METHOD_TABLE_PAIRINGS, REGISTRARS, RESOURCES,
     RUNNER_PAIRINGS, SCHEDULED, SEED_PAIRINGS, SOURCES, STEREOTYPES,

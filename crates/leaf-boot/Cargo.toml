@@ -17,6 +17,10 @@ leaf-core.workspace = true
 leaf-conditions.workspace = true
 leaf-config.workspace = true
 leaf-codegen.workspace = true
+# The auto-proxy EngineContainer + the scheduling/lifecycle test providers write
+# their boxed-future impl methods as native `async fn` via #[async_impl] (no cycle:
+# leaf-macros -> leaf-codegen -> leaf-core; leaf-boot -> leaf-core + leaf-macros).
+leaf-macros.workspace = true
 leaf-tokio = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -50,6 +50,7 @@
 
 pub mod advisor;
 pub mod annotation;
+pub mod async_impl;
 pub mod app;
 pub mod cargo_leaf;
 pub mod concern;

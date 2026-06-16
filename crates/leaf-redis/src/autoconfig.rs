@@ -30,12 +30,12 @@
 //! the GROWING definition set in the Register sub-pass; the `OnProperty` leaf
 //! additionally requires `leaf.redis.enabled` to be present-and-not-`false`.
 //!
-//! NOTE (honest deferral — `dyn`-view back-off): leaf-boot's `BuilderProbe` keys
-//! back-off on the candidate's CONCRETE `self_type`, so the `OnMissingBean` here matches
-//! a user bean of type `RedisCacheManager`. A user `CacheManager` of a DIFFERENT concrete
-//! type does not yet trip this probe — distributed-by-`dyn`-view back-off is a
-//! `provides[]`-aware-probe concern tracked for a later unit. The `provides[]` row
-//! already declares the `dyn CacheManager` view so consumers resolve `Arc<dyn CacheManager>`.
+//! The back-off is keyed on the `dyn CacheManager` VIEW (`on_missing_bean(dyn
+//! ::leaf_core::CacheManager)`), so ANY user bean providing a `CacheManager` —
+//! regardless of its concrete type — supersedes this default. leaf-boot's
+//! `BuilderProbe` indexes each bean's `provides[]` view TypeIds (the
+//! `provides[]`-aware probe), so the `OnMissingBean(dyn CacheManager)` leaf matches a
+//! user `CacheManager` of any concrete type, not just `RedisCacheManager`.
 //!
 //! NOTE (honest deferral — env-bound props): the `#[bean]` factory opens the (lazy)
 //! `RedisClient` from DEFAULT [`RedisProperties`]; threading the env-bound props into the
@@ -85,7 +85,9 @@ impl Default for RedisAutoConfig {
 /// The differently-typed `@Bean`-method contribution: `cache_manager()` produces the
 /// concrete [`RedisCacheManager`] exposed as `dyn CacheManager` (the `provides[]`
 /// view), named `"cacheManager"`, into `AUTO_CONFIGS` at `FALLBACK`, gated by
-/// `OnProperty(leaf.redis.enabled)` AND `OnMissingBean(RedisCacheManager)`.
+/// `OnProperty(leaf.redis.enabled)` AND `OnMissingBean(dyn CacheManager)` — the
+/// `provides[]`-aware back-off: ANY user `CacheManager` (any concrete type)
+/// supersedes this default.
 #[leaf_macros::auto_config]
 impl RedisAutoConfig {
     /// Build the Redis-backed cache manager (the ecosystem factory body the macro
@@ -99,7 +101,7 @@ impl RedisAutoConfig {
     #[bean(name = "cacheManager", provides = "dyn ::leaf_core::CacheManager")]
     #[conditional(
         on_property("leaf.redis.enabled"),
-        on_missing_bean(RedisCacheManager)
+        on_missing_bean(dyn ::leaf_core::CacheManager)
     )]
     fn cache_manager(&self) -> RedisCacheManager {
         let client = RedisClient::open(RedisProperties::default())

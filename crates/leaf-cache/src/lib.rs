@@ -29,6 +29,12 @@
 //!   builders ([`cache_advisor_pairing`]/[`build_cache_interceptor`]) +
 //!   [`CachePointcut`] that auto-wire the advisor through `Application::run`'s
 //!   `ADVISOR_PAIRINGS` collection.
+//! - **autoconfig** ([`autoconfig`]) — the DEFAULT cache-manager `#[auto_config]`
+//!   ([`CacheAutoConfig`]): an `AUTO_CONFIGS` row at `FALLBACK` contributing the in-memory
+//!   [`InMemoryCacheManager`] as the `"cacheManager"` bean, guarded by
+//!   `OnMissingBean(InMemoryCacheManager)`, so `#[cacheable(manager = InMemoryCacheManager)]`
+//!   resolves with no hand-written wrapper bean (the in-memory peer of the Redis-backed
+//!   `leaf_redis::autoconfig::RedisAutoConfig`).
 //!
 //! ## Deferred (honest NOTEs)
 //!
@@ -50,6 +56,7 @@
 #![warn(missing_docs)]
 
 pub mod advisor;
+pub mod autoconfig;
 pub mod interceptor;
 pub mod manager;
 pub mod value;
@@ -64,6 +71,10 @@ leaf_core::declare_source!("leaf-cache");
 pub use advisor::{
     build_cache_interceptor, cache_advisor_contract, cache_advisor_pairing, cache_order_key,
     enable_caching, resolve_manager, CachePointcut,
+};
+pub use autoconfig::{
+    cache_manager_descriptor, CacheAutoConfig, CACHE_AUTO_CONFIG_GUARD, CACHE_MANAGER_BEAN,
+    CACHE_MANAGER_CONTRACT, CACHE_MANAGER_SEED,
 };
 pub use interceptor::{unit_key_fn, CacheInterceptor, CacheKeyFn, CacheOp, CacheRule};
 pub use manager::{FlightError, InMemoryCache, InMemoryCacheManager};

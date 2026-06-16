@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+leaf-macros.workspace = true
 serde_json.workspace = true
 yaml-rust2.workspace = true
 

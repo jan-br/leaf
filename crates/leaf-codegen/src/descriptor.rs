@@ -170,6 +170,26 @@ pub struct ServiceView {
 /// const-row emission (here). It carries the concrete type, the (already merged)
 /// annotation view, the role/scope axes, the constructor's injection points, the
 /// declared service-trait upcasts, and the optional explicit name.
+/// The STRUCTURAL field shape of a stereotype's struct — how the field-default path
+/// builds the bean. Captured from `syn::Fields` (unit vs named vs tuple), NOT from any
+/// type name (the no-type-names rule): the shape decides whether the generated provider
+/// constructs `Self`, `Self { field: … }`, or `Self( … )`. Irrelevant for the
+/// constructor/`#[bean]`/referenced paths (they never hit the field-default recipe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FieldShape {
+    /// Construct via the inherent `<Self>::new(args)` — the `register_component!`
+    /// recipe (and the generic-instantiation escape hatch, where a bare `Repo<u32>`
+    /// literal would not even parse). The default for hand-built inputs.
+    #[default]
+    ViaNew,
+    /// A unit struct (`struct Foo;`) — constructed as the bare `Foo` value.
+    Unit,
+    /// A named-field struct (`struct Foo { a: … }`) — `Foo { a: <inject>, … }`.
+    Named,
+    /// A tuple struct (`struct Foo(…)`) — `Foo(<inject>, …)` (positional).
+    Tuple,
+}
+
 #[derive(Clone, Debug)]
 pub struct BeanInput {
     /// The bean's concrete type (the `self_type` and constructor receiver).
@@ -195,6 +215,11 @@ pub struct BeanInput {
     pub scope: Scope,
     /// The constructor's declared dependencies (injection points).
     pub deps: Vec<Dependency>,
+    /// The struct's structural field shape — how the field-default path constructs the
+    /// bean (see [`FieldShape`]). Set from `syn::Fields` for stereotypes; the default
+    /// ([`FieldShape::Unit`]) is fine for the non-field-default paths, which never read
+    /// it.
+    pub field_shape: FieldShape,
     /// The declared injectable `dyn Svc` views (`provides[]` upcast rows).
     pub provides: Vec<ServiceView>,
     /// The merged annotation metadata (markers / qualifiers / candidate role).
@@ -263,6 +288,7 @@ impl BeanInput {
             role: Role::default(),
             scope: Scope::default(),
             deps: Vec::new(),
+            field_shape: FieldShape::ViaNew,
             provides: Vec::new(),
             meta: MergedAnnotation::default(),
             ctor: None,
@@ -362,6 +388,7 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         &input.deps,
         input.inject_via_trait,
         input.referenced_ctor.as_ref(),
+        input.field_shape,
         &provider_ident,
         &desc_ident,
     );
@@ -603,6 +630,7 @@ fn emit_provider(
     deps: &[Dependency],
     inject_via_trait: bool,
     referenced_ctor: Option<&syn::Path>,
+    field_shape: FieldShape,
     provider_ident: &syn::Ident,
     desc_ident: &syn::Ident,
 ) -> TokenStream {
@@ -670,10 +698,14 @@ fn emit_provider(
     //     `Cfg`, so an `&self` method binds directly). This is the design's lite-only
     //     `#[configuration] impl Cfg { #[bean] fn .. }` lowering;
     //   * a free factory-fn path (`#[bean] fn`): `#path(args)`;
-    //   * the inherent associated `new`, ANGLE-BRACKET-QUALIFIED `<Ty>::new(...)` so
-    //     it is valid in expression position for ANY type — including a generic
-    //     concrete `register_component!(Repo<u32>)`, where a bare `Repo<u32>::new()`
-    //     would mis-parse as a chained comparison.
+    //   * a free factory-fn path (`#[bean] fn`): `#path(args)`;
+    //   * the FIELD-DEFAULT (no constructor): build the struct DIRECTLY from its
+    //     resolved fields — `Self`, `Self { field: <inject>, … }`, or `Self(<inject>,
+    //     …)` per the captured structural [`FieldShape`]. No `Self::new` call, so a
+    //     stereotype needs NO hand-written constructor; the generated provider lives in
+    //     the bean's own module, so a struct literal reaches private fields. A bean that
+    //     WANTS a real constructor opts in via `constructor = <path>` (the referenced
+    //     path above). The shape is structural, never a type-name comparison.
     let (receiver_resolve, construct) = match (receiver_ty, ctor) {
         (Some(recv), Some(method)) => (
             quote! {
@@ -682,7 +714,25 @@ fn emit_provider(
             quote! { __recv.#method( #(#args),* ) },
         ),
         (_, Some(path)) => (TokenStream::new(), quote! { #path( #(#args),* ) }),
-        (_, None) => (TokenStream::new(), quote! { <#self_ty>::new( #(#args),* ) }),
+        (_, None) => {
+            let literal = match field_shape {
+                FieldShape::ViaNew => quote! { <#self_ty>::new( #(#args),* ) },
+                FieldShape::Unit => quote! { #self_ty },
+                FieldShape::Named => {
+                    let inits = deps.iter().map(|dep| {
+                        let field = format_ident!("{}", dep.name);
+                        let local = format_ident!("__dep_{}", dep.name);
+                        quote! { #field: #local }
+                    });
+                    quote! { #self_ty { #(#inits),* } }
+                }
+                FieldShape::Tuple => {
+                    let locals = deps.iter().map(|dep| format_ident!("__dep_{}", dep.name));
+                    quote! { #self_ty( #(#locals),* ) }
+                }
+            };
+            (TokenStream::new(), literal)
+        }
     };
 
     // The `__engine` back-ref is read only by the legacy `Engine::get` resolves and
@@ -755,6 +805,7 @@ mod tests {
     fn foo_with_bar() -> BeanInput {
         let mut input = BeanInput::new(ty("Foo"), "Foo", "crate::Foo");
         input.deps.push(Dependency { name: "bar".into(), ty: ty("Bar") });
+        input.field_shape = FieldShape::Tuple;
         input
     }
 
@@ -861,12 +912,38 @@ mod tests {
     #[test]
     fn provider_resolves_each_dependency_and_invokes_the_constructor() {
         // The generated provider resolves each collaborator through the one
-        // Engine::get seam (the ResolveCtx engine back-ref) and threads the handle
-        // into the bean's constructor.
+        // Engine::get seam (the ResolveCtx engine back-ref) and builds the bean DIRECTLY
+        // from its fields — a tuple-struct field-default is `Foo(__dep_bar)`, no
+        // hand-written `fn new`.
         let s = flat(&emit(&foo_with_bar()).expect("emits"));
         assert!(s.contains("__engine.get::<Bar>().await?"), "got: {s}");
-        assert!(s.contains("<Foo>::new(__dep_bar)"), "got: {s}");
+        assert!(s.contains("Foo(__dep_bar)"), "got: {s}");
+        assert!(!s.contains("<Foo>::new"), "field injection builds a literal, not Self::new: {s}");
         assert!(s.contains("::leaf_core::Published::shared_value"), "got: {s}");
+    }
+
+    #[test]
+    fn field_default_builds_named_struct_literal_without_a_constructor() {
+        // A named-field stereotype with no `constructor =` builds `Self { f: <inject> }`
+        // directly — so NO `fn new` is required.
+        let mut input = BeanInput::new(ty("Svc"), "Svc", "crate::Svc");
+        input.deps.push(Dependency { name: "repo".into(), ty: ty("Repo") });
+        input.inject_via_trait = true;
+        input.field_shape = FieldShape::Named;
+        let s = flat(&emit(&input).expect("emits"));
+        assert!(s.contains("Svc{repo:__dep_repo}"), "got: {s}");
+        assert!(!s.contains("<Svc>::new"), "no Self::new call: {s}");
+    }
+
+    #[test]
+    fn field_default_builds_a_unit_struct_directly() {
+        // A unit stereotype (`struct Foo;`) is just the bare value — no `fn new`, no
+        // braces.
+        let mut input = BeanInput::new(ty("Marker"), "Marker", "crate::Marker");
+        input.field_shape = FieldShape::Unit;
+        let s = flat(&emit(&input).expect("emits"));
+        assert!(s.contains("let__instance=Marker;"), "got: {s}");
+        assert!(!s.contains("Marker::new"), "no Self::new call: {s}");
     }
 
     #[test]

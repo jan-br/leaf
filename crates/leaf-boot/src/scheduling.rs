@@ -148,6 +148,7 @@ mod tests {
         registered: AtomicU32,
         armed: Mutex<bool>,
     }
+    #[leaf_macros::async_impl]
     impl SchedulerCore for FakeScheduler {
         fn register(
             &self,
@@ -158,16 +159,12 @@ mod tests {
             self.registered.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        fn arm(&self) -> BoxFuture<'_, Result<(), LeafError>> {
-            Box::pin(async move {
-                *self.armed.lock().unwrap() = true;
-                Ok(())
-            })
+        async fn arm(&self) -> Result<(), LeafError> {
+            *self.armed.lock().unwrap() = true;
+            Ok(())
         }
-        fn disarm(&self) -> BoxFuture<'_, ()> {
-            Box::pin(async move {
-                *self.armed.lock().unwrap() = false;
-            })
+        async fn disarm(&self) {
+            *self.armed.lock().unwrap() = false;
         }
     }
 

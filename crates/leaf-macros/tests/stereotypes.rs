@@ -14,35 +14,15 @@ use leaf_macros::{bean, configuration, controller, register_component, repositor
 
 #[service]
 struct UserService;
-impl UserService {
-    fn new() -> Self {
-        UserService
-    }
-}
 
 #[repository]
 struct UserRepo;
-impl UserRepo {
-    fn new() -> Self {
-        UserRepo
-    }
-}
 
 #[controller]
 struct UserController;
-impl UserController {
-    fn new() -> Self {
-        UserController
-    }
-}
 
 #[configuration]
 struct AppConfig;
-impl AppConfig {
-    fn new() -> Self {
-        AppConfig
-    }
-}
 
 fn descriptor_named(name: &str) -> leaf_core::Descriptor {
     *leaf_core::COMPONENTS

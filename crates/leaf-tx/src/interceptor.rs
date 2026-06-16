@@ -117,27 +117,26 @@ impl TransactionInterceptor {
     }
 }
 
+#[leaf_macros::async_impl]
 impl Interceptor for TransactionInterceptor {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a Call<'a>,
-        next: Next<'a>,
-    ) -> BoxFuture<'a, Result<ErasedRetAlias, AdviceError>> {
-        Box::pin(async move {
-            let action = resolve(self.attribute.propagation, Self::tx_active())
-                .map_err(AdviceError::AroundBody)?;
+    async fn intercept(
+        &self,
+        call: &Call<'_>,
+        next: Next<'_>,
+    ) -> Result<ErasedRetAlias, AdviceError> {
+        let action = resolve(self.attribute.propagation, Self::tx_active())
+            .map_err(AdviceError::AroundBody)?;
 
-            if action.owns_transaction() {
-                self.run_owning(call, next).await
-            } else {
-                // JOIN / SUPPORTS-plain / NOT_SUPPORTED-plain: the outer owner (or
-                // nobody) demarcates; just run the body. (Suspension of the outer tx
-                // for the plain forms is a documented v1 simplification — the body
-                // simply does not begin/commit; see the crate NOTE.)
-                let _ = action; // action recorded; no owning work here
-                next_proceed(next, call).await
-            }
-        })
+        if action.owns_transaction() {
+            self.run_owning(call, next).await
+        } else {
+            // JOIN / SUPPORTS-plain / NOT_SUPPORTED-plain: the outer owner (or
+            // nobody) demarcates; just run the body. (Suspension of the outer tx
+            // for the plain forms is a documented v1 simplification — the body
+            // simply does not begin/commit; see the crate NOTE.)
+            let _ = action; // action recorded; no owning work here
+            next_proceed(next, call).await
+        }
     }
 }
 

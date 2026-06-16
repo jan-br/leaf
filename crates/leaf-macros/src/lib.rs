@@ -158,6 +158,26 @@ pub fn configuration(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[async_impl]` — write `async fn` in a trait `impl`; the macro desugars each method
+/// to the `::leaf_core::BoxFuture` form leaf's `dyn`-dispatched traits
+/// (`Runner`, `TransactionManager`, `CacheManager`, …) require, so user code carries no
+/// visible `Box::pin`, lifetime, or `BoxFuture` machinery. Impl-only and
+/// signature-preserving: a single lifetime is threaded over the receiver and elided
+/// reference args (leaf's unified-`'a` convention), so the desugared method matches the
+/// trait's declared `fn f<'a>(&'a self, …) -> BoxFuture<'a, T>` — no change to the trait.
+#[proc_macro_attribute]
+pub fn async_impl(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Impl(item_impl) => leaf_codegen::async_impl::expand(&item_impl).into(),
+        other => quote! {
+            #other
+            ::core::compile_error!("#[async_impl] applies to an `impl` block");
+        }
+        .into(),
+    }
+}
+
 /// `#[bean]` — a FACTORY-FUNCTION bean. Lowers a `fn make(deps…) -> Product` to the
 /// SAME const row shape as `#[component]`, but the construction recipe is the
 /// function itself (one shape, no second seed type).

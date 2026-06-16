@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+# The TransactionInterceptor writes its around-advice body as a native `async fn`
+# via #[async_impl] (no cycle: leaf-macros -> leaf-codegen -> leaf-core; leaf-tx ->
+# leaf-core + leaf-macros).
+leaf-macros.workspace = true
 
 [dev-dependencies]
 # The integration test drives a REAL annotated bean through Application::run, so
@@ -13,5 +17,8 @@ leaf-core.workspace = true
 leaf-boot.workspace = true
 leaf-tokio.workspace = true
 leaf-macros.workspace = true
+# The autoconfig wiring tests assert the guard's leaf id == leaf-conditions' kind ID
+# (the cross-crate ID contract), mirroring leaf-redis's autoconfig tests.
+leaf-conditions.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

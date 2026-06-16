@@ -1,5 +1,5 @@
 //! `InjectableCtor` — the "magic constructor" trait that resolves a REFERENCED
-//! constructor's parameters through [`Injectable`](crate::Injectable), so a
+//! constructor's parameters through [`Injectable`], so a
 //! stereotype macro can name a constructor by path (`construct_with(Foo::new, ctx)`)
 //! WITHOUT ever parsing or counting its parameters.
 //!
@@ -41,7 +41,7 @@ pub trait InjectableCtor<Args, T>: Sized {
     fn construct<'a>(self, ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<T, LeafError>>;
 
     /// The static dependency plan — each parameter's
-    /// [`Injectable::RESOLVABLE`](crate::Injectable::RESOLVABLE) lowered to an
+    /// [`Injectable::RESOLVABLE`] lowered to an
     /// [`InjectionPoint`] with a positional name (`arg0`, `arg1`, …).
     ///
     /// Read from the fn value at ASSEMBLY (before any instantiation) so the

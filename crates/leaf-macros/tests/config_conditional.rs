@@ -296,11 +296,6 @@ fn profile_lowers_to_a_single_on_profile_cond_leaf() {
 
 #[auto_config]
 struct RedisAutoConfig;
-impl RedisAutoConfig {
-    fn new() -> Self {
-        RedisAutoConfig
-    }
-}
 
 fn auto_config_named(name: &str) -> Option<leaf_core::Descriptor> {
     leaf_core::AUTO_CONFIGS
@@ -333,11 +328,6 @@ fn auto_config_emits_an_auto_configs_fallback_row() {
 #[auto_config]
 #[conditional(on_property("redis.enabled", having_value = "true"))]
 struct GatedAutoConfig;
-impl GatedAutoConfig {
-    fn new() -> Self {
-        GatedAutoConfig
-    }
-}
 
 #[test]
 fn a_gated_auto_config_emits_both_the_fallback_row_and_the_guard() {

@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use leaf_core::{
-    Arg, BoxFuture, Cause, ErrorKind, LeafError, Locale, MessageCatalogProvider, MessagePattern,
+    Arg, Cause, ErrorKind, LeafError, Locale, MessageCatalogProvider, MessagePattern,
     MessageResolvable, MessageSource,
 };
 
@@ -99,60 +99,55 @@ impl HierarchicalMessageSource {
     }
 }
 
+#[leaf_macros::async_impl]
 impl MessageSource for HierarchicalMessageSource {
-    fn message<'a>(
-        &'a self,
-        code: &'a str,
-        args: &'a [Arg<'a>],
-        locale: Option<&'a Locale>,
-    ) -> BoxFuture<'a, Result<Arc<str>, LeafError>> {
-        Box::pin(async move {
-            let loc = self.effective_locale(locale);
-            match self.resolve_code(code, args, &loc).await {
-                Some(s) => Ok(s),
-                None => Err(no_such_message(code, &loc)),
-            }
-        })
+    async fn message(
+        &self,
+        code: &str,
+        args: &[Arg<'_>],
+        locale: Option<&Locale>,
+    ) -> Result<Arc<str>, LeafError> {
+        let loc = self.effective_locale(locale);
+        match self.resolve_code(code, args, &loc).await {
+            Some(s) => Ok(s),
+            None => Err(no_such_message(code, &loc)),
+        }
     }
 
-    fn message_or<'a>(
-        &'a self,
-        code: &'a str,
-        args: &'a [Arg<'a>],
-        default: &'a str,
-        locale: Option<&'a Locale>,
-    ) -> BoxFuture<'a, Arc<str>> {
-        Box::pin(async move {
-            let loc = self.effective_locale(locale);
-            match self.resolve_code(code, args, &loc).await {
-                Some(s) => s,
-                // The default itself carries `{n}` placeholders (Spring parity).
-                None => Arc::from(format_pattern(default, args)),
-            }
-        })
+    async fn message_or(
+        &self,
+        code: &str,
+        args: &[Arg<'_>],
+        default: &str,
+        locale: Option<&Locale>,
+    ) -> Arc<str> {
+        let loc = self.effective_locale(locale);
+        match self.resolve_code(code, args, &loc).await {
+            Some(s) => s,
+            // The default itself carries `{n}` placeholders (Spring parity).
+            None => Arc::from(format_pattern(default, args)),
+        }
     }
 
-    fn resolve<'a>(
-        &'a self,
-        r: &'a dyn MessageResolvable,
-        locale: Option<&'a Locale>,
-    ) -> BoxFuture<'a, Result<Arc<str>, LeafError>> {
-        Box::pin(async move {
-            let loc = self.effective_locale(locale);
-            let args = r.arguments();
-            for code in r.codes() {
-                if let Some(s) = self.resolve_code(code, args, &loc).await {
-                    return Ok(s);
-                }
+    async fn resolve(
+        &self,
+        r: &dyn MessageResolvable,
+        locale: Option<&Locale>,
+    ) -> Result<Arc<str>, LeafError> {
+        let loc = self.effective_locale(locale);
+        let args = r.arguments();
+        for code in r.codes() {
+            if let Some(s) = self.resolve_code(code, args, &loc).await {
+                return Ok(s);
             }
-            match r.default_message() {
-                Some(d) => Ok(Arc::from(format_pattern(d, args))),
-                None => {
-                    let code = r.codes().first().copied().unwrap_or("");
-                    Err(no_such_message(code, &loc))
-                }
+        }
+        match r.default_message() {
+            Some(d) => Ok(Arc::from(format_pattern(d, args))),
+            None => {
+                let code = r.codes().first().copied().unwrap_or("");
+                Err(no_such_message(code, &loc))
             }
-        })
+        }
     }
 }
 

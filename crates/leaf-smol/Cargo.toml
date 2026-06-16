@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 leaf-core.workspace = true
+leaf-macros.workspace = true
 futures.workspace = true
 once_cell.workspace = true
 smol.workspace = true

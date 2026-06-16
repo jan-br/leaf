@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use leaf_core::{
-    BoxFuture, Existence, LeafError, Location, Pattern, Resource, ResourceId, ResourceProvider,
-    ResourceReader, Scheme,
+    Existence, LeafError, Location, Pattern, Resource, ResourceId, ResourceProvider, ResourceReader,
+    Scheme,
 };
 use tokio::io::AsyncReadExt;
 
@@ -38,14 +38,13 @@ struct FileReader {
     path: String,
 }
 
+#[leaf_macros::async_impl]
 impl ResourceReader for FileReader {
-    fn read_chunk<'a>(&'a mut self, buf: &'a mut [u8]) -> BoxFuture<'a, Result<usize, LeafError>> {
-        Box::pin(async move {
-            self.file
-                .read(buf)
-                .await
-                .map_err(|e| io_error("reading resource chunk", &self.path, &e))
-        })
+    async fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize, LeafError> {
+        self.file
+            .read(buf)
+            .await
+            .map_err(|e| io_error("reading resource chunk", &self.path, &e))
     }
 }
 
@@ -71,6 +70,7 @@ impl FileResource {
     }
 }
 
+#[leaf_macros::async_impl]
 impl Resource for FileResource {
     fn id(&self) -> &ResourceId {
         &self.id
@@ -84,22 +84,18 @@ impl Resource for FileResource {
         std::fs::metadata(&self.path).and_then(|m| m.modified()).ok()
     }
 
-    fn open<'a>(&'a self) -> BoxFuture<'a, Result<Box<dyn ResourceReader>, LeafError>> {
-        Box::pin(async move {
-            let path = self.path_str();
-            let file = tokio::fs::File::open(&self.path)
-                .await
-                .map_err(|e| io_error("opening resource", &path, &e))?;
-            Ok(Box::new(FileReader { file, path }) as Box<dyn ResourceReader>)
-        })
+    async fn open(&self) -> Result<Box<dyn ResourceReader>, LeafError> {
+        let path = self.path_str();
+        let file = tokio::fs::File::open(&self.path)
+            .await
+            .map_err(|e| io_error("opening resource", &path, &e))?;
+        Ok(Box::new(FileReader { file, path }) as Box<dyn ResourceReader>)
     }
 
-    fn read_to_bytes<'a>(&'a self) -> BoxFuture<'a, Result<Vec<u8>, LeafError>> {
-        Box::pin(async move {
-            tokio::fs::read(&self.path)
-                .await
-                .map_err(|e| io_error("reading resource", &self.path_str(), &e))
-        })
+    async fn read_to_bytes(&self) -> Result<Vec<u8>, LeafError> {
+        tokio::fs::read(&self.path)
+            .await
+            .map_err(|e| io_error("reading resource", &self.path_str(), &e))
     }
 }
 
@@ -123,6 +119,7 @@ impl FileResourceProvider {
     }
 }
 
+#[leaf_macros::async_impl]
 impl ResourceProvider for FileResourceProvider {
     fn scheme(&self) -> Scheme {
         Scheme::File
@@ -138,35 +135,33 @@ impl ResourceProvider for FileResourceProvider {
         Ok(Box::new(FileResource::new(loc.clone())))
     }
 
-    fn resolve_pattern<'a>(
-        &'a self,
-        pat: &'a Pattern,
-    ) -> BoxFuture<'a, Result<Vec<Box<dyn Resource>>, LeafError>> {
-        Box::pin(async move {
-            // Minimal: treat the pattern's directory part as a literal dir and
-            // list its immediate entries (no recursive glob — deferred to the
-            // pattern-resolver unit; see the NOTE in the module docs).
-            let raw = pat.0.as_ref();
-            let dir = std::path::Path::new(raw)
-                .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            let mut out: Vec<Box<dyn Resource>> = Vec::new();
-            let mut entries = match tokio::fs::read_dir(&dir).await {
-                Ok(e) => e,
-                // A non-existent directory matches nothing (not an error).
-                Err(_) => return Ok(out),
-            };
-            while let Some(entry) = entries
-                .next_entry()
-                .await
-                .map_err(|e| io_error("listing pattern dir", &dir.to_string_lossy(), &e))?
-            {
-                let p = entry.path().to_string_lossy().into_owned();
-                out.push(Box::new(FileResource::new(Location::new(Scheme::File, p))));
-            }
-            Ok(out)
-        })
+    async fn resolve_pattern(
+        &self,
+        pat: &Pattern,
+    ) -> Result<Vec<Box<dyn Resource>>, LeafError> {
+        // Minimal: treat the pattern's directory part as a literal dir and
+        // list its immediate entries (no recursive glob — deferred to the
+        // pattern-resolver unit; see the NOTE in the module docs).
+        let raw = pat.0.as_ref();
+        let dir = std::path::Path::new(raw)
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut out: Vec<Box<dyn Resource>> = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(e) => e,
+            // A non-existent directory matches nothing (not an error).
+            Err(_) => return Ok(out),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| io_error("listing pattern dir", &dir.to_string_lossy(), &e))?
+        {
+            let p = entry.path().to_string_lossy().into_owned();
+            out.push(Box::new(FileResource::new(Location::new(Scheme::File, p))));
+        }
+        Ok(out)
     }
 }
 

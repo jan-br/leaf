@@ -33,7 +33,8 @@ use std::collections::HashMap;
 
 use leaf_core::{
     collect_slice, CandidateRole, Cause, CondExpr, ContractId, Descriptor, ErrorKind, LeafError,
-    ProviderSeed, RegistryBuilder, AUTO_CONFIGS, COMPONENTS, GUARD_PAIRINGS, SEED_PAIRINGS,
+    ProviderSeed, RegistryBuilder, AUTO_CONFIGS, AUTO_CONFIG_ORDERS, COMPONENTS, GUARD_PAIRINGS,
+    SEED_PAIRINGS,
 };
 
 use crate::autoconfig::AutoConfigCandidate;
@@ -224,13 +225,27 @@ pub fn collect_autoconfig_candidates(
         .map(|r| (r.contract, r.guard))
         .collect();
 
+    // The auto-config-ordering JOIN table (ContractId → OrderHint); an auto-config with
+    // no explicit order (the common case) has no row here and keeps OrderHint::DEFAULT —
+    // a late/early `@AutoConfigureAfter`/`@AutoConfigureBefore`-style hint declares its
+    // OWN order beside its `AUTO_CONFIGS` Descriptor (never a peer's, so no type-name
+    // coupling). `run_autoconfig`'s batch sort reads it via the candidate.
+    let order_of: HashMap<ContractId, leaf_core::OrderHint> = collect_slice(&AUTO_CONFIG_ORDERS)
+        .into_iter()
+        .map(|r| (r.contract, r.order))
+        .collect();
+
     let mut candidates = Vec::new();
     for descriptor in collect_slice(&AUTO_CONFIGS) {
         let Some(&seed) = seed_of.get(&descriptor.contract) else {
             return Err(missing_seed(&descriptor));
         };
         let guard = guard_of.get(&descriptor.contract).copied();
-        candidates.push(AutoConfigCandidate::new(descriptor, seed, guard));
+        let order = order_of
+            .get(&descriptor.contract)
+            .copied()
+            .unwrap_or(leaf_core::OrderHint::DEFAULT);
+        candidates.push(AutoConfigCandidate::with_order(descriptor, seed, guard, order));
     }
     Ok(candidates)
 }
@@ -240,14 +255,26 @@ pub fn collect_autoconfig_candidates(
 /// so the FIRST auto-config candidate's `OnMissingBean`/`OnSingleCandidate` back-off
 /// sees the user/framework beans already in the builder.
 ///
+/// Each component contributes its concrete `self_type` AND one entry per `dyn Trait`
+/// VIEW it provides (`d.provides[*].view`), so a `provides[]`-aware back-off
+/// (`on_missing_bean(dyn V)`) sees a user bean of a DIFFERENTLY-named concrete type
+/// that provides the view `V` (Spring's `@ConditionalOnMissingBean(Interface)` — the
+/// "redis CacheManager overrides the in-memory default" case). A view entry rides the
+/// SAME candidate role as its bean, so [`BuilderProbe`](crate::BuilderProbe)'s
+/// primary/fallback verdict is identical whether probed by concrete type or by view.
+///
 /// The auto-configs themselves are NOT in this probe (the ladder grows the probe
 /// incrementally as each survivor registers — see [`run_autoconfig`](crate::run_autoconfig)).
 #[must_use]
 pub fn component_seed_probe() -> Vec<(TypeId, CandidateRole)> {
-    collect_slice(&COMPONENTS)
-        .into_iter()
-        .map(|d| (d.self_type, d.meta.candidate_role))
-        .collect()
+    let mut out = Vec::new();
+    for d in collect_slice(&COMPONENTS) {
+        out.push((d.self_type, d.meta.candidate_role));
+        for row in d.provides {
+            out.push((row.view, d.meta.candidate_role));
+        }
+    }
+    out
 }
 
 fn missing_seed(descriptor: &Descriptor) -> LeafError {

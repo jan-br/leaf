@@ -32,7 +32,7 @@
 // ── every annotation macro (the maximal-magic surface, charter §2.10) ──
 #[doc(no_inline)]
 pub use leaf_macros::{
-    advice, advisable, aspect, auto_config, bean, cache_evict, cache_put, cacheable, catalog,
+    advice, advisable, aspect, async_impl, auto_config, bean, cache_evict, cache_put, cacheable, catalog,
     component, concurrency_limit, conditional, config_properties, configuration, controller,
     converter, event_listener, failure_analyzer, import, main, pointcut, profile,
     register_component, repository, resource, retryable, runner, scheduled, service, transactional,

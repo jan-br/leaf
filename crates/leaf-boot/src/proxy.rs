@@ -267,17 +267,16 @@ impl<'a> EngineContainer<'a> {
     }
 }
 
+#[leaf_macros::async_impl]
 impl Container for EngineContainer<'_> {
-    fn resolve(
+    async fn resolve(
         &self,
         key: leaf_core::BeanKey,
         _strictness: Strictness,
         _cardinality: Cardinality,
-    ) -> leaf_core::BoxFuture<'_, Result<Published, LeafError>> {
-        Box::pin(async move {
-            let bean = self.engine.get_erased(key).await?;
-            Ok(Published::shared(bean))
-        })
+    ) -> Result<Published, LeafError> {
+        let bean = self.engine.get_erased(key).await?;
+        Ok(Published::shared(bean))
     }
 }
 
@@ -557,18 +556,17 @@ mod tests {
     // A recording around-interceptor: pushes enter/exit into a shared log.
     static LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     struct Recorder;
+    #[leaf_macros::async_impl]
     impl leaf_core::Interceptor for Recorder {
-        fn intercept<'a>(
-            &'a self,
-            call: &'a Call<'a>,
-            mut next: Next<'a>,
-        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-            Box::pin(async move {
-                LOG.lock().unwrap().push("enter");
-                let r = next.proceed(call).await;
-                LOG.lock().unwrap().push("exit");
-                r
-            })
+        async fn intercept(
+            &self,
+            call: &Call<'_>,
+            mut next: Next<'_>,
+        ) -> Result<ErasedRet, AdviceError> {
+            LOG.lock().unwrap().push("enter");
+            let r = next.proceed(call).await;
+            LOG.lock().unwrap().push("exit");
+            r
         }
     }
 
@@ -670,18 +668,17 @@ mod tests {
     // not race the shared `LOG` the install_resolves test clears + asserts on).
     static TI_LOG: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
     struct TiRecorder;
+    #[leaf_macros::async_impl]
     impl leaf_core::Interceptor for TiRecorder {
-        fn intercept<'a>(
-            &'a self,
-            call: &'a Call<'a>,
-            mut next: Next<'a>,
-        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-            Box::pin(async move {
-                TI_LOG.lock().unwrap().push("enter");
-                let r = next.proceed(call).await;
-                TI_LOG.lock().unwrap().push("exit");
-                r
-            })
+        async fn intercept(
+            &self,
+            call: &Call<'_>,
+            mut next: Next<'_>,
+        ) -> Result<ErasedRet, AdviceError> {
+            TI_LOG.lock().unwrap().push("enter");
+            let r = next.proceed(call).await;
+            TI_LOG.lock().unwrap().push("exit");
+            r
         }
     }
 
@@ -766,17 +763,16 @@ mod tests {
     // A retrying interceptor: re-`proceed`s the call N times (the substrate's
     // REPLAYABLE `Next`) — the args-bearing replay the take-once cell could not do.
     struct RetryThrice;
+    #[leaf_macros::async_impl]
     impl leaf_core::Interceptor for RetryThrice {
-        fn intercept<'a>(
-            &'a self,
-            call: &'a Call<'a>,
-            mut next: Next<'a>,
-        ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-            Box::pin(async move {
-                let mut last = next.proceed(call).await;
-                last = next.proceed(call).await.or(last);
-                next.proceed(call).await.or(last)
-            })
+        async fn intercept(
+            &self,
+            call: &Call<'_>,
+            mut next: Next<'_>,
+        ) -> Result<ErasedRet, AdviceError> {
+            let mut last = next.proceed(call).await;
+            last = next.proceed(call).await.or(last);
+            next.proceed(call).await.or(last)
         }
     }
 

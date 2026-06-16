@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 leaf-core.workspace = true
 leaf-cron.workspace = true
+# The resilience interceptors write their `Interceptor::intercept` bodies as native
+# `async fn` via #[async_impl] (no cycle: leaf-macros -> leaf-codegen -> leaf-core;
+# leaf-resilience -> leaf-core + leaf-macros).
+leaf-macros.workspace = true
 once_cell.workspace = true
 
 [dev-dependencies]

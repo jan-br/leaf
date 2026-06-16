@@ -30,9 +30,7 @@
 
 use std::sync::Arc;
 
-use leaf_core::{
-    AdviceError, BoxFuture, Call, ErasedRet, Interceptor, LeafError, Next, RetryPolicy,
-};
+use leaf_core::{AdviceError, Call, ErasedRet, Interceptor, LeafError, Next, RetryPolicy};
 
 use crate::backoff::{BackoffPolicy, Sleeper};
 use crate::template::ResilientRetry;
@@ -102,15 +100,15 @@ impl RetryInterceptor {
     }
 }
 
+#[leaf_macros::async_impl]
 impl Interceptor for RetryInterceptor {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a Call<'a>,
-        mut next: Next<'a>,
-    ) -> BoxFuture<'a, Result<ErasedRet, AdviceError>> {
-        Box::pin(async move {
-            let mut attempt: u32 = 1;
-            loop {
+    async fn intercept(
+        &self,
+        call: &Call<'_>,
+        mut next: Next<'_>,
+    ) -> Result<ErasedRet, AdviceError> {
+        let mut attempt: u32 = 1;
+        loop {
                 // A FRESH proceed each attempt (REPLAYABLE Next). Each attempt sees
                 // a fresh inner chain (its own tx, etc.) since retry is OUTERMOST of
                 // those concerns.
@@ -144,9 +142,8 @@ impl Interceptor for RetryInterceptor {
                     }
                 }
             }
-        })
+        }
     }
-}
 
 #[cfg(test)]
 mod tests {
@@ -155,8 +152,8 @@ mod tests {
     use std::sync::Mutex;
 
     use leaf_core::{
-        AdviceChain, BeanKey, ContractId, ErasedArgs, ErrorKind, FixedTarget, MethodKey, ResolveCtx,
-        Tail,
+        AdviceChain, BeanKey, BoxFuture, ContractId, ErasedArgs, ErrorKind, FixedTarget, MethodKey,
+        ResolveCtx, Tail,
     };
 
     use crate::backoff::NoBackoff;

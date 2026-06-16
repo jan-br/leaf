@@ -199,13 +199,14 @@ impl Auditor {
 }
 
 // The aspect IS the interceptor (the make_interceptor resolves + upcasts it).
+#[leaf_macros::async_impl]
 impl leaf_core::Interceptor for Auditor {
-    fn intercept<'a>(
-        &'a self,
-        call: &'a leaf_core::Call<'a>,
-        mut next: leaf_core::Next<'a>,
-    ) -> leaf_core::BoxFuture<'a, Result<leaf_core::ErasedRet, leaf_core::AdviceError>> {
-        Box::pin(async move { next.proceed(call).await })
+    async fn intercept(
+        &self,
+        call: &leaf_core::Call<'_>,
+        mut next: leaf_core::Next<'_>,
+    ) -> Result<leaf_core::ErasedRet, leaf_core::AdviceError> {
+        next.proceed(call).await
     }
 }
 

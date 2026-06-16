@@ -177,13 +177,20 @@ pub fn parse_conditional(attr: TokenStream) -> Result<CondExpr, EmitError> {
     if attr.is_empty() {
         return Ok(CondExpr::All(Vec::new()));
     }
-    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
-    let exprs = syn::parse::Parser::parse2(parser, attr).map_err(|e| EmitError {
+    // The body is a comma-separated list of condition TERMS. A term is a `kind(..)`
+    // call (or a bare `true`/`false`/marker). We parse each term's parenthesized
+    // argument group as a RAW token stream so a bean-family `dyn Trait` view
+    // argument (`on_missing_bean(dyn CacheManager)`) — which is NOT a `syn::Expr` —
+    // is captured intact and re-parsed as a `syn::Type` per-kind. Property/class
+    // leaves and `all`/`any`/`not` children still go through the `syn::Expr` path.
+    let parser =
+        syn::punctuated::Punctuated::<CondTermTokens, syn::Token![,]>::parse_terminated;
+    let terms = syn::parse::Parser::parse2(parser, attr).map_err(|e| EmitError {
         message: format!("malformed #[conditional] arguments: {e}"),
     })?;
     let mut nodes = Vec::new();
-    for expr in &exprs {
-        nodes.push(parse_cond_expr(expr)?);
+    for term in &terms {
+        nodes.push(term.to_cond_expr()?);
     }
     // Multiple comma-separated top-level conditions are implicitly ANDed (Spring's
     // multiple-@Conditional stacking semantics).
@@ -193,67 +200,97 @@ pub fn parse_conditional(attr: TokenStream) -> Result<CondExpr, EmitError> {
     }
 }
 
-/// Parse one `syn::Expr` into a [`CondExpr`] node.
-fn parse_cond_expr(expr: &syn::Expr) -> Result<CondExpr, EmitError> {
-    match expr {
-        // `true` / `false` literal → a build-folded constant.
-        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) => Ok(CondExpr::Const(b.value)),
-        // A call expression: `kind(args...)`.
-        syn::Expr::Call(call) => parse_cond_call(call),
-        // A bare ident path used as a no-arg marker (rare; treated as a leaf kind).
-        syn::Expr::Path(p) => {
-            let name = path_ident(&p.path).ok_or_else(|| EmitError {
-                message: "expected a condition kind like `on_property(...)`".into(),
-            })?;
-            Ok(CondExpr::Leaf { kind: canonical_kind(&name)?, attrs: Vec::new() })
+/// One parsed condition term capturing the syntactic shape WITHOUT committing the
+/// argument group to `syn::Expr` — so a bean-family `dyn Trait` view argument is
+/// preserved for a per-kind `syn::Type` re-parse.
+enum CondTermTokens {
+    /// A bare `true`/`false` literal.
+    Const(bool),
+    /// A bare ident used as a no-arg marker leaf (`kind`).
+    Bare(String),
+    /// A `kind(<raw args>)` call: the kind name + the parenthesized argument tokens.
+    Call { kind: String, args: TokenStream },
+}
+
+impl syn::parse::Parse for CondTermTokens {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        // `true` / `false`.
+        if input.peek(syn::LitBool) {
+            let b: syn::LitBool = input.parse()?;
+            return Ok(CondTermTokens::Const(b.value));
         }
-        other => Err(EmitError {
-            message: format!(
-                "unexpected #[conditional] expression `{}` (expected `on_*(...)`, \
-                 `all/any/not(...)`, or a bool literal)",
-                quote! { #other }
-            ),
-        }),
+        // `kind` (a path; we take its last segment as the kind name).
+        let path: syn::Path = input.parse()?;
+        let kind = path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .ok_or_else(|| input.error("expected a condition kind identifier"))?;
+        // An optional parenthesized argument group, captured as RAW tokens.
+        if input.peek(syn::token::Paren) {
+            let content;
+            syn::parenthesized!(content in input);
+            let args: TokenStream = content.parse()?;
+            Ok(CondTermTokens::Call { kind, args })
+        } else {
+            Ok(CondTermTokens::Bare(kind))
+        }
     }
 }
 
-/// Parse a `kind(args...)` call expression into a [`CondExpr`].
-fn parse_cond_call(call: &syn::ExprCall) -> Result<CondExpr, EmitError> {
-    let syn::Expr::Path(p) = &*call.func else {
-        return Err(EmitError {
-            message: "a #[conditional] node must be a simple `kind(...)` call".into(),
-        });
-    };
-    let name = path_ident(&p.path).ok_or_else(|| EmitError {
-        message: "a #[conditional] node must be a simple `kind(...)` call".into(),
-    })?;
-
-    match name.as_str() {
-        "all" | "any" => {
-            let mut children = Vec::new();
-            for arg in &call.args {
-                children.push(parse_cond_expr(arg)?);
+impl CondTermTokens {
+    /// Lower this raw term to a [`CondExpr`], dispatching the argument re-parse on
+    /// the kind: `all`/`any`/`not` recurse over child TERMS; bean-family leaves
+    /// re-parse the single argument as a `syn::Type` (accepting `dyn Trait`);
+    /// property/class leaves re-parse the arguments as `syn::Expr`s.
+    fn to_cond_expr(&self) -> Result<CondExpr, EmitError> {
+        match self {
+            CondTermTokens::Const(b) => Ok(CondExpr::Const(*b)),
+            CondTermTokens::Bare(name) => {
+                Ok(CondExpr::Leaf { kind: canonical_kind(name)?, attrs: Vec::new() })
             }
-            Ok(if name == "all" {
+            CondTermTokens::Call { kind, args } => parse_cond_term_call(kind, args.clone()),
+        }
+    }
+}
+
+/// Re-parse a captured `kind(<args>)` term into a [`CondExpr`] node.
+fn parse_cond_term_call(kind: &str, args: TokenStream) -> Result<CondExpr, EmitError> {
+    match kind {
+        // Boolean composition: children are themselves condition TERMS (so a nested
+        // `on_missing_bean(dyn V)` keeps its raw-token capture).
+        "all" | "any" => {
+            let terms = parse_terms(args)?;
+            let mut children = Vec::new();
+            for t in &terms {
+                children.push(t.to_cond_expr()?);
+            }
+            Ok(if kind == "all" {
                 CondExpr::All(children)
             } else {
                 CondExpr::Any(children)
             })
         }
         "not" => {
-            if call.args.len() != 1 {
+            let terms = parse_terms(args)?;
+            if terms.len() != 1 {
                 return Err(EmitError {
-                    message: format!("`not(..)` takes exactly one child, got {}", call.args.len()),
+                    message: format!("`not(..)` takes exactly one child, got {}", terms.len()),
                 });
             }
-            Ok(CondExpr::Not(Box::new(parse_cond_expr(&call.args[0])?)))
+            Ok(CondExpr::Not(Box::new(terms[0].to_cond_expr()?)))
         }
+        // The bean family: a single TYPE argument (a concrete type OR a `dyn Trait`
+        // view). Re-parse the raw tokens as a `syn::Type` so the dyn-view target
+        // (`on_missing_bean(dyn CacheManager)`) is accepted and encoded as its
+        // `TypeId::of::<dyn Trait>()` — the provides[]-aware back-off target.
+        "on_bean" | "on_missing_bean" | "on_single_candidate" => parse_bean_leaf_tokens(kind, args),
         // The property family: first positional string is the key.
-        "on_property" | "on_missing_property" => parse_property_leaf(&name, call),
-        // The bean family: a single type argument.
-        "on_bean" | "on_missing_bean" | "on_single_candidate" => parse_bean_leaf(&name, call),
+        "on_property" | "on_missing_property" => {
+            parse_property_leaf(kind, &parse_expr_args(&args)?)
+        }
         // The class family: a single string argument (a crate/feature name).
-        "on_class" | "on_missing_class" => parse_class_leaf(&name, call),
+        "on_class" | "on_missing_class" => parse_class_leaf(kind, &parse_expr_args(&args)?),
         other => Err(EmitError {
             message: format!(
                 "unknown #[conditional] kind `{other}` (expected on_property/on_bean/\
@@ -263,11 +300,53 @@ fn parse_cond_call(call: &syn::ExprCall) -> Result<CondExpr, EmitError> {
     }
 }
 
+/// Parse a raw token stream into a list of condition TERMS (the `all`/`any`/`not`
+/// child grammar + the top-level grammar share this).
+fn parse_terms(args: TokenStream) -> Result<Vec<CondTermTokens>, EmitError> {
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parser =
+        syn::punctuated::Punctuated::<CondTermTokens, syn::Token![,]>::parse_terminated;
+    let terms = syn::parse::Parser::parse2(parser, args).map_err(|e| EmitError {
+        message: format!("malformed #[conditional] arguments: {e}"),
+    })?;
+    Ok(terms.into_iter().collect())
+}
+
+/// Parse a raw token stream as a comma-separated list of `syn::Expr` (the
+/// property/class leaf argument grammar).
+fn parse_expr_args(args: &TokenStream) -> Result<Vec<syn::Expr>, EmitError> {
+    if args.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
+    let exprs = syn::parse::Parser::parse2(parser, args.clone()).map_err(|e| EmitError {
+        message: format!("malformed #[conditional] arguments: {e}"),
+    })?;
+    Ok(exprs.into_iter().collect())
+}
+
+/// Parse an `on_bean(Ty)` / `on_missing_bean(Ty)` / `on_single_candidate(Ty)` leaf
+/// from RAW argument tokens, accepting a concrete type OR a `dyn Trait` view.
+fn parse_bean_leaf_tokens(name: &str, args: TokenStream) -> Result<CondExpr, EmitError> {
+    let ty: syn::Type = syn::parse2(args).map_err(|_| EmitError {
+        message: format!(
+            "`{name}` expects a bean TYPE argument — a concrete type (`{name}(MyService)`) \
+             or a `dyn Trait` view (`{name}(dyn MyService)`)"
+        ),
+    })?;
+    Ok(CondExpr::Leaf {
+        kind: canonical_kind(name)?,
+        attrs: vec![CondAttr::Type("type".into(), ty)],
+    })
+}
+
 /// Parse an `on_property("k", having_value = "v", match_if_missing = b)` leaf.
-fn parse_property_leaf(name: &str, call: &syn::ExprCall) -> Result<CondExpr, EmitError> {
+fn parse_property_leaf(name: &str, args: &[syn::Expr]) -> Result<CondExpr, EmitError> {
     let mut attrs = Vec::new();
     let mut saw_key = false;
-    for (i, arg) in call.args.iter().enumerate() {
+    for (i, arg) in args.iter().enumerate() {
         match arg {
             // The first positional string literal is the property name. The runtime
             // `OnProperty`/`OnMissingProperty` reads it from the `"name"` attr (the
@@ -301,30 +380,14 @@ fn parse_property_leaf(name: &str, call: &syn::ExprCall) -> Result<CondExpr, Emi
     Ok(CondExpr::Leaf { kind: canonical_kind(name)?, attrs })
 }
 
-/// Parse an `on_bean(Ty)` / `on_missing_bean(Ty)` / `on_single_candidate(Ty)` leaf.
-fn parse_bean_leaf(name: &str, call: &syn::ExprCall) -> Result<CondExpr, EmitError> {
-    if call.args.len() != 1 {
-        return Err(EmitError {
-            message: format!("`{name}` takes exactly one type argument, got {}", call.args.len()),
-        });
-    }
-    let ty = expr_to_type(&call.args[0]).ok_or_else(|| EmitError {
-        message: format!("`{name}` expects a bean TYPE argument (e.g. `{name}(MyService)`)"),
-    })?;
-    Ok(CondExpr::Leaf {
-        kind: canonical_kind(name)?,
-        attrs: vec![CondAttr::Type("type".into(), ty)],
-    })
-}
-
 /// Parse an `on_class("crate")` / `on_missing_class("crate")` leaf.
-fn parse_class_leaf(name: &str, call: &syn::ExprCall) -> Result<CondExpr, EmitError> {
-    if call.args.len() != 1 {
+fn parse_class_leaf(name: &str, args: &[syn::Expr]) -> Result<CondExpr, EmitError> {
+    if args.len() != 1 {
         return Err(EmitError {
-            message: format!("`{name}` takes exactly one string argument, got {}", call.args.len()),
+            message: format!("`{name}` takes exactly one string argument, got {}", args.len()),
         });
     }
-    let s = match &call.args[0] {
+    let s = match &args[0] {
         syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s.value(),
         other => {
             return Err(EmitError {
@@ -391,18 +454,6 @@ fn path_ident(path: &syn::Path) -> Option<String> {
     path.get_ident().map(ToString::to_string).or_else(|| {
         path.segments.last().map(|s| s.ident.to_string())
     })
-}
-
-/// Best-effort conversion of an expression used in argument position to a type
-/// (so `on_bean(Foo)` and `on_bean(crate::Foo)` both work).
-fn expr_to_type(expr: &syn::Expr) -> Option<syn::Type> {
-    match expr {
-        syn::Expr::Path(p) => Some(syn::Type::Path(syn::TypePath {
-            qself: p.qself.clone(),
-            path: p.path.clone(),
-        })),
-        _ => None,
-    }
 }
 
 // ─────────────────────────── the profile grammar ────────────────────────────
@@ -958,6 +1009,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn on_missing_bean_accepts_a_dyn_trait_view_target() {
+        // The provides[]-aware back-off: `on_missing_bean(dyn CacheManager)` encodes
+        // `TypeId::of::<dyn CacheManager>()` so the probe matches a bean whose
+        // provides[] declares that view (Spring's @ConditionalOnMissingBean(Interface)).
+        let expr = cond("on_missing_bean(dyn CacheManager)");
+        let s = flat(&expr.lower());
+        assert!(
+            s.contains(r#"::leaf_core::contract_hash("leaf::condition::OnMissingBean")"#),
+            "got: {s}"
+        );
+        // The dyn-Trait view lowers to a const `TypeId::of::<dyn CacheManager>()` seam
+        // (whitespace is collapsed by `flat`, so `dyn CacheManager` reads `dynCacheManager`).
+        assert!(
+            s.contains(r#"::leaf_core::Attr::Type("type",const{::core::any::TypeId::of::<dynCacheManager>()})"#),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn on_bean_family_accepts_a_path_qualified_dyn_trait_view() {
+        // A fully-pathed `dyn Trait` (the redis form `dyn ::leaf_core::CacheManager`)
+        // also lowers to a TypeId-of-the-view attr.
+        let expr = cond("on_missing_bean(dyn ::leaf_core::CacheManager)");
+        let s = flat(&expr.lower());
+        assert!(
+            s.contains(r#"::core::any::TypeId::of::<dyn::leaf_core::CacheManager>()"#),
+            "got: {s}"
+        );
+    }
+
     // ── boolean composition: all/any/not are first-class nodes ─────────────────
 
     #[test]
@@ -1232,3 +1314,4 @@ mod tests {
         assert!(s.contains("&CacheAutoConfig"), "got: {s}");
     }
 }
+

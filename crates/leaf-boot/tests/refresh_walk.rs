@@ -66,19 +66,18 @@ struct BProvider {
     builds: Arc<AtomicUsize>,
     log: Arc<Mutex<Vec<&'static str>>>,
 }
+#[leaf_macros::async_impl]
 impl Provider for BProvider {
     fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
-    fn provide<'a>(
-        &'a self,
-        _cx: &'a ResolveCtx<'a>,
-    ) -> BoxFuture<'a, Result<Published, leaf_core::LeafError>> {
-        Box::pin(async move {
-            self.builds.fetch_add(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push("build:B");
-            Ok(Published::shared_value(B { tag: "b" }))
-        })
+    async fn provide(
+        &self,
+        _cx: &ResolveCtx<'_>,
+    ) -> Result<Published, leaf_core::LeafError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        self.log.lock().unwrap().push("build:B");
+        Ok(Published::shared_value(B { tag: "b" }))
     }
 }
 
@@ -87,22 +86,21 @@ struct AProvider {
     builds: Arc<AtomicUsize>,
     log: Arc<Mutex<Vec<&'static str>>>,
 }
+#[leaf_macros::async_impl]
 impl Provider for AProvider {
     fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
-    fn provide<'a>(
-        &'a self,
-        cx: &'a ResolveCtx<'a>,
-    ) -> BoxFuture<'a, Result<Published, leaf_core::LeafError>> {
-        Box::pin(async move {
-            self.builds.fetch_add(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push("build:A");
-            // Real nested resolution: A needs B, resolved THROUGH the engine.
-            let engine = cx.engine().expect("engine back-reference threaded");
-            let b = engine.get::<B>().await?;
-            Ok(Published::shared_value(A { b }))
-        })
+    async fn provide(
+        &self,
+        cx: &ResolveCtx<'_>,
+    ) -> Result<Published, leaf_core::LeafError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        self.log.lock().unwrap().push("build:A");
+        // Real nested resolution: A needs B, resolved THROUGH the engine.
+        let engine = cx.engine().expect("engine back-reference threaded");
+        let b = engine.get::<B>().await?;
+        Ok(Published::shared_value(A { b }))
     }
 }
 
@@ -111,19 +109,18 @@ struct BgProvider {
     builds: Arc<AtomicUsize>,
     log: Arc<Mutex<Vec<&'static str>>>,
 }
+#[leaf_macros::async_impl]
 impl Provider for BgProvider {
     fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
-    fn provide<'a>(
-        &'a self,
-        _cx: &'a ResolveCtx<'a>,
-    ) -> BoxFuture<'a, Result<Published, leaf_core::LeafError>> {
-        Box::pin(async move {
-            self.builds.fetch_add(1, Ordering::SeqCst);
-            self.log.lock().unwrap().push("build:Bg");
-            Ok(Published::shared_value(Bg { tag: "bg" }))
-        })
+    async fn provide(
+        &self,
+        _cx: &ResolveCtx<'_>,
+    ) -> Result<Published, leaf_core::LeafError> {
+        self.builds.fetch_add(1, Ordering::SeqCst);
+        self.log.lock().unwrap().push("build:Bg");
+        Ok(Published::shared_value(Bg { tag: "bg" }))
     }
 }
 

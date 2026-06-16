@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use leaf_core::{BoxFuture, Locale, MessageCatalogProvider, MessagePattern};
+use leaf_core::{Locale, MessageCatalogProvider, MessagePattern};
 
 /// An in-memory message catalog: `(locale-tag, code) → pattern`.
 ///
@@ -53,19 +53,14 @@ impl StaticCatalog {
     }
 }
 
+#[leaf_macros::async_impl]
 impl MessageCatalogProvider for StaticCatalog {
-    fn lookup<'a>(
-        &'a self,
-        code: &'a str,
-        locale: &'a Locale,
-    ) -> BoxFuture<'a, Option<MessagePattern>> {
+    async fn lookup(&self, code: &str, locale: &Locale) -> Option<MessagePattern> {
         // Exact (tag, code) lookup — ready future, no IO (phase3/11: compiled-in
         // catalog lookups return ready futures).
-        Box::pin(async move {
-            self.entries
-                .get(&(locale.tag().to_string(), code.to_string()))
-                .cloned()
-        })
+        self.entries
+            .get(&(locale.tag().to_string(), code.to_string()))
+            .cloned()
     }
 
     fn name(&self) -> &str {

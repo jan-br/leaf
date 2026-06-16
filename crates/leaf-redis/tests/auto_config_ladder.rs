@@ -105,15 +105,44 @@ fn explicitly_disabled_property_backs_off() {
 
 #[test]
 fn a_user_cache_manager_of_the_contributed_type_supersedes_the_auto_config() {
-    // A user bean of type RedisCacheManager is already registered (seed the probe with
-    // a NON-fallback def of that type). The OnMissingBean leaf then sees it and the
-    // auto-config backs off — the user bean wins (the soft-override contract).
+    // A user RedisCacheManager bean is registered, PROVIDING the dyn CacheManager view
+    // (the production `component_seed_probe` lifts each bean's self_type + provides[]
+    // views — here both the concrete type and the view). The guard's
+    // OnMissingBean(dyn CacheManager) then sees the view and the auto-config backs off.
     let (registered, builder, report) = run(
         &env_with(&[("leaf.redis.enabled", "true")]),
         &ExclusionSet::new(),
-        &[(TypeId::of::<RedisCacheManager>(), CandidateRole::NORMAL)],
+        &[
+            (TypeId::of::<RedisCacheManager>(), CandidateRole::NORMAL),
+            (TypeId::of::<dyn leaf_core::CacheManager>(), CandidateRole::NORMAL),
+        ],
     );
     assert_eq!(registered, 0, "OnMissingBean backs off: the user CacheManager supersedes");
+    assert_eq!(builder.len(), 0);
+    let rec = report.lookup(ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)).expect("a verdict");
+    assert!(matches!(rec.class, ConditionReportClass::Negative(_)));
+}
+
+#[test]
+fn a_user_cache_manager_of_a_different_concrete_type_supersedes_via_the_dyn_view() {
+    // The headline provides[]-aware back-off: a user CacheManager of a DIFFERENT
+    // concrete type (NOT RedisCacheManager) — but providing the dyn CacheManager view —
+    // makes the Redis default back off. The probe matches on the VIEW, not self_type.
+    struct UserCacheManager;
+    let (registered, builder, report) = run(
+        &env_with(&[("leaf.redis.enabled", "true")]),
+        &ExclusionSet::new(),
+        // Only the dyn-view is seeded (the user bean's own self_type is unrelated to
+        // RedisCacheManager) — yet the back-off still fires.
+        &[
+            (TypeId::of::<UserCacheManager>(), CandidateRole::NORMAL),
+            (TypeId::of::<dyn leaf_core::CacheManager>(), CandidateRole::NORMAL),
+        ],
+    );
+    assert_eq!(
+        registered, 0,
+        "a differently-typed CacheManager providing the dyn view supersedes the default"
+    );
     assert_eq!(builder.len(), 0);
     let rec = report.lookup(ContractId::of(REDIS_CACHE_MANAGER_CONTRACT)).expect("a verdict");
     assert!(matches!(rec.class, ConditionReportClass::Negative(_)));
