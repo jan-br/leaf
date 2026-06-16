@@ -90,6 +90,7 @@ pub mod future;
 pub mod handle;
 pub mod identity;
 pub mod injectable;
+pub mod injectable_ctor;
 pub mod injection;
 pub mod lifecycle;
 pub mod lifecycle_engine;
@@ -174,6 +175,8 @@ pub use registry::{is_null_bean, NullMarker, Registry, RegistryBuilder, NULL_BEA
 // `Container` back-ref — single-phase construction, deferral-only cycle break).
 
 pub use injectable::{Injectable, Resolvable};
+
+pub use injectable_ctor::{construct_with, ctor_deps, InjectableCtor};
 
 pub use injection::{
     collect_ordered, layers, no_unique_bean_traced, reject_advised_concrete, resolved_to_result,

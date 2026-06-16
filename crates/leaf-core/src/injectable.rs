@@ -17,7 +17,9 @@
 use crate::error::LeafError;
 use crate::future::BoxFuture;
 use crate::handle::{Bean, Ref};
-use crate::injection::{Cardinality, LazyRef, Lookup, Strictness};
+use crate::injection::{
+    Arity, Cardinality, InjectionPoint, LazyRef, Lookup, PointKind, Strictness,
+};
 use crate::provider::ResolveCtx;
 use std::any::TypeId;
 
@@ -35,6 +37,37 @@ pub struct Resolvable {
     /// this to decide whether the target MUST exist (a hard graph edge) or may be
     /// absent (a deferred/soft edge that does not force the target to exist).
     pub strictness: Strictness,
+}
+
+impl Resolvable {
+    /// Lower this const descriptor to an [`InjectionPoint`] with the given point
+    /// `name` (the param/field ident, or a positional `arg{i}` for a referenced
+    /// constructor's nameless params).
+    ///
+    /// The ONE place the `Resolvable` → `InjectionPoint` mapping lives, shared by
+    /// the field-default codegen and the [`InjectableCtor`](crate::InjectableCtor)
+    /// driver: `cardinality` picks the [`Arity`], and `strictness` picks the
+    /// [`PointKind`] (a `Strict` single is a real construction-time edge; a
+    /// tolerant/deferred handle is a [`PointKind::Deferral`] that REMOVES the edge,
+    /// the cycle break). Trait dispatch, never type-name matching.
+    #[must_use]
+    pub const fn into_point(self, name: &'static str) -> InjectionPoint {
+        InjectionPoint {
+            produced: self.produced,
+            generics: &[],
+            qualifiers: &[],
+            name,
+            arity: match self.cardinality {
+                Cardinality::Single => Arity::Single,
+                Cardinality::Multiple => Arity::Collection,
+            },
+            kind: match self.strictness {
+                Strictness::Strict => PointKind::Bean,
+                _ => PointKind::Deferral,
+            },
+            collection: None,
+        }
+    }
 }
 
 /// A type obtainable from the container as a constructor parameter (or injected
