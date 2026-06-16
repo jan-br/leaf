@@ -35,6 +35,15 @@ pub struct StereotypeArgs {
     /// that lets a `#[component]` register a `Role::Infrastructure` bean (e.g. the
     /// primary `applicationTaskExecutor`).
     pub role: Option<Role>,
+    /// An optional REFERENCED constructor path (`constructor = OrderRepository::new`).
+    /// `None` (the default) keeps field injection; `Some(path)` makes the stereotype
+    /// emit a referenced-constructor provider/plan (via the Task-1 `construct_with`/
+    /// `ctor_deps` drivers) and SKIP the field-default — so a state-holding struct
+    /// (a non-`Injectable` field) compiles. A bare method ident is prepended with the
+    /// struct's type path by [`struct_input`] (`new` → `Foo::new`); a multi-segment
+    /// path is used verbatim. The macro NEVER parses or counts the constructor's
+    /// parameters — type inference + the per-arity `InjectableCtor` impls do that.
+    pub constructor: Option<syn::Path>,
 }
 
 /// Parse the comma-separated `#[stereotype(name = "…", scope = "…")]` argument
@@ -63,6 +72,16 @@ pub fn parse_args(attr: proc_macro2::TokenStream) -> Result<StereotypeArgs, Emit
             .get_ident()
             .map(ToString::to_string)
             .unwrap_or_default();
+        // `constructor = <path>` is the ONE non-string-literal value: a path
+        // EXPRESSION the macro references verbatim (`OrderRepository::new` / `new`),
+        // never a string. The other keys take a `key = "literal"` string.
+        if key == "constructor" {
+            out.constructor = Some(path_value(&nv.value).ok_or_else(|| EmitError {
+                message: "`constructor` must be a path (e.g. `OrderRepository::new` or `new`)"
+                    .into(),
+            })?);
+            continue;
+        }
         let value = str_value(&nv.value).ok_or_else(|| EmitError {
             message: format!("`{key}` must be a string literal"),
         })?;
@@ -73,7 +92,8 @@ pub fn parse_args(attr: proc_macro2::TokenStream) -> Result<StereotypeArgs, Emit
             other => {
                 return Err(EmitError {
                     message: format!(
-                        "unknown stereotype argument `{other}` (expected `name`/`scope`/`role`)"
+                        "unknown stereotype argument `{other}` \
+                         (expected `name`/`scope`/`role`/`constructor`)"
                     ),
                 });
             }
@@ -86,6 +106,16 @@ pub fn parse_args(attr: proc_macro2::TokenStream) -> Result<StereotypeArgs, Emit
 fn str_value(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) => Some(s.value()),
+        _ => None,
+    }
+}
+
+/// The [`syn::Path`] of a `constructor = <path>` value, if it is a path expression
+/// (`OrderRepository::new` / `new`). Returns `None` for anything else (a string
+/// literal, a call, …) so [`parse_args`] can emit a clear error.
+fn path_value(expr: &Expr) -> Option<syn::Path> {
+    match expr {
+        Expr::Path(ep) if ep.qself.is_none() => Some(ep.path.clone()),
         _ => None,
     }
 }
@@ -193,6 +223,7 @@ pub fn struct_input(
     explicit_name: Option<String>,
     explicit_role: Option<Role>,
     scope: Scope,
+    constructor: Option<syn::Path>,
 ) -> Result<BeanInput, EmitError> {
     let ident = item.ident.to_string();
     let is_generic = !item.generics.params.is_empty();
@@ -201,13 +232,11 @@ pub fn struct_input(
         message: format!("`{ident}` is not a valid self type: {e}"),
     })?;
 
-    let deps = fields_to_deps(&item.fields);
-
     let meta = resolve(&stereotype.annotation()).map_err(|e| EmitError {
         message: e.to_string(),
     })?;
 
-    let mut input = BeanInput::new(self_ty, ident.clone(), ident);
+    let mut input = BeanInput::new(self_ty, ident.clone(), ident.clone());
     input.module_qualified = true;
     // An explicit `role = "…"` arg overrides the stereotype's own role (the
     // orthogonal provenance axis); otherwise the stereotype's role (Application)
@@ -216,14 +245,50 @@ pub fn struct_input(
     input.scope = scope;
     input.explicit_name = explicit_name;
     input.meta = meta;
-    input.deps = deps;
-    // The struct field-default routes through `Injectable` (trait dispatch): each
-    // field carries its VERBATIM type and the emitter derives the injection point +
-    // resolution from `<FieldTy as ::leaf_core::Injectable>::{RESOLVABLE, inject}` —
-    // never a name-stripped `Ref<…>` TypeId (the design's no-type-names rule).
-    input.inject_via_trait = true;
     input.is_generic = is_generic;
+
+    match constructor {
+        // ── opt-in: a REFERENCED constructor (`constructor = <path>`) ──
+        // The macro references the constructor by PATH and resolves its parameters
+        // through the Task-1 `construct_with`/`ctor_deps` drivers — it NEVER parses,
+        // counts, or name-inspects the parameters (type inference + the per-arity
+        // `InjectableCtor` impls do that). So the struct's FIELDS are NOT lowered as
+        // injection points (`deps` stays empty), which lets a state-holding struct (a
+        // non-`Injectable` `AtomicI64`/seeded-`Vec` field) compile. A bare method ident
+        // (`new`) is prepended with the struct's type path → `Self::new`; a multi-segment
+        // path (`OrderRepository::new`) is used verbatim.
+        Some(path) => {
+            input.referenced_ctor = Some(qualify_ctor_path(&path, &ident)?);
+        }
+        // ── default: FIELD injection through `Injectable` (trait dispatch) ──
+        // Each field carries its VERBATIM type and the emitter derives the injection
+        // point + resolution from `<FieldTy as ::leaf_core::Injectable>::{RESOLVABLE,
+        // inject}` — never a name-stripped `Ref<…>` TypeId (the no-type-names rule).
+        None => {
+            input.deps = fields_to_deps(&item.fields);
+            input.inject_via_trait = true;
+        }
+    }
     Ok(input)
+}
+
+/// Qualify a `constructor = <path>` argument against the bean's struct type: a bare
+/// single-segment ident (`new`) is prepended with the struct's type path →
+/// `Ident::new`; a multi-segment path (`OrderRepository::new`) is returned verbatim.
+///
+/// # Errors
+/// [`EmitError`] if a bare ident cannot be rebuilt into a `StructIdent::method` path
+/// (only possible for a non-ident token, which the path parse would already reject).
+fn qualify_ctor_path(path: &syn::Path, struct_ident: &str) -> Result<syn::Path, EmitError> {
+    // A single bare segment with no leading `::` and no generics → an inherent method
+    // on the struct: prepend the struct's type path (`new` → `OrderRepository::new`).
+    if path.leading_colon.is_none() && path.segments.len() == 1 {
+        let method = path.segments[0].ident.to_string();
+        return syn::parse_str(&format!("{struct_ident}::{method}")).map_err(|e| EmitError {
+            message: format!("`{method}` is not a valid constructor method ident: {e}"),
+        });
+    }
+    Ok(path.clone())
 }
 
 /// The ONE entry point the thin stereotype macro calls: parse the attribute args,
@@ -243,7 +308,7 @@ pub fn emit_struct(
     attr: proc_macro2::TokenStream,
 ) -> Result<proc_macro2::TokenStream, EmitError> {
     let args = parse_args(attr)?;
-    let input = struct_input(item, stereotype, args.name, args.role, args.scope)?;
+    let input = struct_input(item, stereotype, args.name, args.role, args.scope, args.constructor)?;
     crate::descriptor::emit(&input)
 }
 
@@ -547,6 +612,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("a unit struct lowers");
         assert!(input.deps.is_empty(), "a unit struct has no injection points");
@@ -568,6 +634,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         assert_eq!(input.deps.len(), 2);
@@ -593,6 +660,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         assert_eq!(input.deps.len(), 1);
@@ -619,6 +687,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         // The dep carries the VERBATIM field type (no `Ref<…>` strip).
@@ -650,6 +719,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         assert_eq!(input.deps.len(), 2);
@@ -665,6 +735,7 @@ mod tests {
             Some("theGreeter".into()),
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         assert_eq!(input.explicit_name, Some("theGreeter".into()));
@@ -678,6 +749,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         let s = flat(&input);
@@ -762,6 +834,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowers");
         let s = flat(&input);
@@ -981,6 +1054,92 @@ mod tests {
         assert!(err.message.contains("register_component!"), "got: {}", err.message);
     }
 
+    /// Render an `emit_struct` token stream to a whitespace-collapsed string (the
+    /// token-assertion idiom; the existing `flat` takes a `&BeanInput`).
+    fn flat_ts(ts: &proc_macro2::TokenStream) -> String {
+        ts.to_string().split_whitespace().collect()
+    }
+
+    #[test]
+    fn constructor_arg_emits_construct_with_and_no_field_default() {
+        // A `constructor = OrderRepository::new` arg makes the stereotype emit a
+        // REFERENCED-CONSTRUCTOR provider/plan via the Task-1 drivers, and SKIP the
+        // field-default — so a state-holding struct (a non-`Injectable` `AtomicI64`
+        // field) compiles: the field is NEVER lowered as an injection point.
+        let ts = emit_struct(
+            &item("struct OrderRepository { next_id: AtomicI64 }"),
+            Stereotype::Repository,
+            syn::parse_str("constructor = OrderRepository::new").expect("tokens"),
+        )
+        .expect("emits");
+        // The whole emitted artifact is still valid Rust items.
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat_ts(&ts);
+        // The provider resolves the bean THROUGH the referenced constructor.
+        assert!(s.contains("construct_with(OrderRepository::new"), "got: {s}");
+        // The dependency plan is read from the referenced constructor.
+        assert!(s.contains("ctor_deps(OrderRepository::new"), "got: {s}");
+        // The field-default is GONE: no all-fields `<Ty>::new(...)` self-construct,
+        // and the `AtomicI64` state field is NEVER lowered as an `Injectable` point.
+        assert!(
+            !s.contains("<OrderRepositoryasOrderRepository>") && !s.contains("__dep_next_id"),
+            "no field-default lowering of the state field: {s}"
+        );
+        assert!(
+            !s.contains("<AtomicI64as::leaf_core::Injectable>"),
+            "the state field must NOT be lowered as an Injectable: {s}"
+        );
+    }
+
+    #[test]
+    fn bare_constructor_name_resolves_to_self() {
+        // A bare method ident (`constructor = new`) is prepended with the struct's
+        // type path → `Foo::new` — so the macro references the inherent constructor.
+        let ts = emit_struct(
+            &item("struct Foo { a: leaf_core::Ref<A> }"),
+            Stereotype::Component,
+            syn::parse_str("constructor = new").expect("tokens"),
+        )
+        .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat_ts(&ts);
+        assert!(s.contains("construct_with(Foo::new"), "the bare name prepends the struct path: {s}");
+        assert!(s.contains("ctor_deps(Foo::new"), "got: {s}");
+    }
+
+    #[test]
+    fn no_constructor_arg_keeps_field_default() {
+        // With NO `constructor` arg, today's field-injection default stands: each
+        // field is lowered through `<FieldTy as ::leaf_core::Injectable>` and there
+        // is no `construct_with`.
+        let ts = emit_struct(
+            &item("struct Foo { a: leaf_core::Ref<A> }"),
+            Stereotype::Component,
+            proc_macro2::TokenStream::new(),
+        )
+        .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat_ts(&ts);
+        assert!(
+            s.contains("<leaf_core::Ref<A>as::leaf_core::Injectable>"),
+            "the field-default lowering stands: {s}"
+        );
+        assert!(!s.contains("construct_with("), "no constructor provider on the default path: {s}");
+        assert!(!s.contains("ctor_deps("), "no ctor_deps on the default path: {s}");
+    }
+
+    #[test]
+    fn parse_args_reads_a_constructor_path() {
+        // The attribute parse recognises `constructor = <path>` and carries the path
+        // (a multi-segment path verbatim).
+        let attr: proc_macro2::TokenStream =
+            syn::parse_str("constructor = OrderRepository::new").expect("tokens");
+        let args = parse_args(attr).expect("parses");
+        let path = args.constructor.expect("a constructor path");
+        let rendered: String = quote::quote!(#path).to_string().split_whitespace().collect();
+        assert_eq!(rendered, "OrderRepository::new");
+    }
+
     #[test]
     fn generic_struct_is_a_hard_error_with_the_register_component_hint() {
         // A generic struct has no single concrete TypeId/ContractId. The lowering
@@ -992,6 +1151,7 @@ mod tests {
             None,
             None,
             Scope::Singleton,
+            None,
         )
         .expect("lowering itself succeeds; the emitter rejects the generic");
         assert!(input.is_generic);

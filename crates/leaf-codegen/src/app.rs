@@ -231,6 +231,9 @@ pub fn runner_input(item: &syn::ItemStruct) -> Result<crate::descriptor::BeanInp
         None,
         None,
         crate::descriptor::Scope::Singleton,
+        // `#[runner]` keeps field injection (no `constructor = …` surface yet — a
+        // trivial deferred follow-up per the design).
+        None,
     )?;
     // Declare the Runner upcast view so the run pipeline finds it by the `dyn Runner`
     // contract (the one place a runner differs from a plain component).

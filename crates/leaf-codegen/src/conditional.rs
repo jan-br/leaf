@@ -770,6 +770,9 @@ pub fn auto_config_input(item: &syn::ItemStruct) -> Result<crate::descriptor::Be
         None,
         None,
         crate::descriptor::Scope::Singleton,
+        // `#[auto_config]` keeps field injection (no `constructor = …` surface yet —
+        // a trivial deferred follow-up per the design).
+        None,
     )?;
     input.slice = crate::descriptor::Slice::AutoConfigs;
     // An auto-config registers at CandidateRole::FALLBACK: re-resolve the stereotype

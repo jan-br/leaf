@@ -232,6 +232,21 @@ pub struct BeanInput {
     /// resolves `Ty` through `Engine::get` and threads a `Ref<Ty>` in. (Task 4
     /// migrates the remaining `false` paths onto the trait + deletes the strip.)
     pub inject_via_trait: bool,
+    /// `Some(path)` iff this bean is constructed through a REFERENCED constructor
+    /// (`#[repository(constructor = OrderRepository::new)]`): the generated provider
+    /// resolves the constructor's parameters through the
+    /// [`InjectableCtor`](leaf_core::InjectableCtor) drivers
+    /// (`::leaf_core::construct_with(#path, ctx)`) and the bean IS the constructor's
+    /// product — the macro NEVER parses, counts, or name-inspects the parameters
+    /// (type inference + the per-arity impls do that). When `Some`, the
+    /// [`deps`](Self::deps) field-default is SKIPPED (a state-holding struct's
+    /// non-`Injectable` fields are not lowered), so [`deps`](Self::deps) is empty and
+    /// the const injection plan is [`InjectionPlan::EMPTY`](leaf_core::InjectionPlan):
+    /// the per-parameter plan is the runtime `::leaf_core::ctor_deps(#path)` (read at
+    /// assembly, exposed as a `#[doc(hidden)]` helper) because a referenced
+    /// constructor's parameter types are unspellable in a const position. `None` (the
+    /// default) is the field-injection / `#[bean]` / inherent-`new` path.
+    pub referenced_ctor: Option<syn::Path>,
 }
 
 impl BeanInput {
@@ -255,6 +270,7 @@ impl BeanInput {
             is_generic: false,
             slice: Slice::default(),
             inject_via_trait: false,
+            referenced_ctor: None,
         }
     }
 }
@@ -345,10 +361,34 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         input.receiver_ty.as_ref(),
         &input.deps,
         input.inject_via_trait,
+        input.referenced_ctor.as_ref(),
         &provider_ident,
         &desc_ident,
     );
     let slice = input.slice.tokens();
+
+    // ── the REFERENCED-CONSTRUCTOR runtime dependency-plan helper ──
+    // A `constructor = <path>` bean cannot name its parameter types in a const
+    // position (they are unspellable — that is the whole point of referencing the
+    // constructor), so its const `InjectionPlan` row stays `EMPTY` and the real
+    // per-parameter plan is the RUNTIME `::leaf_core::ctor_deps(<path>)` (read at
+    // assembly by the wave-planner, before any instantiation). The driver is exposed
+    // through a deterministic `#[doc(hidden)] pub fn __leaf_ctor_deps_<Ident>()` so it
+    // is wired (never dead code) and the assembly pass has a stable hook. Emitted ONLY
+    // for the referenced-constructor path (the field-default path keeps its const
+    // plan); the macro NEVER parses the constructor — `ctor_deps` infers the arity.
+    let ctor_deps_helper = if let Some(path) = input.referenced_ctor.as_ref() {
+        let deps_fn_ident = format_ident!("__leaf_ctor_deps_{}", mangled);
+        quote! {
+            #[allow(non_snake_case)]
+            #[doc(hidden)]
+            pub fn #deps_fn_ident() -> ::std::vec::Vec<::leaf_core::InjectionPoint> {
+                ::leaf_core::ctor_deps(#path)
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
 
     Ok(quote! {
         // ── the per-bean InjectionPlan (one const InjectionPoint per dependency) ──
@@ -376,6 +416,9 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
         #[doc(hidden)]
         pub const #seed_ident: ::leaf_core::ProviderSeed =
             || ::std::sync::Arc::new(#provider_ident);
+
+        // ── the referenced-constructor runtime dependency-plan helper (if any) ──
+        #ctor_deps_helper
 
         // ── the const Descriptor row, submitted into the COMPONENTS slice ──
         // CROSS-CRATE re-export (verified empirically against real leaf-core, NO
@@ -491,6 +534,9 @@ pub fn emit_wiring_only(input: &BeanInput) -> Result<TokenStream, EmitError> {
         input.receiver_ty.as_ref(),
         &input.deps,
         input.inject_via_trait,
+        // `emit_wiring_only` is the legacy `#[inject]`-constructor wiring path (removed
+        // in Task 3); it never uses the referenced-constructor provider.
+        None,
         &provider_ident,
         &desc_ident,
     );
@@ -638,15 +684,53 @@ fn emit_provides(provides: &[ServiceView]) -> TokenStream {
 /// unit's concern; this emitter resolves each collaborator through the one
 /// `Engine::get` seam and threads the handle into the constructor call. The
 /// resulting tokens parse + reference only the frozen `::leaf_core` seam.
+// The construction-recipe knobs (ctor / receiver / deps / trait-vs-name-strip /
+// referenced-constructor) are each an independent axis of the ONE generated provider
+// — bundling them into a struct would only relocate the same arity, so the emitter
+// takes them positionally.
+#[allow(clippy::too_many_arguments)]
 fn emit_provider(
     self_ty: &Type,
     ctor: Option<&syn::Path>,
     receiver_ty: Option<&Type>,
     deps: &[Dependency],
     inject_via_trait: bool,
+    referenced_ctor: Option<&syn::Path>,
     provider_ident: &syn::Ident,
     desc_ident: &syn::Ident,
 ) -> TokenStream {
+    // ── the REFERENCED-CONSTRUCTOR provider (`constructor = <path>`) ──
+    // The bean IS the product of the referenced constructor: the provider awaits
+    // `::leaf_core::construct_with(<path>, __cx)`, which resolves EACH parameter
+    // through `Injectable` (trait dispatch — type inference picks the arity from the
+    // bare fn value, never a turbofish) and calls the constructor. The macro emits the
+    // path verbatim and NEVER parses, counts, or name-inspects the parameters; there
+    // is no per-field resolution, no `Engine::get`, no `<Ty>::new(all_fields)` — so a
+    // state-holding struct (a non-`Injectable` field the constructor seeds) compiles.
+    if let Some(path) = referenced_ctor {
+        return quote! {
+            #[allow(non_camel_case_types)]
+            struct #provider_ident;
+            impl ::leaf_core::Provider for #provider_ident {
+                fn descriptor(&self) -> &::leaf_core::Descriptor {
+                    &#desc_ident
+                }
+                fn provide<'__a>(
+                    &'__a self,
+                    __cx: &'__a ::leaf_core::ResolveCtx<'__a>,
+                ) -> ::leaf_core::BoxFuture<
+                    '__a,
+                    ::core::result::Result<::leaf_core::Published, ::leaf_core::LeafError>,
+                > {
+                    ::std::boxed::Box::pin(async move {
+                        let __instance = ::leaf_core::construct_with(#path, __cx).await?;
+                        ::core::result::Result::Ok(::leaf_core::Published::shared_value(__instance))
+                    })
+                }
+            }
+        };
+    }
+
     // Resolve each dependency, then bind it to a local the constructor call consumes.
     // Two shapes, selected by `inject_via_trait`:
     //   * the TRAIT path: `<Ty as Injectable>::inject(__cx)` yields the FULL handle

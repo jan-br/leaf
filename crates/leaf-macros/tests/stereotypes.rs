@@ -107,6 +107,58 @@ fn a_bean_factory_fn_reaches_components_and_builds_its_product() {
     assert_eq!(clock.label, "system");
 }
 
+// ── `#[repository(constructor = <path>)]` — the state-holding referenced-ctor path ──
+//
+// A REAL macro expansion (not a token-string assertion): the `constructor = …` arg
+// makes the stereotype emit a `::leaf_core::construct_with(OrderRepo::new, __cx)`
+// provider that builds the bean THROUGH the referenced constructor. This proves the
+// generated `construct_with` call typechecks against the per-arity `InjectableCtor`
+// impls AND that a non-`Injectable` state field (`AtomicI64`) compiles — impossible
+// on the field-injection default. The field is NEVER lowered as an injection point.
+
+use std::sync::atomic::{AtomicI64, Ordering};
+
+#[repository(constructor = OrderRepo::new)]
+struct OrderRepo {
+    next_id: AtomicI64,
+}
+impl OrderRepo {
+    fn new() -> Self {
+        OrderRepo { next_id: AtomicI64::new(1) }
+    }
+    fn next_id(&self) -> i64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+#[test]
+fn a_referenced_constructor_repository_resolves_and_carries_its_state() {
+    // The state-holding repository wears `#[repository(constructor = OrderRepo::new)]`
+    // (the `register_component!` replacement for a stateful bean). Its seed-built
+    // provider awaits `construct_with(OrderRepo::new, __cx)` — a zero-injected-param
+    // constructor that SEEDS state — and the resolved bean's state survives + behaves
+    // (two `next_id()` calls return increasing ids).
+    let d = descriptor_named("orderRepo");
+    assert!(has_marker(&d, "leaf::Repository"));
+    assert!(has_marker(&d, "leaf::Component"));
+
+    let mut builder = leaf_core::RegistryBuilder::new();
+    builder
+        .register(d, __leaf_seed_OrderRepo())
+        .expect("register the referenced-constructor row");
+    let engine = leaf_core::Engine::new(builder.freeze().expect("freezes"));
+    let repo = futures::executor::block_on(engine.get::<OrderRepo>())
+        .expect("the referenced-constructor repository resolves");
+    // The constructor seeded `next_id` at 1; the state survived construction through
+    // the stereotype and increments across calls.
+    assert_eq!(repo.next_id(), 1);
+    assert_eq!(repo.next_id(), 2);
+
+    // The runtime dependency plan (read at assembly) is empty — a zero-injected-param
+    // constructor has no construction edges.
+    assert!(__leaf_ctor_deps_OrderRepo().is_empty());
+}
+
 // ── register_component!(Concrete) — the generic escape hatch ──
 
 struct Wrapper<T> {
