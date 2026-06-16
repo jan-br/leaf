@@ -174,6 +174,37 @@ fn the_discount_policy_registers_when_enabled() {
     });
 }
 
+/// THE STATE-HOLDING STEREOTYPE PROOF: `OrderRepository` wears
+/// `#[repository(constructor = OrderRepository::new)]` over `AtomicI64`/`AtomicUsize`
+/// state. Booting the app resolves it through the stereotype's referenced-constructor
+/// provider (not `register_component!`), and its seeded counter survives construction —
+/// two `next_id()` calls return strictly increasing ids.
+#[test]
+fn the_state_holding_repository_resolves_through_its_stereotype_and_keeps_its_state() {
+    let _boot = APP_BOOT.lock().unwrap_or_else(|e| e.into_inner());
+    runtime().block_on(async {
+        let running = leaf::bootstrap("storefront")
+            .run(leaf::RunInputs::new().into(), leaf::boot::RunOverlay::none())
+            .await
+            .expect("the umbrella-only app runs to Ready");
+
+        let repo = running
+            .context()
+            .get::<OrderRepository>()
+            .await
+            .expect("the state-holding OrderRepository resolves via its #[repository] stereotype");
+
+        // The seeded counter survived construction through the referenced constructor:
+        // successive allocations are strictly increasing.
+        let first = repo.next_id();
+        let second = repo.next_id();
+        assert!(second > first, "next_id() increments: {first} then {second}");
+
+        let report = running.shutdown().await;
+        assert_eq!(report.run_state, RunState::Closed);
+    });
+}
+
 /// The Redis auto-config PARTICIPATES (force-linked via the umbrella's `redis` feature):
 /// its `AUTO_CONFIGS` row + force-link references survive DCE, and the umbrella's
 /// ExpectedManifest names leaf-redis. It coexists with the in-memory cache (FALLBACK

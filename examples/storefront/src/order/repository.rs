@@ -7,11 +7,11 @@ use crate::order::Order;
 /// A `@Repository` recording placed order. Lock-light: a saved-count and a next-id
 /// counter (no `Mutex`) stand in for a datastore.
 #[derive(Debug)]
+#[repository(constructor = OrderRepository::new)]
 pub struct OrderRepository {
     next_id: AtomicI64,
     saved: AtomicUsize,
 }
-register_component!(OrderRepository);
 
 impl OrderRepository {
     fn new() -> Self {
