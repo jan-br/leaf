@@ -217,6 +217,46 @@ impl Engine {
         })
     }
 
+    /// Resolve a `dyn Svc` VIEW `TypeId` to the providing bean and hand back the
+    /// view-HOLDER [`ErasedBean`] (an `Arc<Arc<dyn Svc>>`) — the ONE by-trait-
+    /// injection primitive every `Ref<dyn Svc>` surface inherits.
+    ///
+    /// The flow reuses the existing machinery end-to-end: the view `TypeId` is
+    /// resolved through the SAME `by_type` index as a concrete type (every
+    /// `provides[]` view is indexed there), with the FallbackDemote precedence of
+    /// [`Registry::resolve_view_id`] (a soft `@Fallback` loses to a non-fallback;
+    /// ambiguity is a loud `NoUniqueBean`); the providing bean is built through the
+    /// ONE [`create`](Engine::create) driver; and its declared `provides[]`
+    /// [`TypeRow`](crate::TypeRow) upcast coerces the concrete `Arc` into the
+    /// requested view (the macro-emitted const fn wraps it as the `Arc<Arc<dyn Svc>>`
+    /// view-holder). The typed `Ref<dyn Svc>` is reconstituted at the
+    /// [`Injectable`](crate::Injectable) seam by downcasting the holder.
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoSuchBean`]/[`ErrorKind::NoUniqueBean`] on view resolution; a
+    /// construction fault; or [`ErrorKind::ConstructionFailed`] if the resolved bean
+    /// declares no upcast row for the view or is a prototype (owned move).
+    pub async fn resolve_view(&self, view: TypeId) -> Result<ErasedBean, LeafError> {
+        let id = self.registry.resolve_view_id(view)?;
+        let upcast = self.registry.view_upcast(id, view).ok_or_else(|| {
+            LeafError::new(ErrorKind::ConstructionFailed).caused_by(Cause::plain(
+                "resolving by-trait view",
+                "the providing bean declares no upcast row for the requested view",
+            ))
+        })?;
+        let cx = ResolveCtx::for_engine(self);
+        let published = self.create(id, &cx).await?;
+        let bean = published.into_shared().ok_or_else(|| {
+            LeafError::new(ErrorKind::ConstructionFailed).caused_by(Cause::plain(
+                "resolving by-trait view",
+                "the providing bean is a prototype (owned move); a dyn-view needs a shared handle",
+            ))
+        })?;
+        // Apply the providing bean's const upcast: concrete Arc -> the Arc<dyn Svc>
+        // view-holder (re-erased), recoverable typed at the Injectable seam.
+        Ok(upcast(bean))
+    }
+
     /// THE one concrete creation driver (bean-instantiation): single-phase
     /// `provide → run_init → publish`, branching on the scope's [`Multiplicity`].
     ///
@@ -1017,6 +1057,78 @@ mod tests {
     }
 
     // ── AssemblyReport aggregation ──
+
+    // ── resolve_view: the by-trait-injection primitive (engine level) ───────────
+
+    trait Speak: Send + Sync + 'static {
+        fn say(&self) -> &'static str;
+    }
+    #[derive(Debug)]
+    struct Loud;
+    impl Bean for Loud {}
+    impl Speak for Loud {
+        fn say(&self) -> &'static str {
+            "LOUD"
+        }
+    }
+
+    // The macro-shaped provides[] upcast: downcast to concrete, unsize, re-erase as
+    // the Arc<Arc<dyn Speak>> view-holder.
+    fn loud_as_speak(bean: ErasedBean) -> ErasedBean {
+        match bean.downcast::<Loud>() {
+            Ok(c) => {
+                let view: Arc<dyn Speak> = c;
+                Arc::new(view) as ErasedBean
+            }
+            Err(orig) => orig,
+        }
+    }
+
+    struct LoudProvider {
+        descriptor: Descriptor,
+    }
+    impl Provider for LoudProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async { Ok(Published::shared_value(Loud)) })
+        }
+    }
+
+    #[test]
+    fn engine_resolve_view_builds_the_provider_and_returns_the_typed_view_holder() {
+        // `Engine::resolve_view(dyn Speak)` resolves the providing bean, builds it via
+        // the ONE create driver, applies the bean's upcast, and returns the view-holder
+        // — which `view_from_holder` recovers as a typed Ref<dyn Speak>.
+        let provides: &'static [crate::definition::TypeRow] =
+            Box::leak(Box::new([crate::definition::TypeRow {
+                view: TypeId::of::<dyn Speak>(),
+                upcast: loud_as_speak,
+            }]));
+        let d = Descriptor {
+            provides,
+            ..descriptor("loud", "test::Loud", TypeId::of::<Loud>(), ScopeDef::SINGLETON)
+        };
+        let mut builder = RegistryBuilder::new();
+        builder.register(d, Arc::new(LoudProvider { descriptor: d })).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+
+        let holder = block(engine.resolve_view(TypeId::of::<dyn Speak>())).expect("view resolves");
+        let r: Ref<dyn Speak> =
+            crate::injectable::view_from_holder::<dyn Speak>(holder).expect("typed view recovered");
+        assert_eq!(r.say(), "LOUD");
+    }
+
+    #[test]
+    fn engine_resolve_view_for_an_unprovided_view_is_no_such_bean() {
+        let engine = Engine::new(RegistryBuilder::new().freeze().unwrap());
+        let err = block(engine.resolve_view(TypeId::of::<dyn Speak>())).expect_err("no provider");
+        assert_eq!(err.kind, ErrorKind::NoSuchBean);
+    }
 
     #[test]
     fn assembly_report_aggregates_faults() {

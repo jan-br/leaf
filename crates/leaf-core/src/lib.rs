@@ -175,7 +175,7 @@ pub use registry::{is_null_bean, NullMarker, Registry, RegistryBuilder, NULL_BEA
 // family `Lookup`/`LazyRef`/`Inject`/`SelfRef` (resolve-on-demand over a `Weak`
 // `Container` back-ref — single-phase construction, deferral-only cycle break).
 
-pub use injectable::{Injectable, Resolvable};
+pub use injectable::{view_from_holder, Injectable, Resolvable, Resolve};
 
 pub use injectable_ctor::{construct_with, ctor_deps, InjectableCtor};
 
@@ -183,8 +183,8 @@ pub use injection::{
     collect_ordered, layers, no_unique_bean_traced, reject_advised_concrete, resolved_to_result,
     resolved_to_result_traced, trace_to_steps, Arity, Cand, CandidateSet, Cardinality,
     CollectionShape, Container, ContainerRef, DescriptorFilter, Inject, InjectionPlan,
-    InjectionPoint, Layer, LazyRef, Lookup, PointKind, QualifierReq, Resolve, ResolveFn, Resolved,
-    Selector, SelfRef, Strictness, StreamOrder, Trace, Verdict, ViewUpcast, LAYERS,
+    InjectionPoint, Layer, LazyRef, Lookup, PointKind, QualifierReq, ResolveClosure, ResolveFn,
+    Resolved, Selector, SelfRef, Strictness, StreamOrder, Trace, Verdict, ViewUpcast, LAYERS,
 };
 
 // ── UNIT 7 — environment + property binding + conversion ──

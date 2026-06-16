@@ -35,8 +35,8 @@ use std::any::TypeId;
 use std::sync::Arc;
 
 use leaf_core::{
-    AdvisorPairingRow, BeanKey, BoxFuture, Cardinality, Container, ContractId, Interceptor,
-    JoinPointMeta, LeafError, MakeInterceptor, OrderKey, OrderSource, Pointcut, Role,
+    view_from_holder, AdvisorPairingRow, BeanKey, BoxFuture, Cardinality, Container, ContractId,
+    Interceptor, JoinPointMeta, LeafError, MakeInterceptor, OrderKey, OrderSource, Pointcut, Role,
     Strictness, TransactionManager, TxAttribute, TX_ORDER,
 };
 
@@ -164,6 +164,35 @@ where
             let erased = published.into_shared().ok_or_else(manager_mismatch)?;
             let manager: Arc<M> = erased.downcast::<M>().map_err(|_| manager_mismatch())?;
             let manager: Arc<dyn TransactionManager> = manager;
+            let interceptor = TransactionInterceptor::new(manager, TxAttribute::DEFAULT)
+                .with_return_classifier(result_classifier::<T>());
+            Ok(Arc::new(interceptor) as Arc<dyn Interceptor>)
+        }) as BoxFuture<'_, Result<Arc<dyn Interceptor>, LeafError>>
+    }
+}
+
+/// The by-VIEW counterpart of [`make_transaction_interceptor_for`]: resolve the
+/// manager through the GENERAL by-trait injection path — the same
+/// [`Container`]`::resolve_view` primitive a `Ref<dyn TransactionManager>` injection
+/// point drives — rather than by a concrete `TypeId` + downcast.
+///
+/// `#[transactional(manager = dyn TransactionManager)]` emits this (the macro
+/// dispatches on the parameter's SYNTACTIC SHAPE, never a spelled name), so the app
+/// names the VIEW and whatever bean provides `dyn TransactionManager` (the
+/// auto-configured in-memory default, an integration crate's manager, …) backs it —
+/// no concrete pin, no wrapper. `T` is the advised method's `Ok` type (the per-`T`
+/// `Result` classifier rides exactly as in the concrete builder).
+#[must_use]
+pub const fn make_transaction_interceptor_for_view<T>() -> MakeInterceptor
+where
+    T: std::any::Any + Send + 'static,
+{
+    |container: &dyn Container| {
+        Box::pin(async move {
+            let holder =
+                container.resolve_view(TypeId::of::<dyn TransactionManager>()).await?;
+            let manager: Arc<dyn TransactionManager> =
+                view_from_holder::<dyn TransactionManager>(holder)?.into_arc();
             let interceptor = TransactionInterceptor::new(manager, TxAttribute::DEFAULT)
                 .with_return_classifier(result_classifier::<T>());
             Ok(Arc::new(interceptor) as Arc<dyn Interceptor>)

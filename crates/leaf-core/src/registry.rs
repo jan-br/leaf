@@ -271,6 +271,62 @@ impl Registry {
         }
     }
 
+    /// Resolve a `dyn Svc` VIEW `TypeId` to the single providing bean, applying the
+    /// FallbackDemote precedence (a soft `@Fallback` candidate loses to any
+    /// non-fallback of the same view) — the by-trait-injection disambiguation.
+    ///
+    /// This is the view counterpart of the concrete by-type path
+    /// ([`resolve_id`](Self::resolve_id) over a `ByType` key), keyed identically
+    /// through the SAME `by_type`
+    /// index (which indexes every `provides[]` view). The precedence mirrors the
+    /// Selector's STEP-A FallbackDemote: if any non-fallback candidate exists, the
+    /// soft fallbacks are dropped first; the SOLE remaining rule is then `len 0 ->
+    /// NoSuchBean`, `len 1 -> the bean`, `len >1 -> NoUniqueBean`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoSuchBean`] if no bean provides the view; [`ErrorKind::NoUniqueBean`]
+    /// if more than one non-fallback bean provides it (an unresolvable ambiguity).
+    pub fn resolve_view_id(&self, view: TypeId) -> Result<BeanId, LeafError> {
+        let candidates = self.candidates(view);
+        if candidates.is_empty() {
+            return Err(no_such_bean("view"));
+        }
+        // STEP A — FallbackDemote: a soft @Fallback loses to any non-fallback of the
+        // same view (the SEAMS-C5 precedence). Drop the fallbacks iff a non-fallback
+        // coexists, otherwise keep the whole (all-fallback) set.
+        let has_non_fallback = candidates
+            .iter()
+            .any(|id| !self.rows[id.0 as usize].meta.candidate_role.is_fallback());
+        let mut surviving = candidates.iter().copied().filter(|id| {
+            !has_non_fallback || !self.rows[id.0 as usize].meta.candidate_role.is_fallback()
+        });
+        let Some(first) = surviving.next() else {
+            return Err(no_such_bean("view"));
+        };
+        match surviving.next() {
+            None => Ok(first),
+            // More than one survivor: a genuine ambiguity (the registry stops here;
+            // it does NOT pick a winner among non-fallbacks).
+            Some(_) => Err(no_unique_bean(candidates.len())),
+        }
+    }
+
+    /// The `provides[]` upcast row a bean exposes for `view`, if it declares one.
+    ///
+    /// The by-trait-injection seam reads this to coerce the providing bean's
+    /// concrete `Arc` into the requested `dyn Svc` view-holder (the macro-emitted
+    /// const upcast fn — see [`TypeRow`](crate::TypeRow)). Returns `None` if `id`'s
+    /// descriptor declares no row for `view` (a programming error on a resolved
+    /// view — surfaced loudly by the caller).
+    #[must_use]
+    pub fn view_upcast(&self, id: BeanId, view: TypeId) -> Option<crate::definition::UpcastFn> {
+        self.rows[id.0 as usize]
+            .provides
+            .iter()
+            .find(|row| row.view == view)
+            .map(|row| row.upcast)
+    }
+
     fn resolve_by_type_and_name(&self, ty: TypeId, name: &str) -> Result<BeanId, LeafError> {
         // Narrow the named bean by type: the name must resolve AND the resolved
         // slot must be a candidate of `ty`.
@@ -648,7 +704,7 @@ mod tests {
     use std::collections::HashSet;
 
     use crate::definition::{
-        AnnotationMetadata, Role, ScopeDef, TypeRow, UpcastFn,
+        AnnotationMetadata, CandidateRole, Role, ScopeDef, TypeRow, UpcastFn,
     };
     use crate::error::Origin;
     use crate::future::BoxFuture;
@@ -919,6 +975,83 @@ mod tests {
     fn candidates_for_an_unknown_type_is_empty() {
         let reg = RegistryBuilder::new().freeze().expect("freeze");
         assert!(reg.candidates(TypeId::of::<Alpha>()).is_empty());
+    }
+
+    // ── resolve_view_id: by-trait disambiguation by FallbackDemote precedence ────
+
+    // A descriptor with a given candidate_role (for the FallbackDemote precedence).
+    fn descriptor_with_role(
+        contract: &str,
+        self_type: TypeId,
+        name: &'static str,
+        provides: &'static [TypeRow],
+        role: CandidateRole,
+    ) -> Descriptor {
+        let meta: &'static AnnotationMetadata = Box::leak(Box::new(AnnotationMetadata {
+            candidate_role: role,
+            ..AnnotationMetadata::EMPTY
+        }));
+        Descriptor { meta, ..descriptor(contract, self_type, Some(name), provides, &[]) }
+    }
+
+    #[test]
+    fn resolve_view_id_returns_the_sole_provider_and_its_upcast_row() {
+        // One bean providing `dyn Service`: resolve_view_id finds it, and view_upcast
+        // returns the matching provides[] row's upcast fn.
+        let provides = alpha_provides_service();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let d = descriptor("crate::A", TypeId::of::<Alpha>(), Some("a"), provides, &[]);
+        let p: Arc<dyn Provider> = Arc::new(AlphaProvider { descriptor: d, n: 1, calls });
+        let mut b = RegistryBuilder::new();
+        let id = b.register(d, p).expect("a");
+        let reg = b.freeze().expect("freeze");
+
+        let resolved = reg.resolve_view_id(TypeId::of::<dyn Service>()).expect("view resolves");
+        assert_eq!(resolved, id);
+        assert!(reg.view_upcast(id, TypeId::of::<dyn Service>()).is_some());
+        // A view the bean does NOT provide has no upcast row.
+        assert!(reg.view_upcast(id, TypeId::of::<Beta>()).is_none());
+    }
+
+    #[test]
+    fn resolve_view_id_drops_a_soft_fallback_in_favor_of_a_non_fallback() {
+        // Two beans providing `dyn Service`: a0 is @Fallback, a1 is Normal. The
+        // non-fallback wins (the SEAMS-C5 FallbackDemote precedence).
+        let provides = alpha_provides_service();
+        let d0 = descriptor_with_role("crate::A0", TypeId::of::<Alpha>(), "a0", provides, CandidateRole::FALLBACK);
+        let calls0 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p0: Arc<dyn Provider> = Arc::new(AlphaProvider { descriptor: d0, n: 1, calls: calls0 });
+        let d1 = descriptor_with_role("crate::A1", TypeId::of::<Alpha>(), "a1", provides, CandidateRole::NORMAL);
+        let calls1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p1: Arc<dyn Provider> = Arc::new(AlphaProvider { descriptor: d1, n: 2, calls: calls1 });
+        let mut b = RegistryBuilder::new();
+        b.register(d0, p0).expect("a0");
+        let id1 = b.register(d1, p1).expect("a1");
+        let reg = b.freeze().expect("freeze");
+
+        let resolved = reg.resolve_view_id(TypeId::of::<dyn Service>()).expect("non-fallback wins");
+        assert_eq!(resolved, id1);
+    }
+
+    #[test]
+    fn resolve_view_id_two_non_fallbacks_is_no_unique_bean_and_unknown_is_no_such_bean() {
+        let provides = alpha_provides_service();
+        let d0 = descriptor_with_role("crate::A0", TypeId::of::<Alpha>(), "a0", provides, CandidateRole::NORMAL);
+        let calls0 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p0: Arc<dyn Provider> = Arc::new(AlphaProvider { descriptor: d0, n: 1, calls: calls0 });
+        let d1 = descriptor_with_role("crate::A1", TypeId::of::<Alpha>(), "a1", provides, CandidateRole::NORMAL);
+        let calls1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p1: Arc<dyn Provider> = Arc::new(AlphaProvider { descriptor: d1, n: 2, calls: calls1 });
+        let mut b = RegistryBuilder::new();
+        b.register(d0, p0).expect("a0");
+        b.register(d1, p1).expect("a1");
+        let reg = b.freeze().expect("freeze");
+
+        let err = reg.resolve_view_id(TypeId::of::<dyn Service>()).expect_err("ambiguous");
+        assert_eq!(err.kind, ErrorKind::NoUniqueBean);
+        // A view nobody provides is NoSuchBean.
+        let err2 = reg.resolve_view_id(TypeId::of::<Beta>()).expect_err("unknown view");
+        assert_eq!(err2.kind, ErrorKind::NoSuchBean);
     }
 
     // ── name collision is a loud error (override disabled) ─────────────────────

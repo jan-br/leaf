@@ -80,12 +80,13 @@ pub use leaf_core::*;
 // resolve `::leaf_cache::X` / `::leaf_tx::X` to `leaf::X`.
 #[doc(hidden)]
 pub use leaf_cache::{
-    build_cache_interceptor, cache_order_key, unit_key_fn, CacheKeyFn, CacheOp, CachePointcut,
-    CacheRule, InMemoryCacheManager,
+    build_cache_interceptor, build_cache_interceptor_view, cache_order_key, unit_key_fn,
+    CacheKeyFn, CacheOp, CachePointcut, CacheRule, InMemoryCacheManager,
 };
 #[doc(hidden)]
 pub use leaf_tx::{
-    make_transaction_interceptor_for, tx_order_key, InMemoryTransactionManager, TxPointcut,
+    make_transaction_interceptor_for, make_transaction_interceptor_for_view, tx_order_key,
+    InMemoryTransactionManager, TxPointcut,
 };
 
 // ── flat re-exports of the three foundation crates (so `leaf::core`, `leaf::boot`,

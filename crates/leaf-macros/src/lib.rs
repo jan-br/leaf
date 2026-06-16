@@ -209,6 +209,22 @@ pub fn bean(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[injectable]` on a `trait Foo` — make `dyn Foo` an injectable VIEW.
+///
+/// Emits the trait verbatim PLUS one `impl ::leaf_core::Resolve for dyn Foo` (the
+/// by-trait-injection per-view seam): a consumer can then inject `Ref<dyn Foo>` and
+/// resolve to whatever bean `provides`-declares the `dyn Foo` view, through the SAME
+/// `by_type`/resolve path as a concrete `Ref<T>` — NO per-injection-point / per-bean
+/// special-casing, and NO type-name detection (dispatch is the emitted `Resolve`
+/// impl over the `dyn`-view `TypeId`). Emitted ONCE per trait (orphan-rule-OK:
+/// `dyn Foo` is local to the trait's crate).
+#[proc_macro_attribute]
+pub fn injectable(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as syn::ItemTrait);
+    let resolve_impl = leaf_codegen::descriptor::emit_injectable_trait(&parsed.ident);
+    quote! { #parsed #resolve_impl }.into()
+}
+
 /// `register_component!(Concrete)` — register a CONCRETE type as a `@component`
 /// (the escape hatch for a generic component: `register_component!(Repo<u32>)`).
 ///

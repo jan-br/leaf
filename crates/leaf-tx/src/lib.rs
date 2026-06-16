@@ -70,7 +70,8 @@ use leaf_core::{Cx, LeafError, TxPhase, TxResourceKey, TxState};
 
 pub use advisor::{
     enable_transaction_management, make_transaction_interceptor, make_transaction_interceptor_for,
-    tx_advisor_contract, tx_advisor_pairing, tx_advisor_pairing_for, tx_order_key, TxPointcut,
+    make_transaction_interceptor_for_view, tx_advisor_contract, tx_advisor_pairing,
+    tx_advisor_pairing_for, tx_order_key, TxPointcut,
 };
 pub use autoconfig::{
     transaction_manager_descriptor, TxAutoConfig, TRANSACTION_MANAGER_BEAN,

@@ -15,9 +15,9 @@
 //!    allocation-free and branch-only).
 //! 2. ONE candidate SET, keyed for FILTERING only — [`CandidateSet`] of [`Cand`]
 //!    read-views over the frozen registry; it produces the set, it NEVER selects.
-//! 3. ONE deferral driver — [`resolve`](Resolve) over the renamed consumer family
+//! 3. ONE deferral driver — [`ResolveClosure`] over the renamed consumer family
 //!    [`Lookup`]/[`LazyRef`]/[`Inject`], with [`SelfRef`] for self-injection. The
-//!    handle holds the ownership-model `Resolve = Arc<dyn Fn(..) -> BoxFuture>`
+//!    handle holds the ownership-model `ResolveClosure = Arc<dyn Fn(..) -> BoxFuture>`
 //!    closure over a [`Weak`] container back-ref (no `Arc` cycle).
 //!    These are the HONEST VISIBLE handles (the docs' own preference): advice is
 //!    transparent `dyn Svc`, but the deferral family is a visible-in-the-type
@@ -61,7 +61,7 @@ use smallvec::SmallVec;
 use crate::definition::CandidateRole;
 use crate::error::{CandidateInfo, Cause, CauseDetail, ErrorKind, LeafError, NarrowStep};
 use crate::future::BoxFuture;
-use crate::handle::{downcast_ref, Published, Ref};
+use crate::handle::{downcast_ref, ErasedBean, Published, Ref};
 use crate::identity::{BeanId, BeanKey, MarkerId};
 use crate::order::{cmp_order, OrderKey};
 
@@ -1008,7 +1008,11 @@ pub type ResolveFn = dyn Fn(BeanKey, Strictness, Cardinality) -> BoxFuture<'stat
     + Sync;
 
 /// The captured resolve closure, ref-counted so each handle clone is cheap.
-pub type Resolve = Arc<ResolveFn>;
+///
+/// (Renamed from `Resolve` to free that name for the by-trait-injection
+/// [`Resolve`](crate::Resolve) trait — the deferral-handle resolution VERB; this is
+/// the captured CLOSURE the deferral family holds.)
+pub type ResolveClosure = Arc<ResolveFn>;
 
 /// The ordering applied to a multi-candidate enumeration ([`Container::resolve_many`]).
 ///
@@ -1074,6 +1078,34 @@ pub trait Container: Send + Sync {
             }
         })
     }
+
+    /// Resolve a `dyn Svc` VIEW `TypeId` to the providing bean, handing back the
+    /// view-HOLDER [`ErasedBean`] (an `Arc<Arc<dyn Svc>>`) — the SAME by-trait
+    /// primitive [`Engine::resolve_view`](crate::Engine::resolve_view) /
+    /// [`ResolveCtx::resolve_view`](crate::ResolveCtx::resolve_view) drive for a
+    /// `Ref<dyn Svc>` injection point, exposed here so a
+    /// [`MakeInterceptor`](crate::MakeInterceptor) bean bridge (which only holds a
+    /// `&dyn Container`) can resolve a manager NAMED BY ITS VIEW (`dyn CacheManager` /
+    /// `dyn TransactionManager`) through the ordinary container.
+    ///
+    /// A PROVIDED method: the kernel default has no view index, so it surfaces a loud
+    /// [`ErrorKind::NoSuchBean`] (never a silent unit); the engine container overrides
+    /// it with the real [`Engine::resolve_view`](crate::Engine::resolve_view).
+    /// Reconstitute the typed `Ref<dyn Svc>` from the holder with
+    /// [`view_from_holder`](crate::view_from_holder).
+    ///
+    /// # Errors
+    /// [`ErrorKind::NoSuchBean`]/[`ErrorKind::NoUniqueBean`] on view resolution; a
+    /// construction fault; or [`ErrorKind::ConstructionFailed`] for a malformed view row.
+    fn resolve_view(&self, view: TypeId) -> BoxFuture<'_, Result<ErasedBean, LeafError>> {
+        let _ = view;
+        Box::pin(async move {
+            Err(LeafError::new(ErrorKind::NoSuchBean).caused_by(Cause::plain(
+                "resolving by-trait view",
+                "this container has no by-trait view index (resolve_view is unsupported here)",
+            )))
+        })
+    }
 }
 
 /// The shared back-reference a deferral handle holds: a [`Weak`] to the
@@ -1112,7 +1144,7 @@ pub type ViewUpcast<T> = fn(Published) -> Result<Ref<T>, LeafError>;
 /// call path; the stream methods are the lazy collection counterpart (same
 /// [`cmp_order`] as the eager `Vec`, so ordering never diverges); `get_view` is
 /// the `dyn Svc` (`?Sized`)-target variant over the `provides[]` upcast row.
-/// Resolution runs on the CALLER's task through the captured [`Resolve`] closure.
+/// Resolution runs on the CALLER's task through the captured [`ResolveClosure`].
 pub struct Lookup<T: ?Sized> {
     key: BeanKey,
     container: ContainerRef,

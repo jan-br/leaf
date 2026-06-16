@@ -7,8 +7,8 @@ error[E0277]: the trait bound `Atomic<u64>: Injectable` is not satisfied
 help: the following other types implement trait `Injectable`
   --> $WORKSPACE/crates/leaf-core/src/injectable.rs
    |
-   | impl<T: Bean> Injectable for Ref<T> {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `leaf_core::Ref<T>`
+   | impl<X: ?Sized + Resolve> Injectable for Ref<X> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `leaf_core::Ref<X>`
 ...
    | impl<T: Bean> Injectable for Lookup<T> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Lookup<T>`

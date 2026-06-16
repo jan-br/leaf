@@ -154,6 +154,48 @@ where
         as Arc<dyn Interceptor>)
 }
 
+/// Resolve the cache manager through the GENERAL by-trait injection path: the same
+/// [`Container`]`::resolve_view` primitive a `Ref<dyn CacheManager>` injection point
+/// drives, reconstituting the typed view via
+/// [`view_from_holder`](leaf_core::view_from_holder).
+///
+/// # Errors
+/// A [`LeafError`] if no bean provides the `dyn CacheManager` view (or the view is
+/// ambiguous / the holder is malformed).
+pub async fn resolve_manager_view(
+    container: &dyn Container,
+) -> Result<Arc<dyn leaf_core::CacheManager>, LeafError> {
+    let holder = container.resolve_view(TypeId::of::<dyn leaf_core::CacheManager>()).await?;
+    Ok(leaf_core::view_from_holder::<dyn leaf_core::CacheManager>(holder)?.into_arc())
+}
+
+/// The by-VIEW counterpart of [`build_cache_interceptor`]: resolve the manager
+/// through the GENERAL by-trait path ([`resolve_manager_view`]) rather than by a
+/// concrete `TypeId` + downcast, then build the same single-rule [`CacheInterceptor`].
+///
+/// `#[cacheable("prices", … manager = dyn CacheManager)]` emits this (the macro
+/// dispatches on the parameter's SYNTACTIC SHAPE, never a spelled name), so the app
+/// names the VIEW and whatever bean provides `dyn CacheManager` backs it — the
+/// auto-configured in-memory default, or a Redis-backed `RedisCacheManager` when its
+/// auto-config is active — with no concrete pin and no wrapper.
+///
+/// # Errors
+/// A [`LeafError`] if the `dyn CacheManager` view resolution fails.
+pub async fn build_cache_interceptor_view<T>(
+    container: &dyn Container,
+    method: leaf_core::MethodKey,
+    op: CacheOp,
+    meta: &'static leaf_core::CacheOpMeta,
+    key_fn: CacheKeyFn,
+) -> Result<Arc<dyn Interceptor>, LeafError>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let manager = resolve_manager_view(container).await?;
+    Ok(Arc::new(CacheInterceptor::single::<T>(manager, method, op, meta, key_fn))
+        as Arc<dyn Interceptor>)
+}
+
 fn manager_mismatch() -> LeafError {
     LeafError::new(leaf_core::ErrorKind::ConstructionFailed).caused_by(leaf_core::Cause::plain(
         "cache advisor make_interceptor",

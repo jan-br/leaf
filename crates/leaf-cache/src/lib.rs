@@ -69,8 +69,9 @@ pub mod value;
 leaf_core::declare_source!("leaf-cache");
 
 pub use advisor::{
-    build_cache_interceptor, cache_advisor_contract, cache_advisor_pairing, cache_order_key,
-    enable_caching, resolve_manager, CachePointcut,
+    build_cache_interceptor, build_cache_interceptor_view, cache_advisor_contract,
+    cache_advisor_pairing, cache_order_key, enable_caching, resolve_manager, resolve_manager_view,
+    CachePointcut,
 };
 pub use autoconfig::{
     cache_manager_descriptor, CacheAutoConfig, CACHE_AUTO_CONFIG_GUARD, CACHE_MANAGER_BEAN,

@@ -185,6 +185,32 @@ impl<'a> ResolveCtx<'a> {
         engine.get::<T>().await
     }
 
+    /// Resolve a `dyn Svc` VIEW `TypeId` through the engine back-reference,
+    /// returning the view-HOLDER [`ErasedBean`](crate::ErasedBean) (an
+    /// `Arc<Arc<dyn Svc>>`) the [`Injectable`](crate::Injectable) seam downcasts to
+    /// a typed `Ref<dyn Svc>`.
+    ///
+    /// The view counterpart of [`resolve_ref`](ResolveCtx::resolve_ref): the SAME
+    /// one resolution seam, delegating to [`Engine::resolve_view`](crate::Engine::resolve_view)
+    /// (the by-trait-injection primitive). A `Ref<ConcreteType>` is unaffected — it
+    /// keeps routing through `resolve_ref`.
+    ///
+    /// # Errors
+    /// [`ErrorKind::ConstructionFailed`](crate::ErrorKind::ConstructionFailed) if no
+    /// engine back-reference is threaded; otherwise any [`LeafError`] from the view
+    /// resolution (missing/ambiguous provider or a construction fault).
+    pub async fn resolve_view(&self, view: TypeId) -> Result<crate::handle::ErasedBean, LeafError> {
+        let engine = self.engine.ok_or_else(|| {
+            LeafError::new(crate::error::ErrorKind::ConstructionFailed).caused_by(
+                crate::error::Cause::plain(
+                    "resolving an injected dyn-view dependency",
+                    "the resolution context carries no engine back-reference",
+                ),
+            )
+        })?;
+        engine.resolve_view(view).await
+    }
+
     /// The ambient [`InstanceStore`](crate::lifecycle_engine::InstanceStore) for
     /// `kind`, if a scope-store accessor is installed AND it binds `kind`.
     ///

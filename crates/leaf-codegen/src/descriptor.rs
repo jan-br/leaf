@@ -358,7 +358,7 @@ pub fn emit(input: &BeanInput) -> Result<TokenStream, EmitError> {
     let role = input.role.tokens();
     let scope = input.scope.tokens();
     let meta = input.meta.lower();
-    let provides = emit_provides(&input.provides);
+    let provides = emit_provides(self_ty, &input.provides);
 
     // Unique, hygienic-ish identifiers for the emitted helper items. The macro
     // mangles on the bean ident so two beans in one module never collide.
@@ -590,9 +590,17 @@ fn emit_injection_points(deps: &[Dependency], inject_via_trait: bool) -> Vec<Tok
 
 /// Lower the declared `dyn Svc` views to a const `&[::leaf_core::TypeRow]`.
 ///
-/// Each row pairs the view `TypeId` with a const fn-pointer that re-erases the
-/// bean's `Arc` through the `dyn Svc` view (trait upcasting, stable since 1.86).
-fn emit_provides(provides: &[ServiceView]) -> TokenStream {
+/// Each row pairs the view `TypeId` with a const fn-pointer that coerces the bean's
+/// concrete `Arc` into the `dyn Svc` VIEW-HOLDER the by-trait-injection seam reads:
+/// it downcasts the erased bean to the concrete `#self_ty`, unsizes the `Arc` to
+/// `Arc<dyn Svc>` (trait upcasting, stable since 1.86), then RE-ERASES that
+/// `Arc<dyn Svc>` as a double-`Arc` (`Arc<Arc<dyn Svc>>`) erased handle —
+/// recoverable, typed and `unsafe`-free, by `::leaf_core::view_from_holder::<dyn Svc>`
+/// at the [`Injectable`](leaf_core::Injectable) seam (`Engine::resolve_view` applies
+/// this fn to the providing bean's published handle). A downcast miss falls back to
+/// the original erased bean (the view simply will not recover — surfaced loudly as a
+/// construction fault, never a silent wrong handle).
+fn emit_provides(self_ty: &Type, provides: &[ServiceView]) -> TokenStream {
     if provides.is_empty() {
         return quote! { &[] };
     }
@@ -602,7 +610,15 @@ fn emit_provides(provides: &[ServiceView]) -> TokenStream {
         quote! {
             ::leaf_core::TypeRow {
                 view: #view,
-                upcast: |__bean: ::leaf_core::ErasedBean| -> ::leaf_core::ErasedBean { __bean },
+                upcast: |__bean: ::leaf_core::ErasedBean| -> ::leaf_core::ErasedBean {
+                    match __bean.downcast::<#self_ty>() {
+                        ::core::result::Result::Ok(__concrete) => {
+                            let __view: ::std::sync::Arc<#dyn_ty> = __concrete;
+                            ::std::sync::Arc::new(__view) as ::leaf_core::ErasedBean
+                        }
+                        ::core::result::Result::Err(__orig) => __orig,
+                    }
+                },
             }
         }
     });
@@ -772,6 +788,24 @@ fn emit_provider(
                 })
             }
         }
+    }
+}
+
+/// Emit the by-trait-injection per-view artifact for `#[injectable] trait Foo`: the
+/// trait verbatim PLUS one `impl ::leaf_core::Resolve for dyn Foo` (via the
+/// `::leaf_core::impl_resolve_view!` macro), so `Ref<dyn Foo>` is injectable —
+/// resolving to whatever bean `provides`-declares the `dyn Foo` view, through the
+/// SAME path as a concrete `Ref<T>`.
+///
+/// The impl is emitted ONCE per trait (orphan-rule-OK: `dyn Foo` is local to the
+/// trait's crate). The framework's own `dyn CacheManager`/`dyn TransactionManager`
+/// use the hand-written `impl_resolve_view!` directly; user traits use this attr.
+/// The trait ident is referenced verbatim — NO name-based behavior, the dispatch is
+/// purely the emitted `Resolve` impl over the `dyn`-view `TypeId`.
+#[must_use]
+pub fn emit_injectable_trait(trait_ident: &syn::Ident) -> TokenStream {
+    quote! {
+        ::leaf_core::impl_resolve_view!(dyn #trait_ident);
     }
 }
 
@@ -1106,6 +1140,13 @@ mod tests {
         );
         // The upcast row carries a const fn-pointer over ErasedBean.
         assert!(s.contains("upcast:|__bean:::leaf_core::ErasedBean|"), "got: {s}");
+        // It coerces the concrete Arc into the `dyn Svc` view-HOLDER (downcast to the
+        // concrete self_ty, unsize, re-erase as the double-Arc) — the by-trait seam.
+        assert!(s.contains("__bean.downcast::<Foo>()"), "got: {s}");
+        assert!(
+            s.contains("let__view:::std::sync::Arc<dynGreeter>=__concrete;"),
+            "got: {s}"
+        );
     }
 
     #[test]
@@ -1192,6 +1233,22 @@ mod tests {
         assert!(s.contains("__recv.pool(__dep_cfg)"), "got: {s}");
         // It must NOT call an inherent `Pool::new` or a free `pool(..)`.
         assert!(!s.contains("<Pool>::new("), "a config-method bean is not a ::new ctor: {s}");
+    }
+
+    #[test]
+    fn injectable_trait_emits_one_per_view_resolve_impl() {
+        // `#[injectable] trait Greeter {..}` emits a single
+        // `impl ::leaf_core::Resolve for dyn Greeter` (via the impl_resolve_view!
+        // macro) so `Ref<dyn Greeter>` is injectable — the by-trait-injection seam.
+        let ident = syn::Ident::new("Greeter", proc_macro2::Span::call_site());
+        let ts = emit_injectable_trait(&ident);
+        let s = flat(&ts);
+        assert!(
+            s.contains("::leaf_core::impl_resolve_view!(dynGreeter)"),
+            "got: {s}"
+        );
+        // The emitted tokens parse as an item (a macro invocation in item position).
+        syn::parse2::<syn::File>(ts).expect("the emitted artifact is valid Rust items");
     }
 
     #[test]

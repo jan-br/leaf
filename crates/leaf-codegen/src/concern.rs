@@ -118,12 +118,37 @@ pub struct MethodSig {
 
 // ─────────────────────────── attribute parsing ──────────────────────────────
 
+/// A `manager = …` / `gate = …` parameter TYPE, carrying the SYNTACTIC SHAPE the
+/// emitter dispatches on — NEVER a spelled name.
+///
+/// `manager = LedgerTxManager` ([`syn::Type::Path`]) resolves the CONCRETE manager
+/// by its `TypeId` + downcast (the existing, unchanged behavior); `manager = dyn
+/// TransactionManager` ([`syn::Type::TraitObject`]) resolves the manager through the
+/// GENERAL by-trait injection path (the same `resolve_view` primitive a `Ref<dyn
+/// Svc>` injection point drives). [`ManagerRef::is_trait_object`] reads `syn::Type`'s
+/// VARIANT, so the dispatch is purely structural.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagerRef {
+    /// The parsed parameter type (a concrete path, or a `dyn Trait` trait object).
+    pub ty: Type,
+}
+
+impl ManagerRef {
+    /// `true` iff this names a `dyn Trait` VIEW (a [`syn::Type::TraitObject`]) — the
+    /// by-trait path. Dispatch on the type's syntactic shape, never a spelled name.
+    #[must_use]
+    pub fn is_trait_object(&self) -> bool {
+        matches!(self.ty, Type::TraitObject(_))
+    }
+}
+
 /// The parsed `#[transactional(manager = Mgr, rollback_for(Kind), …)]` args.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionalArgs {
-    /// The concrete `TransactionManager` bean TYPE the advisor resolves (required —
-    /// there is no default manager bean type). `manager = LedgerTxManager`.
-    pub manager: Option<String>,
+    /// The `TransactionManager` the advisor resolves (required — there is no default
+    /// manager). A concrete type (`manager = LedgerTxManager`) OR a trait-object view
+    /// (`manager = dyn TransactionManager`).
+    pub manager: Option<ManagerRef>,
 }
 
 /// The parsed `#[cacheable(cache = "users", key = "#0", manager = Mgr)]` args.
@@ -131,8 +156,9 @@ pub struct TransactionalArgs {
 pub struct CacheableArgs {
     /// The cache name(s) (`cache = "users"` or a leading positional string).
     pub cache_names: Vec<String>,
-    /// The cache-manager bean TYPE the advisor resolves (required).
-    pub manager: Option<String>,
+    /// The cache manager the advisor resolves (required). A concrete type OR a
+    /// trait-object view (`manager = dyn CacheManager`).
+    pub manager: Option<ManagerRef>,
     /// `key = "#0"` keys on argument 0 (the only supported key form in v1);
     /// `None` keys on a single per-method entry (the unit key).
     pub key_arg: Option<usize>,
@@ -190,7 +216,7 @@ pub fn parse_transactional(attr: TokenStream) -> Result<TransactionalArgs, EmitE
     for item in attr_items(attr, "transactional")? {
         match item {
             AttrItem::Assign { key, value } if key == "manager" => {
-                args.manager = Some(type_value(&value, "manager")?);
+                args.manager = Some(ManagerRef { ty: type_value(value, "manager")? });
             }
             AttrItem::Assign { key, .. } => return Err(unknown(&key, "transactional", "manager")),
             AttrItem::Call { name, .. } if name == "rollback_for" || name == "no_rollback_for" => {
@@ -235,15 +261,16 @@ pub fn parse_cache(attr: TokenStream, concern: Concern) -> Result<CacheableArgs,
             AttrItem::Positional(e) => return Err(positional(&e, kw)),
             AttrItem::Assign { key, value } => match key.as_str() {
                 "cache" | "value" => {
+                    let value = value.expect_expr(&key)?;
                     let name = str_value(&value).ok_or_else(|| EmitError {
                         message: format!("`{key}` must be a cache-name string"),
                     })?;
                     args.cache_names.push(name);
                 }
-                "manager" => args.manager = Some(type_value(&value, "manager")?),
-                "key" => args.key_arg = Some(parse_key(&value)?),
-                "all_entries" => args.all_entries = bool_value(&value)?,
-                "sync" => args.sync = bool_value(&value)?,
+                "manager" => args.manager = Some(ManagerRef { ty: type_value(value, "manager")? }),
+                "key" => args.key_arg = Some(parse_key(&value.expect_expr(&key)?)?),
+                "all_entries" => args.all_entries = bool_value(&value.expect_expr(&key)?)?,
+                "sync" => args.sync = bool_value(&value.expect_expr(&key)?)?,
                 other => {
                     return Err(EmitError {
                         message: format!(
@@ -278,8 +305,8 @@ pub fn parse_retryable(attr: TokenStream) -> Result<RetryableArgs, EmitError> {
     for item in attr_items(attr, "retryable")? {
         match item {
             AttrItem::Assign { key, value } => match key.as_str() {
-                "max" | "max_attempts" => args.max = uint_value(&value)? as u32,
-                "backoff" => args.backoff = parse_backoff(&value)?,
+                "max" | "max_attempts" => args.max = uint_value(&value.expect_expr(&key)?)? as u32,
+                "backoff" => args.backoff = parse_backoff(&value.expect_expr(&key)?)?,
                 other => return Err(unknown(other, "retryable", "max/backoff")),
             },
             AttrItem::Call { name, .. } if name == "backoff" => {
@@ -309,7 +336,8 @@ pub fn parse_concurrency_limit(attr: TokenStream) -> Result<ConcurrencyLimitArgs
             AttrItem::Positional(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(_), .. })) => {}
             AttrItem::Positional(e) => return Err(positional(&e, "concurrency_limit")),
             AttrItem::Assign { key, value } if key == "gate" => {
-                args.gate = Some(type_value(&value, "gate")?);
+                let ty = type_value(value, "gate")?;
+                args.gate = Some(quote! { #ty }.to_string());
             }
             AttrItem::Assign { key, .. } => return Err(unknown(&key, "concurrency_limit", "gate")),
             AttrItem::Call { name, .. } => return Err(unknown(&name, "concurrency_limit", "gate")),
@@ -508,12 +536,22 @@ fn emit_transactional(
     let types_ident = format_ident!("__LEAF_TX_TYPES_{}", base);
     let pointcut_ident = format_ident!("__LEAF_TX_POINTCUT_{}", base);
     let row_ident = format_ident!("__LEAF_TX_ADVISOR_{}", base);
-    let manager: Type = syn::parse_str(args.manager.as_deref().unwrap_or_default())
-        .map_err(|e| EmitError { message: format!("`manager` is not a type: {e}") })?;
+    let manager = args.manager.as_ref().ok_or_else(|| EmitError {
+        message: "#[transactional] requires `manager = …`".into(),
+    })?;
     let ret = result_ok_ty(&sig.ret_type);
     let contract = unique_contract("leaf::tx::TransactionAdvisor", bean_ident, sig);
     let statics =
         pointcut_statics(self_ty, &types_ident, &pointcut_ident, quote! { ::leaf_tx::TxPointcut });
+    // Dispatch on the manager parameter's SYNTACTIC SHAPE (never a spelled name): a
+    // `dyn TransactionManager` trait object resolves through the GENERAL by-trait
+    // injection path (resolve_view); a concrete type keeps the ByType + downcast path.
+    let make = if manager.is_trait_object() {
+        quote! { ::leaf_tx::make_transaction_interceptor_for_view::<#ret>() }
+    } else {
+        let mty = &manager.ty;
+        quote! { ::leaf_tx::make_transaction_interceptor_for::<#mty, #ret>() }
+    };
     Ok(quote! {
         #statics
         // The tx advisor auto-wire row: the named manager `M` + the `Result<T,_>`
@@ -528,7 +566,7 @@ fn emit_transactional(
             order: ::leaf_tx::tx_order_key(),
             role: ::leaf_core::Role::Infrastructure,
             pointcut: &#pointcut_ident,
-            make_interceptor: ::leaf_tx::make_transaction_interceptor_for::<#manager, #ret>(),
+            make_interceptor: #make,
         };
     })
 }
@@ -549,8 +587,9 @@ fn emit_cache(
     let meta_ident = format_ident!("__LEAF_CACHE_META_{}", base);
     let row_ident = format_ident!("__LEAF_CACHE_ADVISOR_{}", base);
 
-    let manager: Type = syn::parse_str(args.manager.as_deref().unwrap_or_default())
-        .map_err(|e| EmitError { message: format!("`manager` is not a type: {e}") })?;
+    let manager = args.manager.as_ref().ok_or_else(|| EmitError {
+        message: format!("#[{}] requires `manager = …`", concern.keyword()),
+    })?;
     let names = args.cache_names.iter().map(|n| quote! { #n });
     let all = args.all_entries;
     let sync = args.sync;
@@ -605,6 +644,32 @@ fn emit_cache(
         &pointcut_ident,
         quote! { ::leaf_cache::CachePointcut },
     );
+    // Dispatch on the manager parameter's SYNTACTIC SHAPE (never a spelled name): a
+    // `dyn CacheManager` trait object resolves through the GENERAL by-trait injection
+    // path (resolve_view); a concrete type keeps the ByType + downcast path. Only the
+    // builder fn differs — the per-method op/meta/key/T are baked identically.
+    let build = if manager.is_trait_object() {
+        quote! {
+            ::leaf_cache::build_cache_interceptor_view::<#value_ty>(
+                __c,
+                ::leaf_core::MethodKey::of(#method_key),
+                #op,
+                &#meta_ident,
+                #key_fn,
+            )
+        }
+    } else {
+        let mty = &manager.ty;
+        quote! {
+            ::leaf_cache::build_cache_interceptor::<#mty, #value_ty>(
+                __c,
+                ::leaf_core::MethodKey::of(#method_key),
+                #op,
+                &#meta_ident,
+                #key_fn,
+            )
+        }
+    };
     Ok(quote! {
         #statics
         // The PUBLIC per-method CacheOpMeta const the cache interceptor reads.
@@ -628,13 +693,7 @@ fn emit_cache(
             role: ::leaf_core::Role::Infrastructure,
             pointcut: &#pointcut_ident,
             make_interceptor: |__c: &dyn ::leaf_core::Container| {
-                ::std::boxed::Box::pin(::leaf_cache::build_cache_interceptor::<#manager, #value_ty>(
-                    __c,
-                    ::leaf_core::MethodKey::of(#method_key),
-                    #op,
-                    &#meta_ident,
-                    #key_fn,
-                ))
+                ::std::boxed::Box::pin(#build)
             },
         };
     })
@@ -835,8 +894,10 @@ fn result_ok_ty(ret: &Type) -> Type {
 /// One parsed top-level attribute item: `key = value`, `name(..)` call, or a bare
 /// positional expression.
 enum AttrItem {
-    /// `key = value`.
-    Assign { key: String, value: syn::Expr },
+    /// `key = value`. The value is captured as a [`syn::Type`] when `key` is a
+    /// type-valued key (`manager`/`gate` — so `manager = dyn CacheManager` parses,
+    /// where a `syn::Expr` cannot), else as a [`syn::Expr`].
+    Assign { key: String, value: AttrValue },
     /// `name(inner, …)` (e.g. `rollback_for(Kind)`) — only the callee name is read
     /// (the rollback-rule list is accepted; the default any-`Err` rule applies in v1).
     Call { name: String },
@@ -844,32 +905,108 @@ enum AttrItem {
     Positional(syn::Expr),
 }
 
+/// The right-hand side of a `key = value` item: a TYPE (for the type-valued
+/// `manager`/`gate` keys, so a `dyn Trait` trait object parses) or an EXPRESSION
+/// (every other key — strings, bools, ints, the `backoff = …` calls).
+enum AttrValue {
+    /// A type RHS (`manager = dyn CacheManager` / `manager = Concrete` / `gate = G`).
+    Type(Type),
+    /// An expression RHS (`cache = "u"`, `key = "#0"`, `max = 3`, `backoff = …`).
+    Expr(syn::Expr),
+}
+
+/// Keys whose `key = value` RHS is parsed as a [`syn::Type`] rather than a
+/// [`syn::Expr`] — so a trait-object view (`dyn CacheManager`) is acceptable. A
+/// concrete path is a valid `syn::Type` too, so the concrete form is unaffected.
+fn is_type_valued_key(key: &str) -> bool {
+    matches!(key, "manager" | "gate")
+}
+
 /// Parse an attribute body into its top-level comma-separated items.
+///
+/// Hand-split on top-level commas (respecting `()`/`[]`/`{}` nesting) so each segment
+/// can be parsed on its own grammar: a `manager = …` / `gate = …` segment parses its
+/// RHS as a [`syn::Type`] (a `dyn Trait` trait object is a type, NOT a `syn::Expr`),
+/// while every other segment parses as a [`syn::Expr`] exactly as before.
 fn attr_items(attr: TokenStream, kw: &str) -> Result<Vec<AttrItem>, EmitError> {
     if attr.is_empty() {
         return Ok(Vec::new());
     }
-    let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
-    let exprs = syn::parse::Parser::parse2(parser, attr).map_err(|e| EmitError {
-        message: format!("malformed #[{kw}] arguments: {e}"),
-    })?;
     let mut items = Vec::new();
-    for expr in exprs {
-        match expr {
-            syn::Expr::Assign(assign) => {
-                let key = assign_ident(&assign.left)?;
-                items.push(AttrItem::Assign { key, value: *assign.right });
-            }
-            syn::Expr::Call(call) => {
-                let name = call_name(&call.func).ok_or_else(|| EmitError {
-                    message: format!("#[{kw}]: a call argument needs a bare name, e.g. `rollback_for(..)`"),
-                })?;
-                items.push(AttrItem::Call { name });
-            }
-            other => items.push(AttrItem::Positional(other)),
-        }
+    for segment in split_top_level_commas(attr) {
+        items.push(parse_attr_item(segment, kw)?);
     }
     Ok(items)
+}
+
+/// Split a token stream on its TOP-LEVEL commas (a comma not nested inside any
+/// delimiter group), dropping the separators. Trailing empty segments are skipped.
+fn split_top_level_commas(attr: TokenStream) -> Vec<TokenStream> {
+    let mut segments = Vec::new();
+    let mut current = TokenStream::new();
+    for tt in attr {
+        match &tt {
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == ',' => {
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.extend(std::iter::once(tt)),
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Parse ONE comma-separated segment into an [`AttrItem`]: a `key = value` assign
+/// (value parsed as a [`syn::Type`] for `manager`/`gate`, else a [`syn::Expr`]), a
+/// `name(..)` call, or a bare positional expression.
+fn parse_attr_item(segment: TokenStream, kw: &str) -> Result<AttrItem, EmitError> {
+    // A `key = …` assign: peel the leading `ident =`, then parse the RHS on the
+    // grammar the key selects (Type for manager/gate so `dyn Trait` is accepted).
+    if let Some((key, rhs)) = split_assign(&segment) {
+        if is_type_valued_key(&key) {
+            let ty: Type = syn::parse2(rhs).map_err(|e| EmitError {
+                message: format!("`{key}` must be a bean TYPE (a path or `dyn Trait`): {e}"),
+            })?;
+            return Ok(AttrItem::Assign { key, value: AttrValue::Type(ty) });
+        }
+        let expr: syn::Expr = syn::parse2(rhs).map_err(|e| EmitError {
+            message: format!("malformed #[{kw}] argument `{key} = …`: {e}"),
+        })?;
+        return Ok(AttrItem::Assign { key, value: AttrValue::Expr(expr) });
+    }
+    // Not an assign: parse the whole segment as an expression (a call or positional).
+    let expr: syn::Expr = syn::parse2(segment).map_err(|e| EmitError {
+        message: format!("malformed #[{kw}] argument: {e}"),
+    })?;
+    match expr {
+        syn::Expr::Call(call) => {
+            let name = call_name(&call.func).ok_or_else(|| EmitError {
+                message: format!("#[{kw}]: a call argument needs a bare name, e.g. `rollback_for(..)`"),
+            })?;
+            Ok(AttrItem::Call { name })
+        }
+        other => Ok(AttrItem::Positional(other)),
+    }
+}
+
+/// If `segment` is `ident = <rest>`, return `(ident, <rest>)` (the RHS tokens);
+/// otherwise `None`. Recognises the assign only when the FIRST token is a bare
+/// identifier and the SECOND is a lone `=` (never `==`/`=>`/…), so a positional
+/// expression that merely contains `=` deeper is not misread.
+fn split_assign(segment: &TokenStream) -> Option<(String, TokenStream)> {
+    let mut iter = segment.clone().into_iter();
+    let key = match iter.next()? {
+        proc_macro2::TokenTree::Ident(id) => id.to_string(),
+        _ => return None,
+    };
+    match iter.next()? {
+        proc_macro2::TokenTree::Punct(p)
+            if p.as_char() == '=' && p.spacing() == proc_macro2::Spacing::Alone => {}
+        _ => return None,
+    }
+    Some((key, iter.collect()))
 }
 
 /// An "unknown argument" error naming the expected keys.
@@ -915,13 +1052,29 @@ fn call_name(func: &syn::Expr) -> Option<String> {
     }
 }
 
-/// A `key = TypeName` right-hand side as a TYPE source string (a path expr).
-fn type_value(expr: &syn::Expr, key: &str) -> Result<String, EmitError> {
-    match expr {
-        syn::Expr::Path(p) => Ok(quote! { #p }.to_string()),
-        other => Err(EmitError {
-            message: format!("`{key}` must be a bean TYPE, got `{}`", quote! { #other }),
+/// A `key = <type>` right-hand side as a [`syn::Type`]. The value is ALREADY parsed
+/// as a type by [`parse_attr_item`] for the type-valued keys (`manager`/`gate`), so
+/// this only unwraps it; an `AttrValue::Expr` here is a parser-internal invariant
+/// violation, surfaced as a clear error.
+fn type_value(value: AttrValue, key: &str) -> Result<Type, EmitError> {
+    match value {
+        AttrValue::Type(ty) => Ok(ty),
+        AttrValue::Expr(e) => Err(EmitError {
+            message: format!("`{key}` must be a bean TYPE, got `{}`", quote! { #e }),
         }),
+    }
+}
+
+impl AttrValue {
+    /// Unwrap the EXPRESSION RHS, erroring if the value was parsed as a type (only
+    /// the type-valued keys parse as a type, so this is the non-`manager`/`gate` path).
+    fn expect_expr(self, key: &str) -> Result<syn::Expr, EmitError> {
+        match self {
+            AttrValue::Expr(e) => Ok(e),
+            AttrValue::Type(ty) => Err(EmitError {
+                message: format!("`{key}` must be a value, got the type `{}`", quote! { #ty }),
+            }),
+        }
     }
 }
 
@@ -1001,6 +1154,11 @@ mod tests {
         s.parse().expect("tokens")
     }
 
+    fn mgr_str(m: &ManagerRef) -> String {
+        let t = &m.ty;
+        quote! { #t }.to_string().split_whitespace().collect()
+    }
+
     // ── keyword recognition ──────────────────────────────────────────────────
 
     #[test]
@@ -1020,7 +1178,9 @@ mod tests {
     #[test]
     fn transactional_emits_a_tx_advisor_pairing_row_keyed_by_the_bean_type() {
         let args = parse_transactional(parse("manager = LedgerTxManager")).expect("parses");
-        assert_eq!(args.manager.as_deref(), Some("LedgerTxManager"));
+        let mgr = args.manager.as_ref().expect("a manager");
+        assert_eq!(mgr_str(mgr), "LedgerTxManager");
+        assert!(!mgr.is_trait_object(), "a concrete path is not a trait object");
         let ts = emit_transactional(
             &args,
             "LedgerService",
@@ -1067,6 +1227,43 @@ mod tests {
         parse_transactional(parse("manager = M, rollback_for(MyErr)")).expect("rollback_for parses");
     }
 
+    #[test]
+    fn transactional_manager_dyn_view_dispatches_to_the_by_trait_builder() {
+        // `manager = dyn TransactionManager` is a trait object (NOT a syn::Expr) — it
+        // parses as a Type and dispatches on the syntactic SHAPE to the by-view builder
+        // (resolve_view), NEVER on the spelled name.
+        let args = parse_transactional(parse("manager = dyn TransactionManager")).expect("parses");
+        let mgr = args.manager.as_ref().expect("a manager");
+        assert!(mgr.is_trait_object(), "a `dyn Trait` manager is a trait object");
+        let s = flat(
+            &emit_transactional(
+                &args,
+                "LedgerService",
+                &ty("LedgerService"),
+                &sig("LedgerService::record", "Result<i64, LeafError>", Some("i64")),
+            )
+            .expect("emits"),
+        );
+        // The by-VIEW builder (no concrete manager generic), with only the return-T.
+        assert!(
+            s.contains("::leaf_tx::make_transaction_interceptor_for_view::<i64>()"),
+            "the dyn-view manager rides the by-trait builder: {s}"
+        );
+        assert!(
+            !s.contains("make_transaction_interceptor_for::<"),
+            "the dyn-view path does NOT use the concrete ByType builder: {s}"
+        );
+    }
+
+    #[test]
+    fn transactional_manager_qualified_dyn_path_is_still_a_trait_object() {
+        // A path-qualified trait object (`dyn ::leaf::core::TransactionManager`) is
+        // still a Type::TraitObject — the dispatch is purely structural.
+        let args =
+            parse_transactional(parse("manager = dyn leaf::core::TransactionManager")).expect("parses");
+        assert!(args.manager.as_ref().expect("manager").is_trait_object());
+    }
+
     // ── #[cacheable] / #[cache_put] / #[cache_evict] ─────────────────────────────
 
     #[test]
@@ -1099,6 +1296,38 @@ mod tests {
             s.contains(r#""leaf::cache::CacheAdvisor","@""#),
             "per-method-unique contract: {s}"
         );
+    }
+
+    #[test]
+    fn cacheable_manager_dyn_view_dispatches_to_the_by_trait_builder() {
+        // `manager = dyn CacheManager` (a trait object, not a syn::Expr) dispatches on
+        // SHAPE to the by-view builder (resolve_view), never on the spelled name. The
+        // per-method op/meta/key/T are baked identically to the concrete path.
+        let args = parse_cache(parse(r##""prices", key = "#0", manager = dyn CacheManager"##), Concern::Cacheable)
+            .expect("parses");
+        assert!(args.manager.as_ref().expect("manager").is_trait_object());
+        let s = flat(
+            &emit_cache(
+                Concern::Cacheable,
+                &args,
+                "CatalogService",
+                &ty("CatalogService"),
+                &sig("CatalogService::price_of", "Result<i64, LeafError>", Some("String")),
+            )
+            .expect("emits"),
+        );
+        // The by-VIEW builder (no concrete manager generic), only the value type T.
+        assert!(
+            s.contains("::leaf_cache::build_cache_interceptor_view::<Result<i64,LeafError>>"),
+            "the dyn-view manager rides the by-trait builder: {s}"
+        );
+        assert!(
+            !s.contains("::leaf_cache::build_cache_interceptor::<"),
+            "the dyn-view path does NOT use the concrete ByType builder: {s}"
+        );
+        // The key fn + meta are unchanged.
+        assert!(s.contains("__call.args.downcast_ref::<(String,)>()"), "the key fn rides: {s}");
+        assert!(s.contains(r#"cache_names:&["prices"]"#), "the meta rides: {s}");
     }
 
     #[test]
@@ -1189,7 +1418,11 @@ mod tests {
         let args = CacheableArgs { key_arg: Some(3), ..Default::default() };
         let err = emit_cache(
             Concern::Cacheable,
-            &CacheableArgs { cache_names: vec!["u".into()], manager: Some("M".into()), ..args },
+            &CacheableArgs {
+                cache_names: vec!["u".into()],
+                manager: Some(ManagerRef { ty: ty("M") }),
+                ..args
+            },
             "S",
             &ty("S"),
             &sig("S::find", "i64", Some("u64")),

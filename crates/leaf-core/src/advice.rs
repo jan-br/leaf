@@ -198,6 +198,11 @@ pub trait TransactionManager: Send + Sync {
     fn synchronizations<'a>(&'a self, st: &'a TxState) -> &'a TxSyncRegistry;
 }
 
+// By-trait injection: `dyn TransactionManager` is an injectable VIEW (see the
+// `dyn CacheManager` note below) — `Ref<dyn TransactionManager>` resolves to the
+// providing bean through the same path as a concrete `Ref<T>`.
+crate::impl_resolve_view!(dyn TransactionManager);
+
 /// The ONE tx-resource ambient key (transaction-management) — read by nested
 /// data-access, the transactional-events dispatch branch, and `current_tx`.
 ///
@@ -359,6 +364,13 @@ pub trait CacheManager: Send + Sync {
     /// The cache registered under `name`, if any.
     fn cache(&self, name: &str) -> Option<Arc<dyn Cache>>;
 }
+
+// By-trait injection: `dyn CacheManager` is an injectable VIEW, so a consumer can
+// inject `Ref<dyn CacheManager>` and resolve to whatever bean provides it (the
+// auto-configured default, a user override, …) through the SAME path as a concrete
+// `Ref<T>`. The per-view `Resolve` impl is emitted once for the framework trait
+// here (the hand-written equivalent of `#[injectable]` on a user trait).
+crate::impl_resolve_view!(dyn CacheManager);
 
 /// One named cache (caching) — async at every `dyn` seam.
 pub trait Cache: Send + Sync {
@@ -789,6 +801,82 @@ mod tests {
             inner: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         let mgr = OneCacheManager(cache);
+        assert!(mgr.cache("users").is_some());
+        assert!(mgr.cache("absent").is_none());
+    }
+
+    // ── by-trait injection: the framework `dyn CacheManager` view is injectable ──
+
+    impl crate::handle::Bean for OneCacheManager {}
+
+    // The macro-shaped provides[] upcast for `OneCacheManager as dyn CacheManager`:
+    // downcast to concrete, unsize, re-erase as the Arc<Arc<dyn CacheManager>> holder.
+    fn one_cm_as_cachemanager(bean: crate::handle::ErasedBean) -> crate::handle::ErasedBean {
+        match bean.downcast::<OneCacheManager>() {
+            Ok(c) => {
+                let view: Arc<dyn CacheManager> = c;
+                Arc::new(view) as crate::handle::ErasedBean
+            }
+            Err(orig) => orig,
+        }
+    }
+
+    struct CmProvider {
+        descriptor: crate::definition::Descriptor,
+    }
+    impl crate::provider::Provider for CmProvider {
+        fn descriptor(&self) -> &crate::definition::Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<crate::handle::Published, LeafError>> {
+            Box::pin(async {
+                let cache = Arc::new(MapCache {
+                    inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+                });
+                Ok(crate::handle::Published::shared_value(OneCacheManager(cache)))
+            })
+        }
+    }
+
+    #[test]
+    fn ref_dyn_cache_manager_is_injectable_through_the_framework_view() {
+        // The framework `dyn CacheManager` carries the per-view `Resolve` impl
+        // (impl_resolve_view! beside the trait), so `Ref<dyn CacheManager>` resolves
+        // to the providing bean through the SAME path as a concrete Ref<T>.
+        use crate::definition::{AnnotationMetadata, Descriptor, Role, ScopeDef, TypeRow};
+        use crate::engine::Engine;
+        use crate::handle::Ref;
+        use crate::injectable::Injectable;
+        use crate::registry::RegistryBuilder;
+
+        let provides: &'static [TypeRow] = Box::leak(Box::new([TypeRow {
+            view: TypeId::of::<dyn CacheManager>(),
+            upcast: one_cm_as_cachemanager,
+        }]));
+        let d = Descriptor {
+            contract: ContractId::of("test::OneCacheManager"),
+            self_type: TypeId::of::<OneCacheManager>(),
+            provides,
+            declared_name: Some("cacheManager"),
+            aliases: &[],
+            scope: ScopeDef::SINGLETON,
+            role: Role::Application,
+            meta: &AnnotationMetadata::EMPTY,
+            parent: None,
+            origin: crate::error::Origin::Native { crate_name: Some("test") },
+        };
+        let mut builder = RegistryBuilder::new();
+        builder.register(d, Arc::new(CmProvider { descriptor: d })).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        let cx = ResolveCtx::for_engine(&engine);
+
+        let mgr: Ref<dyn CacheManager> =
+            futures::executor::block_on(<Ref<dyn CacheManager> as Injectable>::inject(&cx))
+                .expect("dyn CacheManager view resolves");
+        // The recovered trait object dispatches correctly (the concrete is preserved).
         assert!(mgr.cache("users").is_some());
         assert!(mgr.cache("absent").is_none());
     }

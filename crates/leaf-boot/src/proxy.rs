@@ -278,6 +278,17 @@ impl Container for EngineContainer<'_> {
         let bean = self.engine.get_erased(key).await?;
         Ok(Published::shared(bean))
     }
+
+    // Route a by-trait (`dyn Svc`) view resolution through the engine's ONE
+    // `resolve_view` primitive — the SAME path a `Ref<dyn Svc>` injection point
+    // takes — so a `make_interceptor` bridge can resolve a manager named by its view
+    // (`#[cacheable(manager = dyn CacheManager)]`) with no per-manager special-casing.
+    async fn resolve_view(
+        &self,
+        view: std::any::TypeId,
+    ) -> Result<leaf_core::ErasedBean, LeafError> {
+        self.engine.resolve_view(view).await
+    }
 }
 
 // ─────────────────────────────── InstalledProxies ───────────────────────────
