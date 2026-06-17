@@ -133,6 +133,26 @@ pub trait Resolve: Send + Sync + 'static {
     /// Any [`LeafError`] from the eager resolution (missing/ambiguous target, a
     /// construction fault, or a dropped container).
     fn resolve<'a>(ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Ref<Self>, LeafError>>;
+
+    /// Resolve ALL beans providing this target through the one [`ResolveCtx`]
+    /// collection seam, handing back the ordered `Vec<Ref<Self>>` — the
+    /// [`Cardinality::Multiple`] counterpart of [`resolve`](Resolve::resolve) that a
+    /// `Vec<Ref<X>>` injection point consumes (Spring's `List<Interface>`).
+    ///
+    /// The two `Resolve` shapes recover the elements identically to their single
+    /// counterparts: the BLANKET-over-[`Bean`] impl collects concrete candidates of
+    /// `TypeId::of::<T>()` and recovers each via the one [`downcast_ref`](crate::downcast_ref);
+    /// the per-VIEW impl collects providers of the view's `TypeId` and recovers each
+    /// via [`view_from_holder`]. ZERO providers is an EMPTY `Vec`, never an error
+    /// (collection semantics). NO per-injection-point/bean/trait special-casing — the
+    /// SAME [`ResolveCtx::resolve_collection`] primitive drives both.
+    ///
+    /// # Errors
+    /// Any [`LeafError`] from a provider's construction (never absence) or a dropped
+    /// engine back-reference.
+    fn resolve_collection<'a>(
+        ctx: &'a ResolveCtx<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Ref<Self>>, LeafError>>;
 }
 
 // SHAPE 1 — the concrete path: every `Bean` resolves by its own `TypeId` through
@@ -142,6 +162,25 @@ impl<T: Bean> Resolve for T {
 
     fn resolve<'a>(ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Ref<Self>, LeafError>> {
         Box::pin(async move { ctx.resolve_ref::<T>().await })
+    }
+
+    fn resolve_collection<'a>(
+        ctx: &'a ResolveCtx<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Ref<Self>>, LeafError>> {
+        // The concrete-collection path: collect every bean of T's TypeId (the
+        // EXISTING Multiple path), recovering each shared handle via the one
+        // downcast_ref — identical recovery to the single concrete `resolve`.
+        Box::pin(async move {
+            let beans = ctx.resolve_collection(const { TypeId::of::<T>() }).await?;
+            beans.into_iter().map(crate::handle::downcast_ref::<T>).collect::<Result<Vec<_>, _>>().map_err(
+                |_| {
+                    LeafError::new(ErrorKind::ConstructionFailed).caused_by(Cause::plain(
+                        "resolving concrete collection",
+                        "a resolved bean's concrete type did not match the collection element type",
+                    ))
+                },
+            )
+        })
     }
 }
 
@@ -195,6 +234,29 @@ macro_rules! impl_resolve_view {
                     $crate::view_from_holder::<$dyn_ty>(__holder)
                 })
             }
+
+            fn resolve_collection<'__a>(
+                ctx: &'__a $crate::ResolveCtx<'__a>,
+            ) -> $crate::BoxFuture<
+                '__a,
+                ::core::result::Result<
+                    ::std::vec::Vec<$crate::Ref<$dyn_ty>>,
+                    $crate::LeafError,
+                >,
+            > {
+                // The by-trait collection path: collect EVERY provider of the view
+                // (the EXISTING Multiple path), recovering each view-holder via the
+                // SAME view_from_holder the single `resolve` uses.
+                ::std::boxed::Box::pin(async move {
+                    let __holders = ctx
+                        .resolve_collection(const { ::core::any::TypeId::of::<$dyn_ty>() })
+                        .await?;
+                    __holders
+                        .into_iter()
+                        .map($crate::view_from_holder::<$dyn_ty>)
+                        .collect::<::core::result::Result<::std::vec::Vec<_>, _>>()
+                })
+            }
         }
     };
 }
@@ -214,6 +276,31 @@ impl<X: ?Sized + Resolve> Injectable for Ref<X> {
     fn inject<'a>(ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Self, LeafError>> {
         // Eager: drive the target's own `resolve` through the one ResolveCtx seam.
         <X as Resolve>::resolve(ctx)
+    }
+}
+
+// COLLECTION INJECTION — ONE impl over any `Resolve` target, distinct from the
+// `Ref<X>` impl above (a `Vec<Ref<X>>` is a different type, so coherence is fine).
+// It covers `Vec<Ref<ConcreteType>>` (via SHAPE 1's collection path) AND
+// `Vec<Ref<dyn Svc>>` (via the per-view collection path) through the SAME general
+// primitive — Spring's `List<Interface>` / `@Autowired List<T>`. The
+// field/constructor macros need NO change: a `Vec<Ref<X>>` field lowers through
+// `<Vec<Ref<X>> as Injectable>::RESOLVABLE` (Multiple/collection) by trait dispatch,
+// never by matching `"Vec"` in tokens.
+impl<X: ?Sized + Resolve> Injectable for Vec<Ref<X>> {
+    const RESOLVABLE: Resolvable = Resolvable {
+        produced: <X as Resolve>::PRODUCED,
+        cardinality: Cardinality::Multiple,
+        // Tolerant: a collection's empty set is an empty Vec, never a forced
+        // dependency — the wave-planner must NOT make its target a hard graph edge.
+        strictness: Strictness::AbsenceTolerant,
+    };
+
+    fn inject<'a>(ctx: &'a ResolveCtx<'a>) -> BoxFuture<'a, Result<Self, LeafError>> {
+        // Drive the target's own collection resolution through the one ResolveCtx
+        // seam — the EXISTING collect-all + cmp_order Multiple path + per-bean
+        // upcast recovery. Zero providers → empty Vec.
+        <X as Resolve>::resolve_collection(ctx)
     }
 }
 
@@ -671,5 +758,281 @@ mod tests {
             .map(|_| ())
             .expect_err("no engine");
         assert_eq!(err.kind, ErrorKind::ConstructionFailed);
+    }
+
+    // ── COLLECTION INJECTION: Vec<Ref<dyn Trait>> resolves ALL providers ─────────
+    //
+    // Spring's `List<Interface>` / `@Autowired List<T>`. A `Vec<Ref<dyn Greet>>`
+    // field becomes a Multiple/collection injection point purely by trait dispatch
+    // on the `Vec<Ref<X>>` type — its RESOLVABLE is Multiple/tolerant — and resolves
+    // to ALL beans providing the view, ordered, through the ONE resolve_collection
+    // primitive (the SAME per-bean upcast + the existing collect-all Multiple path).
+
+    fn build_greet_engine(
+        beans: &[(&'static str, &'static str, TypeId, crate::definition::UpcastFn, bool)],
+    ) -> Engine {
+        // (contract, name, self_type, upcast, is_french) — a tiny builder over the
+        // existing GreeterProvider machinery so each test registers its own set.
+        let mut builder = RegistryBuilder::new();
+        for &(contract, name, self_type, upcast, is_french) in beans {
+            let d = greeter_descriptor(
+                contract,
+                name,
+                self_type,
+                greet_provides(upcast),
+                crate::definition::CandidateRole::NORMAL,
+            );
+            if is_french {
+                builder
+                    .register(d, Arc::new(GreeterProvider::<French> { descriptor: d, _m: std::marker::PhantomData }))
+                    .unwrap();
+            } else {
+                builder
+                    .register(d, Arc::new(GreeterProvider::<English> { descriptor: d, _m: std::marker::PhantomData }))
+                    .unwrap();
+            }
+        }
+        Engine::from_builder(builder).unwrap()
+    }
+
+    #[test]
+    fn vec_ref_dyn_trait_resolvable_is_multiple_and_tolerant() {
+        // The RESOLVABLE of a `Vec<Ref<dyn Greet>>` targets the VIEW's TypeId,
+        // Multiple + tolerant — the collection counterpart of the single Ref<dyn>.
+        let r = <Vec<Ref<dyn Greet>> as Injectable>::RESOLVABLE;
+        assert_eq!(r.produced, TypeId::of::<dyn Greet>());
+        assert_eq!(r.cardinality, Cardinality::Multiple);
+        assert_eq!(r.strictness, Strictness::AbsenceTolerant);
+    }
+
+    #[test]
+    fn vec_ref_dyn_trait_resolves_all_providers_ordered() {
+        // TWO beans providing `dyn Greet` (both Normal): the collection resolves to
+        // BOTH (no narrowing — Multiple BYPASSES selection), ordered by registration.
+        let engine = build_greet_engine(&[
+            ("test::English", "english", TypeId::of::<English>(), english_as_greet, false),
+            ("test::French", "french", TypeId::of::<French>(), french_as_greet, true),
+        ]);
+        let cx = ResolveCtx::for_engine(&engine);
+
+        let all: Vec<Ref<dyn Greet>> =
+            block(<Vec<Ref<dyn Greet>> as Injectable>::inject(&cx)).expect("collection resolves");
+        let greetings: Vec<&'static str> = all.iter().map(|g| g.greet()).collect();
+        // Registration order: English (id 0) then French (id 1).
+        assert_eq!(greetings, vec!["hello", "bonjour"]);
+    }
+
+    #[test]
+    fn vec_ref_dyn_trait_zero_providers_is_empty_never_an_error() {
+        // No bean provides `dyn Greet`: the collection is EMPTY, never NoSuchBean.
+        let engine = build_greet_engine(&[]);
+        let cx = ResolveCtx::for_engine(&engine);
+        let all: Vec<Ref<dyn Greet>> =
+            block(<Vec<Ref<dyn Greet>> as Injectable>::inject(&cx)).expect("empty collection");
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn vec_ref_dyn_trait_one_provider_is_a_single_element_vec() {
+        let engine = build_greet_engine(&[(
+            "test::English",
+            "english",
+            TypeId::of::<English>(),
+            english_as_greet,
+            false,
+        )]);
+        let cx = ResolveCtx::for_engine(&engine);
+        let all: Vec<Ref<dyn Greet>> =
+            block(<Vec<Ref<dyn Greet>> as Injectable>::inject(&cx)).expect("one-element collection");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].greet(), "hello");
+    }
+
+    #[test]
+    fn single_ref_dyn_trait_is_unchanged_alongside_the_collection_path() {
+        // A UNIQUE `Ref<dyn Greet>` (one provider) still resolves to that one bean —
+        // the single by-trait path is untouched by the collection impl.
+        let engine = build_greet_engine(&[(
+            "test::French",
+            "french",
+            TypeId::of::<French>(),
+            french_as_greet,
+            true,
+        )]);
+        let cx = ResolveCtx::for_engine(&engine);
+        let one: Ref<dyn Greet> =
+            block(<Ref<dyn Greet> as Injectable>::inject(&cx)).expect("unique single resolves");
+        assert_eq!(one.greet(), "bonjour");
+    }
+
+    // ── Vec<Ref<ConcreteType>>: a concrete type with multiple registrations ──────
+
+    #[derive(Debug)]
+    struct Plugin {
+        tag: &'static str,
+    }
+    impl Bean for Plugin {}
+
+    struct PluginProvider {
+        descriptor: Descriptor,
+        tag: &'static str,
+    }
+    impl Provider for PluginProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            let tag = self.tag;
+            Box::pin(async move { Ok(Published::shared_value(Plugin { tag })) })
+        }
+    }
+
+    #[test]
+    fn vec_ref_concrete_type_resolves_all_registrations() {
+        // TWO beans of the SAME concrete `Plugin` (distinct contracts/names):
+        // `Vec<Ref<Plugin>>` resolves BOTH via the concrete collection path (each
+        // recovered by downcast_ref), ordered by registration.
+        fn plugin_desc(contract: &str, name: &'static str) -> Descriptor {
+            Descriptor {
+                contract: ContractId::of(contract),
+                self_type: TypeId::of::<Plugin>(),
+                provides: &[],
+                declared_name: Some(name),
+                aliases: &[],
+                scope: ScopeDef::SINGLETON,
+                role: Role::Application,
+                meta: &AnnotationMetadata::EMPTY,
+                parent: None,
+                origin: Origin::Native { crate_name: Some("test") },
+            }
+        }
+        let d0 = plugin_desc("test::P0", "p0");
+        let d1 = plugin_desc("test::P1", "p1");
+        let mut builder = RegistryBuilder::new();
+        builder.register(d0, Arc::new(PluginProvider { descriptor: d0, tag: "first" })).unwrap();
+        builder.register(d1, Arc::new(PluginProvider { descriptor: d1, tag: "second" })).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        let cx = ResolveCtx::for_engine(&engine);
+
+        let all: Vec<Ref<Plugin>> =
+            block(<Vec<Ref<Plugin>> as Injectable>::inject(&cx)).expect("concrete collection");
+        let tags: Vec<&'static str> = all.iter().map(|p| p.tag).collect();
+        assert_eq!(tags, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn vec_ref_concrete_zero_registrations_is_empty() {
+        let engine = Engine::from_builder(RegistryBuilder::new()).unwrap();
+        let cx = ResolveCtx::for_engine(&engine);
+        let all: Vec<Ref<Plugin>> =
+            block(<Vec<Ref<Plugin>> as Injectable>::inject(&cx)).expect("empty concrete collection");
+        assert!(all.is_empty());
+    }
+
+    // ── generality: a NON-manager user trait collection ──────────────────────────
+    //
+    // PricingRule is an application service trait (not an infra manager) — proving
+    // the primitive is general: a Vec<Ref<dyn PricingRule>> resolves all providers.
+
+    trait PricingRule: Send + Sync + 'static {
+        fn surcharge(&self) -> u32;
+    }
+    crate::impl_resolve_view!(dyn PricingRule);
+
+    #[derive(Debug)]
+    struct WeekendRule;
+    impl Bean for WeekendRule {}
+    impl PricingRule for WeekendRule {
+        fn surcharge(&self) -> u32 {
+            5
+        }
+    }
+    #[derive(Debug)]
+    struct LoyaltyRule;
+    impl Bean for LoyaltyRule {}
+    impl PricingRule for LoyaltyRule {
+        fn surcharge(&self) -> u32 {
+            2
+        }
+    }
+    fn weekend_as_rule(bean: ErasedBean) -> ErasedBean {
+        match bean.downcast::<WeekendRule>() {
+            Ok(c) => Arc::new(c as Arc<dyn PricingRule>) as ErasedBean,
+            Err(orig) => orig,
+        }
+    }
+    fn loyalty_as_rule(bean: ErasedBean) -> ErasedBean {
+        match bean.downcast::<LoyaltyRule>() {
+            Ok(c) => Arc::new(c as Arc<dyn PricingRule>) as ErasedBean,
+            Err(orig) => orig,
+        }
+    }
+    fn rule_provides(upcast: crate::definition::UpcastFn) -> &'static [crate::definition::TypeRow] {
+        Box::leak(Box::new([crate::definition::TypeRow {
+            view: TypeId::of::<dyn PricingRule>(),
+            upcast,
+        }]))
+    }
+    struct RuleProvider<T: Bean + Default> {
+        descriptor: Descriptor,
+        _m: std::marker::PhantomData<fn() -> T>,
+    }
+    impl<T: Bean + Default> Provider for RuleProvider<T> {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async { Ok(Published::shared_value(T::default())) })
+        }
+    }
+    impl Default for WeekendRule {
+        fn default() -> Self {
+            WeekendRule
+        }
+    }
+    impl Default for LoyaltyRule {
+        fn default() -> Self {
+            LoyaltyRule
+        }
+    }
+
+    #[test]
+    fn vec_ref_non_manager_user_trait_resolves_all_rules() {
+        // Two PricingRule beans → Vec<Ref<dyn PricingRule>> resolves BOTH (general,
+        // not a special-cased manager trait), ordered by registration.
+        let dw = greeter_descriptor(
+            "test::WeekendRule",
+            "weekend",
+            TypeId::of::<WeekendRule>(),
+            rule_provides(weekend_as_rule),
+            crate::definition::CandidateRole::NORMAL,
+        );
+        let dl = greeter_descriptor(
+            "test::LoyaltyRule",
+            "loyalty",
+            TypeId::of::<LoyaltyRule>(),
+            rule_provides(loyalty_as_rule),
+            crate::definition::CandidateRole::NORMAL,
+        );
+        let mut builder = RegistryBuilder::new();
+        builder
+            .register(dw, Arc::new(RuleProvider::<WeekendRule> { descriptor: dw, _m: std::marker::PhantomData }))
+            .unwrap();
+        builder
+            .register(dl, Arc::new(RuleProvider::<LoyaltyRule> { descriptor: dl, _m: std::marker::PhantomData }))
+            .unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+        let cx = ResolveCtx::for_engine(&engine);
+
+        let rules: Vec<Ref<dyn PricingRule>> =
+            block(<Vec<Ref<dyn PricingRule>> as Injectable>::inject(&cx)).expect("all rules");
+        let surcharges: Vec<u32> = rules.iter().map(|r| r.surcharge()).collect();
+        assert_eq!(surcharges, vec![5, 2]);
     }
 }

@@ -55,7 +55,8 @@ use crate::env::Env;
 use crate::error::{Cause, ErrorKind, LeafError};
 use crate::handle::{downcast_owned, downcast_ref, ErasedBean, Published, Ref};
 use crate::identity::{BeanId, BeanKey};
-use crate::injection::Selector;
+use crate::injection::{collect_ordered, Cand, CandidateSet, Selector};
+use crate::order::OrderKey;
 use crate::lifecycle_engine::{run_init, Destroyer, LifecyclePlan, TeardownLedger};
 use crate::provider::ResolveCtx;
 use crate::registry::{Registry, RegistryBuilder};
@@ -255,6 +256,74 @@ impl Engine {
         // Apply the providing bean's const upcast: concrete Arc -> the Arc<dyn Svc>
         // view-holder (re-erased), recoverable typed at the Injectable seam.
         Ok(upcast(bean))
+    }
+
+    /// Resolve a `target` `TypeId` (a concrete type OR a `dyn Svc` VIEW) to ALL the
+    /// beans providing it, handing back one [`ErasedBean`] per provider in
+    /// [`cmp_order`](crate::cmp_order) — the ONE general COLLECTION-injection
+    /// primitive every `Vec<Ref<X>>` surface inherits (Spring's `List<Interface>`).
+    ///
+    /// This is the [`Cardinality::Multiple`](crate::Cardinality::Multiple)
+    /// counterpart of [`resolve_view`](Engine::resolve_view), reusing the EXISTING
+    /// machinery end-to-end and BYPASSING selection (no fold/narrowing):
+    ///
+    /// 1. the registry's [`candidates`](crate::Registry::candidates) returns every
+    ///    bean whose concrete `self_type` OR a declared `provides[]` view is `target`
+    ///    (registration order);
+    /// 2. [`crate::collect_ordered`] — the SAME collection ordering
+    ///    the lazy `Lookup::ordered_stream` uses — sorts them by `cmp_order` then the
+    ///    stable `BeanId` registration tie-break;
+    /// 3. each provider is built through the ONE [`create`](Engine::create) driver;
+    /// 4. for a VIEW target (a bean that declares a `provides[]`
+    ///    [`TypeRow`](crate::TypeRow) upcast for `target`) each bean's OWN per-bean
+    ///    upcast — the SAME recovery [`resolve_view`](Engine::resolve_view) applies —
+    ///    coerces its concrete `Arc` into the `Arc<dyn Svc>` view-holder; for a
+    ///    CONCRETE target the bean's shared handle is returned directly.
+    ///
+    /// ZERO candidates is an EMPTY `Vec`, NEVER a [`ErrorKind::NoSuchBean`]
+    /// (collection semantics — the empty set is an empty collection). The typed
+    /// `Vec<Ref<X>>` is reconstituted at the [`Injectable`](crate::Injectable) seam
+    /// (a concrete element via [`downcast_ref`], a view element via
+    /// [`view_from_holder`](crate::view_from_holder)).
+    ///
+    /// # Errors
+    /// Propagates a [`LeafError`] from any provider's construction (never absence);
+    /// or [`ErrorKind::ConstructionFailed`] if a providing bean is a prototype
+    /// (owned move — a collection needs shared handles).
+    pub async fn resolve_collection(&self, target: TypeId) -> Result<Vec<ErasedBean>, LeafError> {
+        // (1)+(2) the EXISTING Multiple path: all candidates, cmp_order-ordered.
+        let mut set = CandidateSet::new();
+        for &cid in self.registry.candidates(target) {
+            let d = self.registry.descriptor(cid);
+            let mut cand = Cand::new(cid, d.declared_name.unwrap_or(""));
+            cand.role = d.meta.candidate_role;
+            cand.order = OrderKey::implicit();
+            set.push(cand);
+        }
+        let ordered = collect_ordered(&set);
+
+        // (3)+(4) build each via the ONE create driver; for a view target apply the
+        // bean's OWN upcast (the SAME per-bean recovery resolve_view uses).
+        let cx = ResolveCtx::for_engine(self);
+        let mut out: Vec<ErasedBean> = Vec::with_capacity(ordered.len());
+        for cand in &ordered {
+            let published = self.create(cand.id, &cx).await?;
+            let bean = published.into_shared().ok_or_else(|| {
+                LeafError::new(ErrorKind::ConstructionFailed).caused_by(Cause::plain(
+                    "resolving collection",
+                    "a providing bean is a prototype (owned move); a collection needs shared handles",
+                ))
+            })?;
+            // A view target: recover through the bean's declared upcast row. A
+            // concrete target (the bean has no row for `target`): the shared handle
+            // IS the element. Same per-bean recovery resolve_view applies.
+            let element = match self.registry.view_upcast(cand.id, target) {
+                Some(upcast) => upcast(bean),
+                None => bean,
+            };
+            out.push(element);
+        }
+        Ok(out)
     }
 
     /// THE one concrete creation driver (bean-instantiation): single-phase
@@ -1128,6 +1197,119 @@ mod tests {
         let engine = Engine::new(RegistryBuilder::new().freeze().unwrap());
         let err = block(engine.resolve_view(TypeId::of::<dyn Speak>())).expect_err("no provider");
         assert_eq!(err.kind, ErrorKind::NoSuchBean);
+    }
+
+    // ── resolve_collection: the COLLECTION-injection primitive (engine level) ────
+
+    #[derive(Debug)]
+    struct Quiet;
+    impl Bean for Quiet {}
+    impl Speak for Quiet {
+        fn say(&self) -> &'static str {
+            "quiet"
+        }
+    }
+    fn quiet_as_speak(bean: ErasedBean) -> ErasedBean {
+        match bean.downcast::<Quiet>() {
+            Ok(c) => {
+                let view: Arc<dyn Speak> = c;
+                Arc::new(view) as ErasedBean
+            }
+            Err(orig) => orig,
+        }
+    }
+    struct QuietProvider {
+        descriptor: Descriptor,
+    }
+    impl Provider for QuietProvider {
+        fn descriptor(&self) -> &Descriptor {
+            &self.descriptor
+        }
+        fn provide<'a>(
+            &'a self,
+            _cx: &'a ResolveCtx<'a>,
+        ) -> BoxFuture<'a, Result<Published, LeafError>> {
+            Box::pin(async { Ok(Published::shared_value(Quiet)) })
+        }
+    }
+
+    fn speak_provides(upcast: crate::definition::UpcastFn) -> &'static [crate::definition::TypeRow] {
+        Box::leak(Box::new([crate::definition::TypeRow { view: TypeId::of::<dyn Speak>(), upcast }]))
+    }
+
+    #[test]
+    fn engine_resolve_collection_returns_all_view_providers_in_registration_order() {
+        // TWO beans providing `dyn Speak`: resolve_collection returns BOTH (no
+        // selection/narrowing), each recovered through its own upcast row, ordered
+        // by cmp_order then the stable BeanId registration tie-break.
+        let d_loud = Descriptor {
+            provides: speak_provides(loud_as_speak),
+            ..descriptor("loud", "test::Loud", TypeId::of::<Loud>(), ScopeDef::SINGLETON)
+        };
+        let d_quiet = Descriptor {
+            provides: speak_provides(quiet_as_speak),
+            ..descriptor("quiet", "test::Quiet", TypeId::of::<Quiet>(), ScopeDef::SINGLETON)
+        };
+        let mut builder = RegistryBuilder::new();
+        builder.register(d_loud, Arc::new(LoudProvider { descriptor: d_loud })).unwrap();
+        builder.register(d_quiet, Arc::new(QuietProvider { descriptor: d_quiet })).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+
+        let holders = block(engine.resolve_collection(TypeId::of::<dyn Speak>()))
+            .expect("collection resolves");
+        let says: Vec<&'static str> = holders
+            .into_iter()
+            .map(|h| crate::injectable::view_from_holder::<dyn Speak>(h).expect("typed").say())
+            .collect();
+        // Registration order: Loud (id 0) then Quiet (id 1).
+        assert_eq!(says, vec!["LOUD", "quiet"]);
+    }
+
+    #[test]
+    fn engine_resolve_collection_zero_providers_is_empty_never_an_error() {
+        // A view nobody provides resolves to an EMPTY collection (NOT NoSuchBean).
+        let engine = Engine::new(RegistryBuilder::new().freeze().unwrap());
+        let holders = block(engine.resolve_collection(TypeId::of::<dyn Speak>()))
+            .expect("empty collection, never an error");
+        assert!(holders.is_empty());
+    }
+
+    #[test]
+    fn engine_resolve_collection_one_provider_is_a_single_element_vec() {
+        let d_loud = Descriptor {
+            provides: speak_provides(loud_as_speak),
+            ..descriptor("loud", "test::Loud", TypeId::of::<Loud>(), ScopeDef::SINGLETON)
+        };
+        let mut builder = RegistryBuilder::new();
+        builder.register(d_loud, Arc::new(LoudProvider { descriptor: d_loud })).unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+
+        let holders = block(engine.resolve_collection(TypeId::of::<dyn Speak>())).expect("resolves");
+        assert_eq!(holders.len(), 1);
+    }
+
+    #[test]
+    fn engine_resolve_collection_for_a_concrete_type_returns_shared_handles() {
+        // For a CONCRETE target the elements are the beans' shared handles directly
+        // (no upcast row): two distinct-named beans of the same concrete type C.
+        let c0 = descriptor("c0", "test::C0", TypeId::of::<C>(), ScopeDef::SINGLETON);
+        let c1 = descriptor("c1", "test::C1", TypeId::of::<C>(), ScopeDef::SINGLETON);
+        let mut builder = RegistryBuilder::new();
+        builder
+            .register(c0, Arc::new(CProvider { descriptor: c0, builds: Arc::new(AtomicUsize::new(0)) }))
+            .unwrap();
+        builder
+            .register(c1, Arc::new(CProvider { descriptor: c1, builds: Arc::new(AtomicUsize::new(0)) }))
+            .unwrap();
+        let engine = Engine::from_builder(builder).unwrap();
+
+        let beans = block(engine.resolve_collection(TypeId::of::<C>())).expect("concrete collection");
+        let tags: Vec<&'static str> = beans
+            .into_iter()
+            .map(|b| downcast_ref::<C>(b).expect("downcast C").tag)
+            .collect();
+        // Both concrete-type beans (registration order), each via its shared handle.
+        assert_eq!(tags, vec!["c", "c"]);
     }
 
     #[test]

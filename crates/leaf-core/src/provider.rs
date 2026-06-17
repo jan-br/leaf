@@ -211,6 +211,37 @@ impl<'a> ResolveCtx<'a> {
         engine.resolve_view(view).await
     }
 
+    /// Resolve a `target` `TypeId` (concrete OR a `dyn Svc` VIEW) through the engine
+    /// back-reference to ALL the beans providing it, one
+    /// [`ErasedBean`](crate::ErasedBean) element per provider in
+    /// [`cmp_order`](crate::cmp_order) — the [`Injectable`](crate::Injectable) seam
+    /// recovers each into a typed `Ref<X>` for a `Vec<Ref<X>>` injection point.
+    ///
+    /// The COLLECTION counterpart of [`resolve_ref`](ResolveCtx::resolve_ref) /
+    /// [`resolve_view`](ResolveCtx::resolve_view): the SAME one resolution seam,
+    /// delegating to [`Engine::resolve_collection`](crate::Engine::resolve_collection)
+    /// (the one general collection primitive). ZERO providers is an EMPTY `Vec`,
+    /// never an error (collection semantics).
+    ///
+    /// # Errors
+    /// [`ErrorKind::ConstructionFailed`](crate::ErrorKind::ConstructionFailed) if no
+    /// engine back-reference is threaded; otherwise any [`LeafError`] from a
+    /// provider's construction (never absence).
+    pub async fn resolve_collection(
+        &self,
+        target: TypeId,
+    ) -> Result<Vec<crate::handle::ErasedBean>, LeafError> {
+        let engine = self.engine.ok_or_else(|| {
+            LeafError::new(crate::error::ErrorKind::ConstructionFailed).caused_by(
+                crate::error::Cause::plain(
+                    "resolving an injected collection dependency",
+                    "the resolution context carries no engine back-reference",
+                ),
+            )
+        })?;
+        engine.resolve_collection(target).await
+    }
+
     /// The ambient [`InstanceStore`](crate::lifecycle_engine::InstanceStore) for
     /// `kind`, if a scope-store accessor is installed AND it binds `kind`.
     ///

@@ -1106,6 +1106,29 @@ pub trait Container: Send + Sync {
             )))
         })
     }
+
+    /// Resolve a `target` `TypeId` (a concrete type OR a `dyn Svc` VIEW) to ALL the
+    /// beans providing it, one view-HOLDER/shared [`ErasedBean`] per provider in
+    /// [`crate::cmp_order`] — the SAME general COLLECTION primitive
+    /// [`Engine::resolve_collection`](crate::Engine::resolve_collection) /
+    /// [`ResolveCtx::resolve_collection`](crate::ResolveCtx::resolve_collection)
+    /// drive for a `Vec<Ref<X>>` injection point, exposed here so a container-only
+    /// consumer can collect a multi-provider view through the ordinary container.
+    ///
+    /// A PROVIDED method: the kernel default has no candidate index, so it surfaces
+    /// an EMPTY collection (collection semantics — zero providers is an empty `Vec`,
+    /// never an error); the engine container overrides it with the real
+    /// [`Engine::resolve_collection`](crate::Engine::resolve_collection).
+    ///
+    /// # Errors
+    /// Propagates a [`LeafError`] from any provider's construction (never absence).
+    fn resolve_collection(
+        &self,
+        target: TypeId,
+    ) -> BoxFuture<'_, Result<SmallVec<[ErasedBean; 4]>, LeafError>> {
+        let _ = target;
+        Box::pin(async move { Ok(SmallVec::new()) })
+    }
 }
 
 /// The shared back-reference a deferral handle holds: a [`Weak`] to the

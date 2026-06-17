@@ -12,6 +12,9 @@
 //!   [`converter`].
 //! - **Conditions + auto-config:** [`conditional`], [`profile`], [`auto_config`],
 //!   [`import`].
+//! - **By-trait injection:** [`injectable`] (on a `trait Foo`, make `dyn Foo` an
+//!   injectable view — resolvable as `Ref<dyn Foo>` and collectible as
+//!   `Vec<Ref<dyn Foo>>`).
 //! - **Declarative advice / AOP + cross-cutting concerns:** [`advisable`],
 //!   [`aspect`], [`advice`], [`pointcut`], [`transactional`],
 //!   [`cacheable`], [`cache_put`], [`cache_evict`], [`validated`], [`retryable`],
@@ -34,7 +37,7 @@
 pub use leaf_macros::{
     advice, advisable, aspect, async_impl, auto_config, bean, cache_evict, cache_put, cacheable, catalog,
     component, concurrency_limit, conditional, config_properties, configuration, controller,
-    converter, event_listener, failure_analyzer, import, main, pointcut, profile,
+    converter, event_listener, failure_analyzer, import, injectable, main, pointcut, profile,
     register_component, repository, resource, retryable, runner, scheduled, service, transactional,
     transactional_event_listener, validated, value, BindTarget,
 };

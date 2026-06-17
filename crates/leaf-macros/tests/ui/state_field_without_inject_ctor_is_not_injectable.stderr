@@ -10,6 +10,9 @@ help: the following other types implement trait `Injectable`
    | impl<X: ?Sized + Resolve> Injectable for Ref<X> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `leaf_core::Ref<X>`
 ...
+   | impl<X: ?Sized + Resolve> Injectable for Vec<Ref<X>> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `std::vec::Vec<leaf_core::Ref<X>>`
+...
    | impl<T: Bean> Injectable for Lookup<T> {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Lookup<T>`
 ...
