@@ -1,0 +1,16 @@
+[package]
+name = "leaf-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# leaf-web is the ABSTRACTION crate (leaf-core only, like leaf-cache/leaf-tx
+# define their concern traits). It names NO HTTP-server library — hyper/tower/
+# axum live exclusively in the leaf-web-hyper backend crate (Stage 3).
+leaf-core.workspace = true
+# Neutral, server-agnostic HTTP value vocabulary (Method/StatusCode/HeaderMap/
+# Uri) — the ecosystem standard hyper/axum/tonic all build on; NOT server internals.
+http.workspace = true
+# The body carrier — a cheaply-cloneable byte buffer at the request/response edge.
+bytes.workspace = true

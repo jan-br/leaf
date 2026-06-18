@@ -36,6 +36,7 @@ leaf-figlet = { path = "crates/leaf-figlet", version = "0.1.0" }
 leaf-redis = { path = "crates/leaf-redis", version = "0.1.0" }
 leaf-starter-redis = { path = "crates/leaf-starter-redis", version = "0.1.0" }
 leaf-starter-web = { path = "crates/leaf-starter-web", version = "0.1.0" }
+leaf-web = { path = "crates/leaf-web", version = "0.1.0" }
 leaf = { path = "crates/leaf", version = "0.1.0" }
 
 # External deps (pinned centrally — the internal BOM also covers third-party versions)
@@ -47,6 +48,11 @@ linkme = "0.3"
 pin-project-lite = "0.2"
 tokio = { version = "1", default-features = false }
 smol = "2"
+
+# Neutral HTTP value vocabulary + body carrier for the leaf-web abstractions
+# (server-agnostic; the hyper backend lives in its own crate).
+http = "1"
+bytes = "1"
 
 # Codegen deps (leaf-codegen is a normal lib using proc-macro2/syn/quote so it is
 # unit-testable without a compiler; leaf-macros is the thin proc-macro that calls it).
