@@ -24,15 +24,23 @@
 //!   return into a body / deserialize a body into a typed value, keyed by
 //!   content-type. The JSON impl is a `#[component]` bean in `leaf-serde`; leaf-web
 //!   names no serde data format (only the `erased-serde` object-safety boundary).
+//! - [`FromRequest`] + [`Path`] / [`Query`] / [`Json`] / [`Header`] / [`State`] —
+//!   the argument-extraction seam: each controller-method parameter resolves from
+//!   the [`Request`] via its STRUCTURAL extractor type (the codegen dispatches on
+//!   shape, never a type name). `Path<String>`, `Query<HashMap>` and the whole-
+//!   `Request` extractor land here; the serde-backed reads (`Json<T>` body,
+//!   `Query<T>`) ride the injected `HttpMessageConverter` and the DI-collaborator
+//!   `State<T>` rides the handler's captured ctx — both resolved by the controller
+//!   codegen, so leaf-web names no serde format here.
 //!
-//! Later stages add `FromRequest` extractors, `ControlAdvice`, and the
-//! `WebServer`/`Dispatcher` — all backend-free, assembled from the container via
-//! collection + by-trait injection.
+//! Later stages add `ControlAdvice` and the `WebServer`/`Dispatcher` — all
+//! backend-free, assembled from the container via collection + by-trait injection.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod content;
+pub mod extract;
 pub mod filter;
 pub mod handler;
 pub mod request;
@@ -45,6 +53,7 @@ pub mod response;
 leaf_core::declare_source!("leaf-web");
 
 pub use content::HttpMessageConverter;
+pub use extract::{FromRequest, Header, Json, Path, Query, State};
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;
