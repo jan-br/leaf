@@ -1,0 +1,45 @@
+[package]
+name = "leaf-web-hyper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# leaf-web-hyper is THE backend crate — the ONE crate in the workspace allowed to
+# name hyper/tower/axum. It implements the leaf-web `WebServer` trait at the HTTP
+# transport edge, converting hyper's native request/response to/from the leaf
+# `Request`/`Response` so nothing above it ever sees hyper. Everything else stays
+# backend-free.
+leaf-core.workspace = true
+leaf-web.workspace = true
+# The shared executor: serving runs on the leaf-tokio runtime (Task 12 resolves the
+# default `WebServer` as a FALLBACK auto-config bean over it).
+leaf-tokio.workspace = true
+# The thin stereotype macros — `#[async_impl]` desugars the `WebServer::serve` body
+# into the `BoxFuture` form the `dyn WebServer` trait requires (no hand-written
+# `Box::pin(async move { .. })`).
+leaf-macros.workspace = true
+# The hyper 1.x HTTP/1 server + hyper-util's auto/Tokio glue (the executor + IO
+# adapters + the protocol-negotiating connection builder), http-body-util to
+# collect/emit a full body, bytes for the body carrier.
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "tokio", "http1"] }
+http-body-util.workspace = true
+bytes.workspace = true
+# The neutral HTTP value vocabulary (StatusCode for the bare-500 fallback). The leaf
+# `Request`/`Response` already carry `http` Method/Uri/HeaderMap; this names it directly
+# for the fallback path.
+http.workspace = true
+# The raw tokio runtime primitives the backend binds/accepts on: the TcpListener + the
+# per-connection task spawn run on the leaf-tokio executor's ambient runtime. (leaf-tokio
+# owns the FACILITY; the transport edge needs the bare net/rt API here.)
+tokio = { workspace = true, features = ["rt", "net"] }
+
+[dev-dependencies]
+# The integration test (`tests/serves_http.rs`) boots a real `HyperServer` on an
+# ephemeral port and drives real HTTP through it with a reqwest client, asserting
+# routing + a filter + advice end to end.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+reqwest = { workspace = true, default-features = false }
+futures.workspace = true
+http.workspace = true
