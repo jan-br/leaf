@@ -173,6 +173,12 @@ pub enum Stereotype {
     Repository,
     /// `@controller` — a web-layer bean (`[Controller, Component]`).
     Controller,
+    /// `@rest_controller` — a web-layer bean carrying the `@ResponseBody` policy:
+    /// the two-hop `@controller` specialization (`[RestController, Controller,
+    /// Component]`). The `RestController` marker is the one the rest-controller
+    /// return-codegen keys on (serialize the return via `HttpMessageConverter`),
+    /// orthogonal to the plain `Controller` (return `IntoResponse` directly).
+    RestController,
     /// `@configuration` — a `@bean`-factory holder (`[Configuration, Component]`).
     Configuration,
 }
@@ -186,6 +192,7 @@ impl Stereotype {
             Stereotype::Service => "leaf::Service",
             Stereotype::Repository => "leaf::Repository",
             Stereotype::Controller => "leaf::Controller",
+            Stereotype::RestController => "leaf::RestController",
             Stereotype::Configuration => "leaf::Configuration",
         }
     }
@@ -199,13 +206,20 @@ impl Stereotype {
     }
 
     /// The composed [`Annotation`] (self transitively over `@component`) the merge
-    /// engine flattens into `meta.markers`. `@component` is its own root; every
-    /// other stereotype is a one-hop meta-edge over `@component` (so the flattened
-    /// closure always contains `COMPONENT`, the default scan-include marker).
+    /// engine flattens into `meta.markers`. `@component` is its own root; the
+    /// single-hop stereotypes are a one-hop meta-edge over `@component` (so the
+    /// flattened closure always contains `COMPONENT`, the default scan-include
+    /// marker); `@rest_controller` is the two-hop `@rest_controller` → `@controller`
+    /// → `@component` chain (mirroring Spring's `@RestController = @Controller +
+    /// @ResponseBody`), so its closure is `[RestController, Controller, Component]`.
     #[must_use]
     pub fn annotation(self) -> Annotation {
         match self {
             Stereotype::Component => Annotation::new("leaf::Component"),
+            // `@rest_controller` composes `@controller` (which itself composes
+            // `@component`) — the two-hop closure carries all three markers.
+            Stereotype::RestController => Annotation::new(self.marker_path())
+                .with_meta(Stereotype::Controller.annotation()),
             other => Annotation::new(other.marker_path())
                 .with_meta(Annotation::new("leaf::Component")),
         }
@@ -808,6 +822,62 @@ mod tests {
         let s = flat(&input);
         assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::Service")"#), "got: {s}");
         assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::Component")"#), "got: {s}");
+    }
+
+    #[test]
+    fn rest_controller_marker_closure_is_rest_controller_controller_component() {
+        // A @rest_controller is @controller (= @component) plus the RestController
+        // self-marker: the TWO-hop closure flattens to [RestController, Controller,
+        // Component], with RestController first (the @ResponseBody policy marker the
+        // rest-controller return-codegen keys on), Controller next, Component the root.
+        let merged = resolve(&Stereotype::RestController.annotation()).expect("resolves");
+        assert_eq!(
+            merged.markers,
+            vec![
+                "leaf::RestController".to_string(),
+                "leaf::Controller".to_string(),
+                "leaf::Component".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn rest_controller_struct_carries_all_three_markers() {
+        // The headline Task-8 token test: `#[rest_controller] struct Api;` emits a
+        // @Component Descriptor whose meta.markers include BOTH the Controller AND the
+        // RestController markers (plus the transitive Component).
+        let s = flat_ts(
+            &emit_struct(
+                &item("struct Api;"),
+                Stereotype::RestController,
+                proc_macro2::TokenStream::new(),
+            )
+            .expect("emits"),
+        );
+        assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::RestController")"#), "got: {s}");
+        assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::Controller")"#), "got: {s}");
+        assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::Component")"#), "got: {s}");
+    }
+
+    #[test]
+    fn controller_struct_carries_the_controller_marker_but_not_rest_controller() {
+        // `#[controller] struct Api;` is the plain controller family: it carries the
+        // Controller (+ Component) markers but NOT the RestController @ResponseBody
+        // marker (a #[controller] returns IntoResponse directly, no serialize policy).
+        let s = flat_ts(
+            &emit_struct(
+                &item("struct Api;"),
+                Stereotype::Controller,
+                proc_macro2::TokenStream::new(),
+            )
+            .expect("emits"),
+        );
+        assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::Controller")"#), "got: {s}");
+        assert!(s.contains(r#"::leaf_core::MarkerId::of("leaf::Component")"#), "got: {s}");
+        assert!(
+            !s.contains(r#"::leaf_core::MarkerId::of("leaf::RestController")"#),
+            "a plain #[controller] must NOT carry the RestController marker: {s}"
+        );
     }
 
     #[test]

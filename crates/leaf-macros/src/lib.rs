@@ -15,6 +15,8 @@
 //! - `#[service]` / `#[repository]` / `#[controller]` / `#[configuration]` — the
 //!   same row differing ONLY in the transitive `meta.markers` closure (each is a
 //!   `@component` one-hop meta-edge), per component-stereotypes.
+//! - `#[rest_controller]` — the `@ResponseBody` specialization of `#[controller]`
+//!   (the two-hop `[RestController, Controller, Component]` closure).
 //! - `#[bean]` — a factory-method bean inside a `#[configuration]`, lowering to the
 //!   SAME const row shape (one shape, no second seed type).
 //! - `register_component!(Concrete)` — the escape hatch for a generic component: a
@@ -107,6 +109,18 @@ pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_stereotype(attr, item, Stereotype::Controller)
+}
+
+/// `#[rest_controller]` — the `@ResponseBody` specialization of `#[controller]`
+/// (`meta.markers` = `[RestController, Controller, Component]`); mirrors Spring's
+/// `@RestController = @Controller + @ResponseBody`. The extra `RestController`
+/// marker is the policy axis the rest-controller return-codegen (Task 9) keys on —
+/// a `#[rest_controller]` handler's return value is serialized through the injected
+/// `HttpMessageConverter`, whereas a plain `#[controller]` returns an `IntoResponse`
+/// directly. Otherwise identical to `#[component]` (field/referenced-ctor injection).
+#[proc_macro_attribute]
+pub fn rest_controller(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand_stereotype(attr, item, Stereotype::RestController)
 }
 
 /// `#[configuration]` — a `@bean`-factory holder. TWO forms:
