@@ -64,6 +64,13 @@ const CONCERN_ATTRS: &[&str] = &[
     "concurrency_limit",
 ];
 
+/// The request-mapping method attributes the `#[controller]`/`#[rest_controller]` impl
+/// iterator OWNS (stripped from the re-emitted impl, then lowered to a generated `Route`
+/// bean per method by the impl-block macro — a method-position attr alone cannot emit
+/// the sibling `Route` registration row). The verb-specific attrs (`#[get]`/…) +
+/// the general `#[route(method=.., path=..)]` form.
+const MAPPING_ATTRS: &[&str] = &["get", "post", "put", "delete", "patch", "head", "route"];
+
 /// `#[component]` — the base stereotype. Emits one const `::leaf_core::Descriptor`
 /// row (+ `ProviderSeed`/`InjectionPlan`/`Bean` impl) for the annotated struct.
 ///
@@ -105,10 +112,22 @@ pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// `#[controller]` — a web-layer stereotype (`meta.markers` = `[Controller,
-/// Component]`); otherwise identical to `#[component]`.
+/// Component]`). TWO forms:
+///
+/// - on a STRUCT: the controller BEAN — structurally a `#[component]` (so the
+///   controller is registered + resolvable, its collaborators field-injected),
+///   differing only in the transitive `Controller` marker.
+/// - on an inherent IMPL BLOCK (`#[controller] impl Pages { #[get("/")] async fn
+///   home(&self) -> Response {..} }`): the request-mapping form. Like `#[configuration]
+///   impl`/`#[advisable] impl`, an attr on a single method cannot emit the sibling
+///   `Route` registration row, so the impl block is processed as a unit: each mapped
+///   method (`#[get]`/`#[post]`/…) is lowered to ONE generated `Route` bean (the
+///   controller-impl iterator, Task 9). A plain `#[controller]` handler's return is
+///   converted via `IntoResponse` (no `@ResponseBody`). The mapping attrs are STRIPPED
+///   from the re-emitted impl (the impl-block macro owns the lowering).
 #[proc_macro_attribute]
 pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_stereotype(attr, item, Stereotype::Controller)
+    expand_controller(attr, item, Stereotype::Controller, false)
 }
 
 /// `#[rest_controller]` — the `@ResponseBody` specialization of `#[controller]`
@@ -117,10 +136,136 @@ pub fn controller(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// marker is the policy axis the rest-controller return-codegen (Task 9) keys on —
 /// a `#[rest_controller]` handler's return value is serialized through the injected
 /// `HttpMessageConverter`, whereas a plain `#[controller]` returns an `IntoResponse`
-/// directly. Otherwise identical to `#[component]` (field/referenced-ctor injection).
+/// directly. Like `#[controller]` it has TWO forms (the controller BEAN on a struct, the
+/// request-mapping ITERATOR on an inherent impl block — Task 9), differing only in the
+/// `@ResponseBody` serialize-return policy + the extra marker.
 #[proc_macro_attribute]
 pub fn rest_controller(attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_stereotype(attr, item, Stereotype::RestController)
+    expand_controller(attr, item, Stereotype::RestController, true)
+}
+
+/// The shared dual-form body for `#[controller]`/`#[rest_controller]`: a STRUCT is the
+/// controller bean (the stereotype struct lowering); an inherent IMPL BLOCK is the
+/// request-mapping iterator (Task 9), lowering each `#[get]`/`#[post]`/… method to its
+/// generated `Route` bean. `response_body` is the `@ResponseBody` return policy axis.
+fn expand_controller(
+    attr: TokenStream,
+    item: TokenStream,
+    stereotype: Stereotype,
+    response_body: bool,
+) -> TokenStream {
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Impl(item_impl) => {
+            let cleaned = strip_inner_attrs(item_impl.clone(), MAPPING_ATTRS);
+            match leaf_codegen::web_controller::expand_controller_impl(&item_impl, response_body) {
+                Ok(rows) => quote! { #cleaned #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #cleaned #error }.into()
+                }
+            }
+        }
+        Item::Struct(item_struct) => {
+            match stereotype::emit_struct(&item_struct, stereotype, attr.into()) {
+                Ok(rows) => quote! { #item_struct #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #item_struct #error }.into()
+                }
+            }
+        }
+        other => quote! {
+            #other
+            ::core::compile_error!(
+                "#[controller]/#[rest_controller] applies to a `struct` (the controller \
+                 bean) or an inherent `impl` block (its request-mapping methods)"
+            );
+        }
+        .into(),
+    }
+}
+
+// ═══════════════════ the request-mapping method attributes ═══════════════════
+//
+// These are the request-mapping annotations on a controller method: a method on a
+// `#[controller]`/`#[rest_controller] impl` carries `#[get("/x")]` / `#[post]` / … /
+// `#[route(method=.., path=..)]`, and the controller-impl iterator STRIPS + lowers each
+// to its generated `Route` bean (the impl iterator, not these per-method attrs, emits
+// the sibling registration row — a method-position attr alone cannot). So these
+// standalone proc-macro attributes exist only to make the annotation valid in attribute
+// position; applied OUTSIDE a controller impl they are a loud `compile_error!` steering
+// to the impl-block form (the same constraint `#[bean]`/`#[advice]` hit). The heavy
+// lowering lives in `leaf_codegen::web_controller`, driven by the controller-impl
+// iterator (`expand_controller_impl`).
+
+/// `#[get("/path")]` — map a GET request to a `#[controller]`-impl handler method. See
+/// the module note: the controller-impl macro lowers it to a `Route` bean; standalone
+/// it is a hard error.
+#[proc_macro_attribute]
+pub fn get(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "get")
+}
+
+/// `#[post("/path")]` — map a POST request to a `#[controller]`-impl handler method.
+/// Lowered by the controller-impl macro.
+#[proc_macro_attribute]
+pub fn post(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "post")
+}
+
+/// `#[put("/path")]` — map a PUT request to a `#[controller]`-impl handler method.
+/// Lowered by the controller-impl macro.
+#[proc_macro_attribute]
+pub fn put(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "put")
+}
+
+/// `#[delete("/path")]` — map a DELETE request to a `#[controller]`-impl handler method.
+/// Lowered by the controller-impl macro.
+#[proc_macro_attribute]
+pub fn delete(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "delete")
+}
+
+/// `#[patch("/path")]` — map a PATCH request to a `#[controller]`-impl handler method.
+/// Lowered by the controller-impl macro.
+#[proc_macro_attribute]
+pub fn patch(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "patch")
+}
+
+/// `#[head("/path")]` — map a HEAD request to a `#[controller]`-impl handler method.
+/// Lowered by the controller-impl macro.
+#[proc_macro_attribute]
+pub fn head(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "head")
+}
+
+/// `#[route(method = "PUT", path = "/path")]` — the general request-mapping form (the
+/// verb-specific attrs sugar it) on a `#[controller]`-impl handler method. Lowered by
+/// the controller-impl macro.
+#[proc_macro_attribute]
+pub fn route(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mapping_marker_only(item, "route")
+}
+
+/// The shared body for the request-mapping markers: keep the item verbatim and append a
+/// `compile_error!` — applied standalone (outside a controller impl) a per-method
+/// mapping attr cannot emit its sibling `Route` registration row, so it steers to the
+/// impl-block form. Inside a `#[controller]`/`#[rest_controller] impl` the macro is
+/// STRIPPED before it expands (the impl iterator owns the lowering), so this never
+/// fires there.
+fn mapping_marker_only(item: TokenStream, kw: &str) -> TokenStream {
+    let parsed: proc_macro2::TokenStream = item.into();
+    let message = format!(
+        "`#[{kw}]` is a request-mapping annotation for a method INSIDE a \
+         `#[controller]`/`#[rest_controller] impl Controller {{ .. }}` block: the \
+         impl-block macro lowers it to its generated `Route` bean (a method-position \
+         attribute alone cannot emit the sibling registration row). Put the \
+         `#[controller]`/`#[rest_controller]` attribute on the impl block."
+    );
+    quote! { #parsed ::core::compile_error!(#message); }.into()
 }
 
 /// `#[configuration]` — a `@bean`-factory holder. TWO forms:

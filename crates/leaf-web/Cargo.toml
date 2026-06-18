@@ -46,3 +46,9 @@ leaf-boot.workspace = true
 # compile leaf-web as a normal dependency, where `cfg(test)` is off) still see the
 # `MockServer` harness. The standard Cargo idiom for a test-only public surface.
 leaf-web = { path = ".", features = ["testing"] }
+# The Task-9 controller-codegen proof (`tests/controller_routes.rs`) boots a real
+# `#[rest_controller]` whose generated `Route` beans serialize returns through the JSON
+# `HttpMessageConverter` (`leaf-serde`'s `JsonConverter` bean) and needs serde derive
+# for the response DTO. Dev-only: leaf-web's production deps stay leaf-core + http.
+leaf-serde.workspace = true
+serde = { workspace = true }

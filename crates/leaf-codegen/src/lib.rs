@@ -67,3 +67,4 @@ pub mod rollup;
 pub mod scheduling;
 pub mod stereotype;
 pub mod validate;
+pub mod web_controller;

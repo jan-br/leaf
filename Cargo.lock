@@ -802,7 +802,9 @@ dependencies = [
  "leaf-boot",
  "leaf-core",
  "leaf-macros",
+ "leaf-serde",
  "leaf-web",
+ "serde",
 ]
 
 [[package]]
