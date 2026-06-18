@@ -33,18 +33,33 @@
 //!   `State<T>` rides the handler's captured ctx — both resolved by the controller
 //!   codegen, so leaf-web names no serde format here.
 //!
-//! Later stages add `ControlAdvice` and the `WebServer`/`Dispatcher` — all
-//! backend-free, assembled from the container via collection + by-trait injection.
+//! - [`ControlAdvice`] — the global error-handling seam (Spring's
+//!   `@ControllerAdvice`/`@ExceptionHandler`): an ordered chain that maps a
+//!   `LeafError` (from a handler/filter/extractor) to a [`Response`], first-match
+//!   wins, with a built-in default mapping as the floor.
+//! - [`ServerProperties`] / [`WebServer`] / [`Dispatcher`] — the server seam: the
+//!   bound address, the pluggable embedded-server bean, and the protocol-agnostic
+//!   request engine. The [`Dispatcher`] runs the filter chain → matches a route →
+//!   invokes its handler → maps errors via the advice chain, and NEVER errors out
+//!   (every failure becomes a response). It is backend-free: a backend converts its
+//!   native request to a [`Request`], calls [`Dispatcher::dispatch`], and writes the
+//!   [`Response`].
+//!
+//! All of it is backend-free, assembled from the container via collection +
+//! by-trait injection (`Vec<Ref<dyn Route>>` / `Vec<Ref<dyn WebFilter>>` /
+//! `Vec<Ref<dyn ControlAdvice>>`).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod advice;
 pub mod content;
 pub mod extract;
 pub mod filter;
 pub mod handler;
 pub mod request;
 pub mod response;
+pub mod server;
 
 // The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag
 // in the link-collected `SOURCES` slice so a binary that lists leaf-web in its
@@ -52,9 +67,11 @@ pub mod response;
 // from "never-linked". The package name (dashes) is the join string.
 leaf_core::declare_source!("leaf-web");
 
+pub use advice::ControlAdvice;
 pub use content::HttpMessageConverter;
 pub use extract::{FromRequest, Header, Json, Path, Query, State};
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;
 pub use response::{IntoResponse, Response};
+pub use server::{Dispatcher, ServerProperties, WebServer};
