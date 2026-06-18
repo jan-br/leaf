@@ -9,6 +9,12 @@ license.workspace = true
 # define their concern traits). It names NO HTTP-server library — hyper/tower/
 # axum live exclusively in the leaf-web-hyper backend crate (Stage 3).
 leaf-core.workspace = true
+# The thin stereotype macros — leaf-web's own beans dogfood them: `ServerProperties` is a
+# `#[config_properties]` `@ConfigurationProperties` bean, and the `WebServerRunner` is a
+# `#[runner]` whose `Runner::run` is written via `#[async_impl]`. No backend library here:
+# leaf-macros -> leaf-codegen -> leaf-core (no cycle), exactly like leaf-cache/leaf-tx
+# depend on leaf-macros for their auto-config beans.
+leaf-macros.workspace = true
 # Neutral, server-agnostic HTTP value vocabulary (Method/StatusCode/HeaderMap/
 # Uri) — the ecosystem standard hyper/axum/tonic all build on; NOT server internals.
 http.workspace = true
@@ -30,10 +36,6 @@ erased-serde.workspace = true
 testing = []
 
 [dev-dependencies]
-# The `#[cfg(test)]` fake filters/terminal write their around-advice bodies as
-# native `async fn` via #[async_impl] (no cycle: leaf-macros -> leaf-codegen ->
-# leaf-core; leaf-web -> leaf-core). The lone Stage-1 hand-written impls.
-leaf-macros.workspace = true
 # A minimal `block_on` to drive the async filter chain in unit tests — no runtime.
 futures.workspace = true
 # The DI-assembly proof (`tests/dispatch_through_mock.rs`): leaf-boot's cold-pass

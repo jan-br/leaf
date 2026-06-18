@@ -11,10 +11,17 @@
 //! [`HyperServer`] is the swappable default backend; a mock backend
 //! (`leaf_web::MockServer`) implements the SAME trait with no transport, proving the
 //! abstraction is genuinely backend-free.
+//!
+//! [`HyperServerAutoConfig`] contributes [`HyperServer`] as the DEFAULT `dyn WebServer` bean
+//! — an `#[auto_config]` `FALLBACK` row gated by `OnMissingBean(dyn WebServer)`, so simply
+//! linking this crate makes an app serve, while a different backend (or a user `WebServer`)
+//! supersedes it by providing the same `dyn ::leaf_web::WebServer` view. The leaf-web
+//! [`WebServerRunner`](leaf_web::WebServerRunner) injects whichever server won and serves.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod autoconfig;
 pub mod server;
 
 // The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag in the
@@ -23,4 +30,5 @@ pub mod server;
 // name (dashes) is the author-stable join string.
 leaf_core::declare_source!("leaf-web-hyper");
 
+pub use autoconfig::HyperServerAutoConfig;
 pub use server::HyperServer;

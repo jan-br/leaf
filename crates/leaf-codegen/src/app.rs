@@ -285,7 +285,9 @@ pub fn emit_runner_upcast(ident: &str) -> TokenStream {
         // The PUBLIC per-runner upcast thunk: downcast the erased bean to the concrete
         // runner, re-wrap as Arc<dyn Runner>. The run pipeline applies it to the
         // resolved erased bean to auto-collect the runner from the live Context.
-        #[allow(non_upper_case_globals, non_snake_case)]
+        // `missing_docs`: a macro-generated `pub` thunk — allow it so a crate that
+        // `#![warn(missing_docs)]`s (e.g. leaf-web's `WebServerRunner`) is not flagged.
+        #[allow(non_upper_case_globals, non_snake_case, missing_docs)]
         pub fn #upcast_ident(
             __bean: ::leaf_core::ErasedBean,
         ) -> ::core::option::Option<::std::sync::Arc<dyn ::leaf_core::Runner>> {

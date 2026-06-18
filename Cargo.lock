@@ -951,11 +951,15 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "leaf-boot",
+ "leaf-conditions",
  "leaf-core",
  "leaf-macros",
+ "leaf-serde",
  "leaf-tokio",
  "leaf-web",
  "reqwest",
+ "serde",
  "tokio",
 ]
 

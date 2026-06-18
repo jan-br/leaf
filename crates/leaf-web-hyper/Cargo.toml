@@ -43,3 +43,17 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 reqwest = { workspace = true, default-features = false }
 futures.workspace = true
 http.workspace = true
+# The Task-12 auto-config proof (`tests/auto_config_server.rs`) boots a REAL leaf app:
+# leaf-boot's run pipeline auto-collects the `#[auto_config]` FALLBACK `dyn WebServer`
+# (this crate) + the leaf-web `WebServerRunner` + a `#[rest_controller]`, and the runner
+# assembles the `Dispatcher` from the container + serves — proving the endpoint responds
+# over real HTTP. leaf-tokio supplies the run-pipeline spawner; leaf-serde's JSON
+# converter serializes the controller return; leaf-macros writes the controller.
+leaf-boot.workspace = true
+leaf-tokio.workspace = true
+leaf-serde.workspace = true
+serde = { workspace = true }
+# The `autoconfig.rs` unit tests drive the real `run_autoconfig` ladder and assert the
+# OnMissingBean(dyn WebServer) back-off — `leaf-conditions` names the `OnMissingBean` kind
+# the guard leaf carries (the same back-off proof leaf-cache/leaf-tx run for their defaults).
+leaf-conditions.workspace = true

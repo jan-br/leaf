@@ -412,7 +412,10 @@ pub fn emit_config_properties(
         // ── the rich const ConfigGroup documenting the bound keys (leaf metadata) ──
         #[allow(non_upper_case_globals)]
         static #props_ident: &[::leaf_core::Property] = &[ #(#property_rows),* ];
-        #[allow(non_upper_case_globals)]
+        // A macro-generated `pub` artifact: allow `missing_docs` so a contributing crate
+        // that `#![warn(missing_docs)]`s does not flag this internal config-metadata const
+        // (the same generated-item lint parity the descriptor/seed emitters apply).
+        #[allow(non_upper_case_globals, missing_docs)]
         pub const #group_ident: ::leaf_core::ConfigGroup = ::leaf_core::ConfigGroup {
             prefix: #prefix,
             type_name: ::core::concat!(::core::module_path!(), "::", #ident_str),
@@ -511,7 +514,7 @@ fn emit_config_bean_registration(
             }
         }
 
-        #[allow(non_upper_case_globals)]
+        #[allow(non_upper_case_globals, missing_docs)]
         pub const #seed_ident: ::leaf_core::ProviderSeed = || {
             ::std::sync::Arc::new(#provider_ident(::leaf_core::Descriptor {
                 contract: #contract,
@@ -612,7 +615,7 @@ fn emit_config_bind_thunk(
         // registered as a bean too, via the auto-config / config-properties lane).
         impl ::leaf_core::Bean for #ident {}
 
-        #[allow(non_upper_case_globals)]
+        #[allow(non_upper_case_globals, missing_docs)]
         pub const #thunk_ident: ::leaf_core::ConfigBindThunk =
             |__env: &::leaf_core::Env, __lever: ::leaf_core::StartupValidation|
                 -> ::leaf_core::ConfigBindOutcome

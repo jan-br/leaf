@@ -30,14 +30,19 @@ use crate::{Request, Response};
 /// The embedded web server's bound address — `@ConfigurationProperties` keyed
 /// `leaf.web.server` (Spring's `server.address` / `server.port`).
 ///
-/// A plain settings struct the `WebServerRunner` (Stage 3) binds from the
-/// environment and hands to [`WebServer::serve`]; the abstraction crate only
-/// defines its shape.
+/// A `#[config_properties(prefix = "leaf.web.server")]` bean: the run pipeline binds
+/// `leaf.web.server.host` / `leaf.web.server.port` from the environment (CLI args / env /
+/// config files) purely from the macro-emitted bind thunk, auto-registers it (so it is
+/// resolvable as `Ref<ServerProperties>`), and the [`WebServerRunner`](crate::WebServerRunner)
+/// injects it and hands it to [`WebServer::serve`]. The abstraction crate owns its shape;
+/// the unset default is `127.0.0.1:8080`.
+#[leaf_macros::config_properties(prefix = "leaf.web.server")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerProperties {
-    /// The bind host (e.g. `"127.0.0.1"` or `"0.0.0.0"`).
+    /// The bind host (`leaf.web.server.host`, e.g. `"127.0.0.1"` or `"0.0.0.0"`).
     pub host: String,
-    /// The bind port (`0` = an ephemeral OS-assigned port, used by tests).
+    /// The bind port (`leaf.web.server.port`; `0` = an ephemeral OS-assigned port, used
+    /// by tests).
     pub port: u16,
 }
 
@@ -70,6 +75,13 @@ pub trait WebServer: Send + Sync {
         props: &'a ServerProperties,
     ) -> BoxFuture<'a, Result<(), LeafError>>;
 }
+
+// The by-trait-injection seam for the pluggable server (emitted once, beside the trait —
+// orphan-rule-OK, `dyn WebServer` is local). It makes `Ref<dyn WebServer>` injectable, so
+// the `WebServerRunner` resolves whichever `dyn WebServer` bean won (the FALLBACK hyper
+// auto-config, or a user-provided backend that supersedes it via OnMissingBean) — the
+// same path `Ref<dyn CacheManager>` / `Ref<dyn TransactionManager>` use.
+leaf_core::impl_resolve_view!(dyn WebServer);
 
 /// The protocol-agnostic request engine: it owns the container-collected routes,
 /// filters, and advice, and turns a leaf [`Request`] into a [`Response`].
