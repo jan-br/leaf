@@ -89,6 +89,30 @@ pub use leaf_tx::{
     InMemoryTransactionManager, TxPointcut,
 };
 
+// The leaf-web macro surface the `#[controller]`/`#[rest_controller]`/`#[control_advice]`
+// annotations emit `::leaf_web::` paths into — re-exported AT THE UMBRELLA ROOT so the
+// facade alias `extern crate leaf as leaf_web;` (auto-emitted by `#[leaf::main]`) resolves
+// `::leaf_web::Route` to `leaf::Route`, exactly like the `leaf_cache`/`leaf_tx` aliases.
+// Only the EXACT symbols the web macros reference are re-exported here (an explicit list,
+// not a glob — `leaf-web`'s `Next`/`Request`/… share names with other crates a glob could
+// clash on); the broader user-facing web surface is reached via the `web` prelude block.
+// Present iff the `web` capability feature pulled the bundle in.
+#[cfg(feature = "web")]
+#[doc(hidden)]
+pub use leaf_starter_web::leaf_web::{
+    ControlAdvice, FromRequest, Handler, HttpMessageConverter, IntoResponse, Request, Response,
+    Route,
+};
+// The neutral HTTP value vocabulary leaf-web re-exports — re-exported AT THE UMBRELLA ROOT
+// too so the controller codegen's `::leaf_web::http::Method::GET` verb token (+ the
+// `CONTENT_TYPE` header) resolves through the `leaf_web` facade alias (`::leaf_web::http`
+// → `leaf::http`). An umbrella-only app reaches `http` through the one `leaf` dep — never
+// naming `http` directly — exactly as `::leaf_core::`/`::leaf_cache::` route their external
+// types through a leaf-* crate the alias points at.
+#[cfg(feature = "web")]
+#[doc(hidden)]
+pub use leaf_starter_web::leaf_web::http;
+
 // ── flat re-exports of the three foundation crates (so `leaf::core`, `leaf::boot`,
 // `leaf::macros` reach the full surface without naming the hyphenated crates) ──
 

@@ -31,6 +31,13 @@
 //! - **The advice-manager traits** (the SPIs a user implements to back a concern):
 //!   [`CacheManager`], [`TransactionManager`].
 //! - **The bootstrap bridge:** [`bootstrap`] (the default-runtime run entry).
+//! - **The web surface** (only with the `web` capability feature): the HTTP
+//!   stereotypes + request-mapping attrs `rest_controller` / `get` / `post` / `put` /
+//!   `delete` / `route` and the global-error `control_advice` / `exception_handler`
+//!   macros, plus the leaf-web types a handler/filter/advice names — `Request` /
+//!   `Response` / `IntoResponse`, the `FromRequest` extractors `Path` / `Query` /
+//!   `Json` / `Header` / `State`, and the `WebFilter` / `Next` / `ControlAdvice`
+//!   extension traits. (`controller` is in the always-on stereotype list above.)
 
 // ── every annotation macro (the maximal-magic surface, charter §2.10) ──
 #[doc(no_inline)]
@@ -66,3 +73,28 @@ pub use leaf_core::{CacheManager, TransactionManager};
 // ── the default-runtime bootstrap bridge ──
 #[doc(no_inline)]
 pub use crate::runtime::bootstrap;
+
+// ── the WEB capability surface (present iff the `web` feature pulled the bundle) ──
+//
+// The HTTP transport stereotypes + the request-mapping method attrs + the global-error
+// macro, plus the leaf-web types a controller/filter/advice names in its signatures
+// (`Request`/`Response`/`IntoResponse`, the `FromRequest` extractors `Path`/`Query`/
+// `Json`/`Header`/`State`, and the `WebFilter`/`Next`/`ControlAdvice` extension traits).
+// Brought in flat so `use leaf::prelude::*;` is the whole web surface — the same maximal-
+// magic shape the cross-cutting concerns already have. `#[controller]` is in the always-on
+// macro glob above (it predates this stack as a bare marker); the rest land here.
+//
+// The macros emit ABSOLUTE `::leaf_web::` paths that resolve through the umbrella's facade
+// alias (`extern crate leaf as leaf_web;`) + the root re-exports above; these prelude names
+// are what the USER writes.
+#[cfg(feature = "web")]
+#[doc(no_inline)]
+pub use leaf_macros::{
+    control_advice, delete, exception_handler, get, post, put, rest_controller, route,
+};
+#[cfg(feature = "web")]
+#[doc(no_inline)]
+pub use leaf_starter_web::leaf_web::{
+    ControlAdvice, FromRequest, Header, IntoResponse, Json, Next, Path, Query, Request, Response,
+    State, WebFilter,
+};

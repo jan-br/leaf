@@ -87,9 +87,14 @@ pub fn participating_crates() -> Vec<&'static str> {
     const REDIS: &[&str] = &[];
 
     #[cfg(feature = "web")]
-    // The STACK starter: the curated additive bundle (the non-ecosystem set that
-    // exists today — leaf-tokio + leaf-validation + leaf-cache).
-    const WEB: &[&str] = &["leaf-tokio", "leaf-validation", "leaf-cache"];
+    // The STACK starter: the curated HTTP transport bundle. The crates that contribute
+    // a `declare_source!` SourceTag (so the anti-DCE self-check expects them in SOURCES):
+    // the leaf-web abstractions + the hyper backend + the runtime peer + the web
+    // concerns. leaf-serde rides the bundle (its JSON converter is force-linked via the
+    // starter's `pub use leaf_serde`) but declares NO SourceTag, so it is not listed
+    // here — the manifest is the SourceTag mirror, not the dependency mirror.
+    const WEB: &[&str] =
+        &["leaf-cache", "leaf-tokio", "leaf-validation", "leaf-web", "leaf-web-hyper"];
     #[cfg(not(feature = "web"))]
     const WEB: &[&str] = &[];
 
@@ -205,6 +210,10 @@ mod tests {
     #[test]
     fn the_web_capability_contributes_the_curated_stack_bundle() {
         let crates = participating_crates();
+        // The HTTP transport stack: the abstractions + the hyper backend.
+        assert!(crates.contains(&"leaf-web"), "got: {crates:?}");
+        assert!(crates.contains(&"leaf-web-hyper"), "got: {crates:?}");
+        // The runtime peer + the web concerns.
         assert!(crates.contains(&"leaf-tokio"), "got: {crates:?}");
         assert!(crates.contains(&"leaf-validation"), "got: {crates:?}");
         assert!(crates.contains(&"leaf-cache"), "got: {crates:?}");

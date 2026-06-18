@@ -17,26 +17,37 @@
 //!
 //! This is the downstream "single dep a downstream app names" contract, end to end.
 
+// The prelude glob is what the base-path beans below use; under `web` those beans are
+// cfg'd out (the seam test reaches `leaf::forcelink::*` by path), so the import is too.
+#[cfg(not(feature = "web"))]
 use leaf::prelude::*;
 
 // ─────────────────────────── the user's app beans ───────────────────────────
+//
+// These back the base-path boot proof, which is gated off under the `web` capability
+// (the bundle's blocking `WebServerRunner` makes `run()` not return — see the test's cfg),
+// so the beans themselves are `not(feature = "web")`-gated to stay dead-code-clean there.
 
 /// A `@Component` repository constructed via `Repository::new()` (the
 /// no-injected-collaborator `register_component!` form) — the dependency target.
+#[cfg(not(feature = "web"))]
 #[derive(Debug)]
 struct Repository {
     name: &'static str,
 }
 
+#[cfg(not(feature = "web"))]
 impl Repository {
     fn new() -> Self {
         Repository { name: "order" }
     }
 }
+#[cfg(not(feature = "web"))]
 register_component!(Repository);
 
 /// A `@Component` service depending on the [`Repository`] (constructor injection
 /// over the `Ref<Repository>` field) — the live dependency-graph edge.
+#[cfg(not(feature = "web"))]
 #[component]
 #[derive(Debug)]
 struct OrderService {
@@ -45,6 +56,7 @@ struct OrderService {
 
 /// A `@ConfigurationProperties` type bound from `app.*` — AUTO-REGISTERED + bound +
 /// resolvable purely from the macro-emitted slices (no hand seed/descriptor/thunk).
+#[cfg(not(feature = "web"))]
 #[config_properties(prefix = "app")]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AppProps {
@@ -54,6 +66,13 @@ struct AppProps {
 
 // ─────────────────────────────── the milestone ───────────────────────────────
 
+// This base-path proof boots to Ready and expects `run()` to RETURN so it can assert +
+// shut down. With the `web` capability on, the bundle's `WebServerRunner` fires and BLOCKS
+// on the embedded-server accept loop (the Spring `WebServer` model — `run()` does not
+// return), so this non-web boot proof is gated off under `web`; the web blessed-path boot
+// proof lives in `tests/web_umbrella.rs` (it runs the blocking serve on a dedicated thread
+// + probes the socket). The non-boot force-link/manifest seam test below stays unconditional.
+#[cfg(not(feature = "web"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_umbrella_runs_a_real_app_from_the_prelude_alone() {
     // The blessed path: bootstrap the default-runtime Application + run it. The
@@ -123,8 +142,12 @@ fn the_force_link_macro_and_manifest_seam_are_reachable() {
     }
     #[cfg(all(feature = "web", not(feature = "redis")))]
     {
-        // The web stack pulls its curated bundle (incl. leaf-validation) into the set.
+        // The web stack pulls its curated HTTP transport bundle into the set: the
+        // leaf-web abstractions + the hyper backend (each a `declare_source!` crate the
+        // manifest mirrors as a SourceTag for the self-check).
+        assert!(crates.contains(&"leaf-web"), "got: {crates:?}");
+        assert!(manifest.iter().any(|t| t.0 == "leaf-web"), "got: {manifest:?}");
+        assert!(crates.contains(&"leaf-web-hyper"), "got: {crates:?}");
         assert!(crates.contains(&"leaf-validation"), "got: {crates:?}");
-        assert!(manifest.iter().any(|t| t.0 == "leaf-validation"), "got: {manifest:?}");
     }
 }

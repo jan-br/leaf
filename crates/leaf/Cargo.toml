@@ -60,4 +60,8 @@ leaf-starter-web = { workspace = true, optional = true }
 [dev-dependencies]
 # The end-to-end umbrella proof drives a real run pipeline under a tokio runtime.
 futures.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+# The umbrella WEB proof (`tests/web_umbrella.rs`, `web` feature) defines JSON DTOs the
+# `#[rest_controller]` serializes — serde is the data-format vocabulary a JSON app owns
+# (the leaf umbrella stays serde-format-free; leaf-serde bridges it under the hood).
+serde = { workspace = true, features = ["derive"] }

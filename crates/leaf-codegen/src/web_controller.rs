@@ -45,7 +45,7 @@ const MAPPING_ATTRS: &[&str] = &["get", "post", "put", "delete", "patch", "head"
 /// A request-mapping method: the verb-constant token + the path pattern + the method.
 struct MappedMethod<'a> {
     method: &'a ImplItemFn,
-    /// The `::http::Method` constant token for the verb (`GET`/`POST`/…).
+    /// The `::leaf_web::http::Method` constant token for the verb (`GET`/`POST`/…).
     verb: TokenStream,
     /// The path PATTERN literal (e.g. `"/products/{sku}"`).
     path: String,
@@ -146,7 +146,7 @@ fn emit_route_bean(
             let __body = __converter.write(&__value)?;
             ::core::result::Result::Ok(
                 ::leaf_web::Response::ok()
-                    .with_header(::http::header::CONTENT_TYPE, __converter.content_type())
+                    .with_header(::leaf_web::http::header::CONTENT_TYPE, __converter.content_type())
                     .with_body(__body),
             )
         }
@@ -187,7 +187,7 @@ fn emit_route_bean(
 
         #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
         impl ::leaf_web::Route for #route_struct_ident {
-            fn method(&self) -> ::http::Method {
+            fn method(&self) -> ::leaf_web::http::Method {
                 #verb
             }
             fn path(&self) -> &str {
@@ -265,10 +265,12 @@ fn mapping_of(func: &ImplItemFn) -> Result<Option<MappedMethod<'_>>, EmitError> 
     Ok(Some(MappedMethod { method: func, verb, path }))
 }
 
-/// The `::http::Method::<VERB>` constant token for a verb-specific mapping attr name.
+/// The `::leaf_web::http::Method::<VERB>` constant token for a verb-specific mapping
+/// attr name (through the `leaf_web` facade re-export of `http`, so an umbrella-only app
+/// reaches it via the one `leaf_web` alias — never needing `http` as a direct dep).
 fn verb_token(name: &str) -> TokenStream {
     let verb = format_ident!("{}", name.to_uppercase());
-    quote! { ::http::Method::#verb }
+    quote! { ::leaf_web::http::Method::#verb }
 }
 
 /// Parse a verb-specific attr's single string-literal path (`#[get("/x")]` → `/x`).
@@ -349,7 +351,7 @@ fn parse_route_attr(
     // emit the const directly. (The verb-specific attrs only ever produce standard verbs.)
     let token = match verb_upper.as_str() {
         "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" | "TRACE"
-        | "CONNECT" => quote! { ::http::Method::#verb },
+        | "CONNECT" => quote! { ::leaf_web::http::Method::#verb },
         other => {
             return Err(EmitError {
                 message: format!(
@@ -614,7 +616,7 @@ mod tests {
         );
 
         // (b) the verb + the path PATTERN.
-        assert!(s.contains("::http::Method::GET"), "method() == GET: {s}");
+        assert!(s.contains("::leaf_web::http::Method::GET"), "method() == GET: {s}");
         assert!(s.contains(r#""/products/{sku}""#), "path() == the pattern: {s}");
 
         // (c) the arg resolves via `<Path<String> as FromRequest>::from_request` (trait
@@ -681,7 +683,7 @@ mod tests {
             2,
             "two mapping methods => two COMPONENTS Route rows: {s}"
         );
-        assert!(s.contains("::http::Method::POST"), "the POST verb: {s}");
+        assert!(s.contains("::leaf_web::http::Method::POST"), "the POST verb: {s}");
         assert!(s.contains(r#""/orders""#), "the POST path: {s}");
         assert!(s.contains(r#""/orders/{id}""#), "the GET path: {s}");
         // The non-mapping helper method does NOT contribute a Route.
@@ -703,7 +705,7 @@ mod tests {
             }"#,
         );
         let s = flat(&expand_controller_impl(&item, true).expect("emits"));
-        assert!(s.contains("::http::Method::PUT"), "the explicit verb: {s}");
+        assert!(s.contains("::leaf_web::http::Method::PUT"), "the explicit verb: {s}");
         assert!(s.contains(r#""/widgets/{id}""#), "the explicit path: {s}");
     }
 

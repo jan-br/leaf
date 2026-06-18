@@ -83,6 +83,16 @@ pub mod testing;
 // from "never-linked". The package name (dashes) is the join string.
 leaf_core::declare_source!("leaf-web");
 
+// The neutral HTTP value vocabulary (`Method`/`StatusCode`/`HeaderMap`/`Uri`) leaf-web
+// builds on, re-exported so it is reachable AS `leaf_web::http` — the path the
+// controller codegen emits (`::leaf_web::http::Method::GET`, the verb token; the
+// `CONTENT_TYPE` header name) so an umbrella-only app reaches it through the SAME
+// `leaf_web` facade alias the rest of the web macro surface uses, never needing `http`
+// as a direct dependency. The `http` types already appear in leaf-web's public API
+// (`Route::method` returns `http::Method`), so re-exporting the crate is honest.
+#[doc(no_inline)]
+pub use http;
+
 pub use advice::ControlAdvice;
 pub use content::HttpMessageConverter;
 pub use extract::{FromRequest, Header, Json, Path, Query, State};

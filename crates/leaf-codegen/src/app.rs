@@ -156,6 +156,13 @@ pub fn emit_main(binary_crate: &str, args: &MainArgs, user_fn: &syn::ItemFn) -> 
         extern crate leaf as leaf_cache;
         #[allow(unused_extern_crates)]
         extern crate leaf as leaf_tx;
+        // The web facade alias: the `#[controller]`/`#[rest_controller]`/`#[control_advice]`
+        // macros emit `::leaf_web::` paths (the `Route`/`Handler`/`Request`/`Response`/…
+        // surface + the `::leaf_web::http::` verb token), which this alias resolves to the
+        // umbrella's `web`-gated root re-exports. An app with no `web` feature simply leaves
+        // it unused (the `#[allow]`), so emitting it unconditionally is harmless.
+        #[allow(unused_extern_crates)]
+        extern crate leaf as leaf_web;
     };
     let anti_dce = quote! { #facade_aliases #anti_dce };
 
@@ -398,6 +405,10 @@ mod tests {
         assert!(s.contains("externcrateleafasleaf_core;"), "got: {s}");
         assert!(s.contains("externcrateleafasleaf_cache;"), "got: {s}");
         assert!(s.contains("externcrateleafasleaf_tx;"), "got: {s}");
+        // The WEB facade alias — so a `#[controller]`/`#[rest_controller]`/`#[control_advice]`
+        // annotation's `::leaf_web::` path (incl. the `::leaf_web::http::` verb token)
+        // resolves crate-wide from the one `leaf` dep, exactly like the concern aliases.
+        assert!(s.contains("externcrateleafasleaf_web;"), "got: {s}");
         // The binary crate itself is always force-linked.
         assert!(s.contains(r#"::leaf_core::SourceTag("my-app")"#), "got: {s}");
         // A real synchronous `fn main` returning the umbrella-rooted LeafError is emitted.

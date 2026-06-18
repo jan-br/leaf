@@ -707,6 +707,7 @@ dependencies = [
  "leaf-starter-web",
  "leaf-tokio",
  "leaf-tx",
+ "serde",
  "tokio",
 ]
 
@@ -884,8 +885,11 @@ name = "leaf-starter-web"
 version = "0.1.0"
 dependencies = [
  "leaf-cache",
+ "leaf-serde",
  "leaf-tokio",
  "leaf-validation",
+ "leaf-web",
+ "leaf-web-hyper",
 ]
 
 [[package]]

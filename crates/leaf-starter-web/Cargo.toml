@@ -4,17 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# STACK starter — a curated additive bundle over EXISTING non-ecosystem crates.
+# STACK starter — a curated additive web bundle.
 #
-# NOTE: the spring-boot-starter-web ideal is `leaf-router + leaf-tokio + leaf-json
-# + leaf-validation` (phase3/03 TOPOLOGY). But leaf-router/leaf-json are real web
-# INTEGRATION crates = ECOSYSTEM, which the charter's non-ecosystem scope excludes.
-# So this is a REPRESENTATIVE stack starter over the non-ecosystem crates that DO
-# exist (leaf-tokio + leaf-validation + leaf-cache) — enough to prove the
-# stack-starter SHAPE (a curated additive bundle, not an XOR/backend choice).
-# Real web bindings (leaf-router, leaf-json) follow the leaf-redis integration
-# pattern and slot in here as extra dependencies when the ecosystem ships them.
+# The HTTP transport stack the sub-project-A spec defines: the leaf-web ABSTRACTIONS
+# + the leaf-web-hyper BACKEND (the FALLBACK `dyn WebServer` auto-config) + the
+# leaf-serde JSON `HttpMessageConverter` — bundled with the runtime peer (leaf-tokio)
+# and the request/bean-validation concern (leaf-validation) + response/method caching
+# (leaf-cache). A downstream adds the ONE `web` capability and gets the coherent set:
+# every crate's auto-config participates + backs off independently.
 [dependencies]
+# The HTTP transport stack (sub-project A): the backend-free abstractions, the hyper
+# backend (its FALLBACK `dyn WebServer` auto-config row), and the JSON content
+# converter (its `dyn HttpMessageConverter` bean). leaf-serde's `web-converter`
+# feature is on by default, so the JSON converter rides the bundle.
+leaf-web.workspace = true
+leaf-web-hyper.workspace = true
+leaf-serde.workspace = true
+# The runtime peer (the executor the server serves on) + the cross-cutting web concerns.
 leaf-tokio.workspace = true
 leaf-validation.workspace = true
 leaf-cache.workspace = true

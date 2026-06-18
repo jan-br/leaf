@@ -10,22 +10,26 @@
 //! participates and backs off independently); the backend choice is a
 //! runtime/profile decision, NEVER an XOR cargo feature.
 //!
-//! ## NOTE — representative bundle (charter non-ecosystem scope)
+//! ## The bundle — the HTTP transport stack (sub-project A)
 //!
-//! The spring-boot-starter-web ideal is `leaf-router + leaf-tokio + leaf-json +
-//! leaf-validation` (phase3/03 TOPOLOGY "Starters & BOM"). But `leaf-router` and
-//! `leaf-json` are REAL web integration crates = **ecosystem**, which the
-//! charter's non-ecosystem scope EXCLUDES. So this crate is a REPRESENTATIVE
-//! stack starter over the non-ecosystem crates that DO exist — [`leaf_tokio`]
-//! (the runtime), [`leaf_validation`] (request/bean validation), and
-//! [`leaf_cache`] (response/method caching) — which is enough to prove the
-//! stack-starter SHAPE.
+//! This bundle is the leaf-web HTTP stack the web spec defines:
 //!
-//! Real web bindings follow the [`leaf_redis`](https://docs.rs/leaf-redis)
-//! integration pattern (an integration crate depending on leaf-core + a runtime +
-//! a 3rd-party lib, contributing `AUTO_CONFIGS` rows + Infrastructure Providers,
-//! never the umbrella) and slot in HERE as additional dependencies + re-exports
-//! when the ecosystem ships them.
+//! - [`leaf_web`] — the backend-free web ABSTRACTIONS (`Request`/`Response`/
+//!   `WebServer`/`Handler`/`Route`/`WebFilter`/`HttpMessageConverter`/`ControlAdvice`
+//!   + the `WebServerRunner` that self-assembles the dispatcher from the container).
+//! - [`leaf_web_hyper`] — the hyper BACKEND: its `#[auto_config]` FALLBACK
+//!   `dyn WebServer` bean (`OnMissingBean(dyn WebServer)`), so merely pulling the
+//!   bundle makes an app serve, while a user backend supersedes it.
+//! - [`leaf_serde`] — the JSON `HttpMessageConverter` `#[component]` bean (content
+//!   negotiation), its `web-converter` feature on by default.
+//! - [`leaf_tokio`] (the runtime peer the server serves on), [`leaf_validation`]
+//!   (request/bean validation), and [`leaf_cache`] (response/method caching) —
+//!   the cross-cutting web concerns.
+//!
+//! Each crate's auto-config participates + backs off independently; the backend
+//! choice is a runtime/profile decision, NEVER an XOR cargo feature. A future
+//! ecosystem backend (an alternative `WebServer`) slots in HERE as an extra
+//! dependency, superseding the hyper FALLBACK via the same `OnMissingBean` model.
 //!
 //! ## DAG: starters → integration crates, NEVER the umbrella
 //!
@@ -47,6 +51,12 @@
 #[doc(no_inline)]
 pub use leaf_cache;
 #[doc(no_inline)]
+pub use leaf_serde;
+#[doc(no_inline)]
 pub use leaf_tokio;
 #[doc(no_inline)]
 pub use leaf_validation;
+#[doc(no_inline)]
+pub use leaf_web;
+#[doc(no_inline)]
+pub use leaf_web_hyper;
