@@ -14,15 +14,19 @@
 //!   [`bytes::Bytes`] body the backend fills at the edge.
 //! - [`IntoResponse`] — any handler return that can become a [`Response`]
 //!   (`Response`/`StatusCode`/`&str`/`String`/`()`/`Result<T, E>`).
+//! - [`Handler`] / [`Route`] / [`RouteTable`] — the dispatch unit, the
+//!   `(method, path-pattern)` registration the server collects, and the matcher
+//!   that resolves a concrete request path to a route + captured params.
 //!
-//! Later stages add `Handler`/`Route` (matching), `WebFilter`/`Next`,
-//! `FromRequest` extractors, `HttpMessageConverter`, `ControlAdvice`, and the
-//! `WebServer`/`Dispatcher` — all backend-free, assembled from the container via
-//! collection + by-trait injection.
+//! Later stages add `WebFilter`/`Next`, `FromRequest` extractors,
+//! `HttpMessageConverter`, `ControlAdvice`, and the `WebServer`/`Dispatcher` —
+//! all backend-free, assembled from the container via collection + by-trait
+//! injection.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod handler;
 pub mod request;
 pub mod response;
 
@@ -32,5 +36,6 @@ pub mod response;
 // from "never-linked". The package name (dashes) is the join string.
 leaf_core::declare_source!("leaf-web");
 
+pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;
 pub use response::{IntoResponse, Response};
