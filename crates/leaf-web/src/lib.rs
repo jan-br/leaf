@@ -17,15 +17,18 @@
 //! - [`Handler`] / [`Route`] / [`RouteTable`] — the dispatch unit, the
 //!   `(method, path-pattern)` registration the server collects, and the matcher
 //!   that resolves a concrete request path to a route + captured params.
+//! - [`WebFilter`] / [`Next`] / [`FilterChain`] / [`Terminal`] — the around-advice
+//!   seam: ordered filters wrap the request, each continuing via `Next::run` or
+//!   short-circuiting, with the [`Terminal`] (route dispatch) at the bottom.
 //!
-//! Later stages add `WebFilter`/`Next`, `FromRequest` extractors,
-//! `HttpMessageConverter`, `ControlAdvice`, and the `WebServer`/`Dispatcher` —
-//! all backend-free, assembled from the container via collection + by-trait
-//! injection.
+//! Later stages add `FromRequest` extractors, `HttpMessageConverter`,
+//! `ControlAdvice`, and the `WebServer`/`Dispatcher` — all backend-free, assembled
+//! from the container via collection + by-trait injection.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod filter;
 pub mod handler;
 pub mod request;
 pub mod response;
@@ -36,6 +39,7 @@ pub mod response;
 // from "never-linked". The package name (dashes) is the join string.
 leaf_core::declare_source!("leaf-web");
 
+pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;
 pub use response::{IntoResponse, Response};

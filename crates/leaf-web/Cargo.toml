@@ -14,3 +14,11 @@ leaf-core.workspace = true
 http.workspace = true
 # The body carrier — a cheaply-cloneable byte buffer at the request/response edge.
 bytes.workspace = true
+
+[dev-dependencies]
+# The `#[cfg(test)]` fake filters/terminal write their around-advice bodies as
+# native `async fn` via #[async_impl] (no cycle: leaf-macros -> leaf-codegen ->
+# leaf-core; leaf-web -> leaf-core). The lone Stage-1 hand-written impls.
+leaf-macros.workspace = true
+# A minimal `block_on` to drive the async filter chain in unit tests — no runtime.
+futures.workspace = true
