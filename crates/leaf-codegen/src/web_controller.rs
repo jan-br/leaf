@@ -33,10 +33,10 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Type};
+use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Lit, Meta, Type};
 
 use crate::descriptor::{self, BeanInput, Dependency, EmitError, FieldShape, Scope, ServiceView, Slice};
-use crate::stereotype::Stereotype;
+use crate::stereotype::{self, Stereotype};
 
 /// The mapping-attr names a method must carry to be lowered as a request-mapping
 /// handler (the verb-specific sugar + the general `route` form).
@@ -420,6 +420,153 @@ fn parse_type(s: &str) -> Result<Type, EmitError> {
     })
 }
 
+// ═══════════════════════════════ #[control_advice] ═══════════════════════════════
+//
+// The global-error-handling stereotype (Spring's `@ControllerAdvice` + `@ExceptionHandler`),
+// expressed in leaf's DI (Task 10). Like `#[controller]`/`#[configuration]`/`#[advisable]`
+// it is a DUAL-FORM macro:
+//
+// - on a STRUCT (`#[control_advice] struct Errors;`): the advice BEAN — structurally a
+//   `#[component]` (so the advice is registered + resolvable, its collaborators
+//   field-injected) that ALSO `provides` the `dyn ::leaf_web::ControlAdvice` view, so the
+//   server's `Vec<Ref<dyn ControlAdvice>>` collection injection finds it. Mirrors
+//   `#[runner]`'s `provides`-the-`dyn Runner`-view shape.
+// - on an inherent IMPL BLOCK (`#[control_advice] impl Errors { #[exception_handler]
+//   fn not_found(&self, e: &LeafError, req: &Request) -> Option<Response> {..} }`): the
+//   request-mapping analogue — the macro reads each `#[exception_handler]` METHOD and
+//   generates ONE `impl ::leaf_web::ControlAdvice for Errors` whose `handle` delegates to
+//   the handler method(s), first-`Some`-wins in declaration order. A method-position attr
+//   alone cannot emit the sibling trait impl, so the impl block is processed as a unit
+//   (the same constraint `#[bean]`/`#[advice]` hit).
+
+/// The attribute name a method must carry to be wired as an exception handler.
+const EXCEPTION_HANDLER_ATTR: &str = "exception_handler";
+
+/// Lower a `#[control_advice] struct Errors;` to its `#[component]`-equivalent bean
+/// registration PLUS the `dyn ::leaf_web::ControlAdvice` `provides[]` view (so the
+/// server's `Vec<Ref<dyn ControlAdvice>>` collection injection finds it). Structurally a
+/// plain `#[component]` differing ONLY in the declared advice view — exactly the
+/// `#[runner]` `provides`-a-view shape.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when the struct is generic / its stereotype
+/// annotation is malformed (surfaced by [`stereotype::struct_input`]).
+pub fn expand_control_advice_struct(
+    item: &ItemStruct,
+    attr: TokenStream,
+) -> Result<TokenStream, EmitError> {
+    let args = stereotype::parse_args(attr)?;
+    let mut input = stereotype::struct_input(
+        item,
+        Stereotype::Component,
+        args.name,
+        args.role,
+        args.scope,
+        args.constructor,
+    )?;
+    // Declare the ControlAdvice upcast view so the server collects this bean by the
+    // `dyn ControlAdvice` contract (the one place an advice differs from a plain
+    // component) — the SAME provides[] machinery the stereotypes/`#[runner]` use.
+    input.provides.push(ServiceView { dyn_ty: parse_type("dyn ::leaf_web::ControlAdvice")? });
+    descriptor::emit(&input)
+}
+
+/// Lower a `#[control_advice] impl Errors { #[exception_handler] fn .. }` block to ONE
+/// generated `impl ::leaf_web::ControlAdvice for Errors` whose `handle` delegates to the
+/// `#[exception_handler]` method(s) — tried in declaration order, first `Some` wins.
+///
+/// Each handler method takes `&self`, the `&LeafError`, and OPTIONALLY a `&Request`
+/// (the structural shape: a one-extra-param handler receives the request, a zero-extra
+/// handler does not — dispatch on the method's ARITY, never a spelled type name). The
+/// generated `handle` threads `err`/`req` into each in turn.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when the impl is generic / a trait impl, no method
+/// carries `#[exception_handler]`, or a handler method takes no `self` receiver.
+pub fn expand_control_advice_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
+    let self_ty = self_ty_of(item)?;
+    let advice_ident = type_ident(&self_ty);
+    if !item.generics.params.is_empty() {
+        return Err(EmitError {
+            message: format!(
+                "`{advice_ident}` is a generic `#[control_advice]` impl: a generic advice \
+                 has no single concrete type to mint its `ControlAdvice` impl. Make the \
+                 advice concrete."
+            ),
+        });
+    }
+
+    // Each `#[exception_handler]` method → one delegation arm in `handle`. The first
+    // arm returning `Some` short-circuits (the first-match chain).
+    let mut arms = Vec::new();
+    for inner in &item.items {
+        let ImplItem::Fn(func) = inner else { continue };
+        if find_attr(&func.attrs, EXCEPTION_HANDLER_ATTR).is_none() {
+            continue;
+        }
+        let method_ident = &func.sig.ident;
+        if !has_self_receiver(func) {
+            return Err(EmitError {
+                message: format!(
+                    "`{advice_ident}::{method_ident}` is an `#[exception_handler]` but takes \
+                     no `self` receiver: an exception handler threads the advice bean \
+                     through `&self`."
+                ),
+            });
+        }
+        // Dispatch on the handler's ARITY (structural): one non-receiver param → the
+        // error alone; two → the error + the request. Never a spelled type name.
+        let extra = non_receiver_arg_types(func).len();
+        let call = if extra >= 2 {
+            quote! { self.#method_ident(__err, __req) }
+        } else {
+            quote! { self.#method_ident(__err) }
+        };
+        arms.push(quote! {
+            if let ::core::option::Option::Some(__resp) = #call {
+                return ::core::option::Option::Some(__resp);
+            }
+        });
+    }
+
+    if arms.is_empty() {
+        return Err(EmitError {
+            message: format!(
+                "`{advice_ident}` is a `#[control_advice]` impl with no `#[exception_handler]` \
+                 method: a control-advice carries at least one `fn handler(&self, e: \
+                 &LeafError[, req: &Request]) -> Option<Response>` exception handler."
+            ),
+        });
+    }
+
+    // The generated trait impl. `handle` walks the handler arms (first `Some` wins) and
+    // declines (`None`) if none map the error — the dispatcher's chain / default floor
+    // takes over. The error/request binding idents are `__err`/`__req` even when an
+    // arm ignores the request (the unused-binding allow covers it).
+    Ok(quote! {
+        #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
+        impl ::leaf_web::ControlAdvice for #self_ty {
+            fn handle(
+                &self,
+                __err: &::leaf_core::LeafError,
+                __req: &::leaf_web::Request,
+            ) -> ::core::option::Option<::leaf_web::Response> {
+                let _ = __req;
+                #(#arms)*
+                ::core::option::Option::None
+            }
+        }
+    })
+}
+
+/// Find an attribute by its path's last segment (`#[exception_handler]`), matching the
+/// last segment so a `#[leaf::exception_handler]`-qualified form is recognised too.
+fn find_attr<'a>(attrs: &'a [syn::Attribute], name: &str) -> Option<&'a syn::Attribute> {
+    attrs
+        .iter()
+        .find(|a| a.path().segments.last().is_some_and(|s| s.ident == name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +725,114 @@ mod tests {
         let err = expand_controller_impl(&item, true)
             .expect_err("a mapping method needs a self receiver");
         assert!(err.message.contains("self"), "got: {}", err.message);
+    }
+
+    // ── #[control_advice] (the global-error-handling stereotype, Task 10) ─────────
+
+    fn struct_item(src: &str) -> ItemStruct {
+        syn::parse_str(src).expect("a valid struct item")
+    }
+
+    #[test]
+    fn a_control_advice_struct_provides_the_dyn_control_advice_view() {
+        // The struct form: `#[control_advice] struct Errors;` is a `#[component]`-equivalent
+        // bean that ALSO `provides` the `dyn ::leaf_web::ControlAdvice` view (so the
+        // server's `Vec<Ref<dyn ControlAdvice>>` collection injection finds it). Mirrors
+        // `#[runner]`'s `provides`-the-`dyn Runner`-view shape.
+        let ts = expand_control_advice_struct(&struct_item("struct Errors;"), TokenStream::new())
+            .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        // It rides the COMPONENTS channel (a plain `#[component]`-equivalent bean).
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "the advice bean is a COMPONENTS row: {s}"
+        );
+        // It declares the `dyn ::leaf_web::ControlAdvice` provides[] view.
+        assert!(
+            s.contains("::core::any::TypeId::of::<dyn::leaf_web::ControlAdvice>()"),
+            "the advice bean must declare the `dyn ::leaf_web::ControlAdvice` view: {s}"
+        );
+    }
+
+    #[test]
+    fn a_control_advice_impl_delegates_handle_to_the_exception_handler_method() {
+        // The impl form: an `#[exception_handler]` method `fn not_found(&self, e:
+        // &LeafError) -> Option<Response>` lowers to an `impl ::leaf_web::ControlAdvice`
+        // whose `handle` delegates to the method (passing the error + request through).
+        let item = impl_item(
+            r#"impl Errors {
+                #[exception_handler]
+                fn not_found(&self, e: &LeafError, req: &Request) -> Option<Response> {
+                    todo!()
+                }
+            }"#,
+        );
+        let ts = expand_control_advice_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        // The generated trait impl.
+        assert!(
+            s.contains("impl::leaf_web::ControlAdviceforErrors"),
+            "the impl form generates `impl ControlAdvice for Errors`: {s}"
+        );
+        // Its `handle` delegates to the exception-handler method.
+        assert!(
+            s.contains("fnhandle") && s.contains("self.not_found("),
+            "`handle` delegates to the #[exception_handler] method: {s}"
+        );
+    }
+
+    #[test]
+    fn a_control_advice_impl_with_no_arg_handler_still_delegates() {
+        // The minimal handler shape: an `#[exception_handler]` taking only `&self` +
+        // `&LeafError` (no `&Request`) is supported — `handle` passes just the error.
+        let item = impl_item(
+            r#"impl Errors {
+                #[exception_handler]
+                fn map(&self, e: &LeafError) -> Option<Response> { todo!() }
+            }"#,
+        );
+        let s = flat(&expand_control_advice_impl(&item).expect("emits"));
+        assert!(s.contains("self.map("), "delegates to the handler: {s}");
+    }
+
+    #[test]
+    fn a_control_advice_impl_tries_each_exception_handler_in_order() {
+        // Multiple `#[exception_handler]` methods are tried in declaration order; the
+        // first returning `Some` wins (the `?`-free first-match chain in `handle`).
+        let item = impl_item(
+            r#"impl Errors {
+                #[exception_handler]
+                fn not_found(&self, e: &LeafError) -> Option<Response> { todo!() }
+                #[exception_handler]
+                fn bad_request(&self, e: &LeafError) -> Option<Response> { todo!() }
+                fn helper(&self) -> u8 { 0 }
+            }"#,
+        );
+        let s = flat(&expand_control_advice_impl(&item).expect("emits"));
+        assert!(s.contains("self.not_found("), "first handler tried: {s}");
+        assert!(s.contains("self.bad_request("), "second handler tried: {s}");
+        // The non-handler helper does NOT participate.
+        assert!(!s.contains("self.helper("), "a non-handler method is not wired: {s}");
+    }
+
+    #[test]
+    fn a_control_advice_impl_with_no_exception_handler_is_an_error() {
+        // An impl with no `#[exception_handler]` method has nothing to delegate to.
+        let item = impl_item(r#"impl Errors { fn helper(&self) -> u8 { 0 } }"#);
+        let err = expand_control_advice_impl(&item)
+            .expect_err("a control-advice impl needs an exception handler");
+        assert!(err.message.contains("exception_handler"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn a_generic_control_advice_impl_is_a_hard_error() {
+        let item = impl_item(
+            r#"impl<T> Errors<T> { #[exception_handler] fn h(&self, e: &LeafError) -> Option<Response> { todo!() } }"#,
+        );
+        let err = expand_control_advice_impl(&item)
+            .expect_err("a generic control-advice impl hard-errors");
+        assert!(err.message.contains("generic"), "got: {}", err.message);
     }
 }

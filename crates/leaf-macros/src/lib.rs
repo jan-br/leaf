@@ -250,6 +250,75 @@ pub fn route(_attr: TokenStream, item: TokenStream) -> TokenStream {
     mapping_marker_only(item, "route")
 }
 
+/// `#[control_advice]` — the global error-handling stereotype (Spring's
+/// `@ControllerAdvice` + `@ExceptionHandler`), expressed in leaf's DI. TWO forms:
+///
+/// - on a STRUCT: the advice BEAN — structurally a `#[component]` (so the advice is
+///   registered + resolvable, its collaborators field-injected) that ALSO `provides` the
+///   `dyn ::leaf_web::ControlAdvice` view, so the server's `Vec<Ref<dyn ControlAdvice>>`
+///   collection injection finds it (the same `provides`-a-view shape `#[runner]` uses).
+/// - on an inherent IMPL BLOCK (`#[control_advice] impl Errors { #[exception_handler] fn
+///   not_found(&self, e: &LeafError, req: &Request) -> Option<Response> {..} }`): the
+///   request-mapping analogue — the macro reads each `#[exception_handler]` METHOD and
+///   generates ONE `impl ::leaf_web::ControlAdvice for Errors` whose `handle` delegates to
+///   the handler method(s) (first `Some` wins, declaration order). A method-position attr
+///   alone cannot emit the sibling trait impl, so the impl block is processed as a unit;
+///   the inner `#[exception_handler]` attrs are STRIPPED from the re-emitted impl (the
+///   impl-block macro owns the lowering).
+#[proc_macro_attribute]
+pub fn control_advice(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Impl(item_impl) => {
+            let cleaned = strip_inner_attrs(item_impl.clone(), &["exception_handler"]);
+            match leaf_codegen::web_controller::expand_control_advice_impl(&item_impl) {
+                Ok(rows) => quote! { #cleaned #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #cleaned #error }.into()
+                }
+            }
+        }
+        Item::Struct(item_struct) => {
+            match leaf_codegen::web_controller::expand_control_advice_struct(
+                &item_struct,
+                attr.into(),
+            ) {
+                Ok(rows) => quote! { #item_struct #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #item_struct #error }.into()
+                }
+            }
+        }
+        other => quote! {
+            #other
+            ::core::compile_error!(
+                "#[control_advice] applies to a `struct` (the advice bean) or an inherent \
+                 `impl` block (its `#[exception_handler]` methods)"
+            );
+        }
+        .into(),
+    }
+}
+
+/// `#[exception_handler]` — mark a `#[control_advice]`-impl method as an exception
+/// handler (`fn handler(&self, e: &LeafError[, req: &Request]) -> Option<Response>`). See
+/// the module note: the `#[control_advice]` impl-block macro STRIPS + lowers it into the
+/// generated `ControlAdvice::handle` delegation (a method-position attr alone cannot emit
+/// the sibling trait impl). Applied OUTSIDE a `#[control_advice] impl` it is a loud
+/// `compile_error!` steering to the impl-block form.
+#[proc_macro_attribute]
+pub fn exception_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed: proc_macro2::TokenStream = item.into();
+    let message = "`#[exception_handler]` is an annotation for a method INSIDE a \
+         `#[control_advice] impl Errors { .. }` block: the impl-block macro lowers it to \
+         the generated `ControlAdvice::handle` delegation (a method-position attribute \
+         alone cannot emit the sibling trait impl). Put the `#[control_advice]` attribute \
+         on the impl block.";
+    quote! { #parsed ::core::compile_error!(#message); }.into()
+}
+
 /// The shared body for the request-mapping markers: keep the item verbatim and append a
 /// `compile_error!` — applied standalone (outside a controller impl) a per-method
 /// mapping attr cannot emit its sibling `Route` registration row, so it steers to the
