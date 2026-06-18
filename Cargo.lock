@@ -799,8 +799,10 @@ dependencies = [
  "erased-serde",
  "futures",
  "http",
+ "leaf-boot",
  "leaf-core",
  "leaf-macros",
+ "leaf-web",
 ]
 
 [[package]]

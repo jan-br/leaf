@@ -35,3 +35,10 @@ pub trait ControlAdvice: Send + Sync {
         0
     }
 }
+
+// Make `dyn ControlAdvice` an injectable VIEW (the by-trait-injection seam, emitted
+// ONCE — orphan-rule-OK since `dyn ControlAdvice` is local to this crate). The
+// `#[control_advice]` stereotype (Stage 2) publishes the `dyn ControlAdvice` view; the
+// server collects EVERY provider as `Vec<Ref<dyn ControlAdvice>>` (collection injection)
+// for its ordered error-mapping chain.
+leaf_core::impl_resolve_view!(dyn ControlAdvice);

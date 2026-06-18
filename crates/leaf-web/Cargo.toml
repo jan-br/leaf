@@ -21,6 +21,14 @@ bytes.workspace = true
 # is the serialization analogue of the neutral `http` value-vocabulary exception.
 erased-serde.workspace = true
 
+[features]
+# The in-memory `MockServer` test harness (`src/testing.rs`). Gated so it is never
+# production surface; leaf-web's own integration tests enable it via the self
+# dev-dependency below (`leaf-web = { path = ".", features = ["testing"] }`), the
+# canonical Cargo idiom for a package to compile its own test-only API into its
+# integration-test crates. External consumers opt in with `features = ["testing"]`.
+testing = []
+
 [dev-dependencies]
 # The `#[cfg(test)]` fake filters/terminal write their around-advice bodies as
 # native `async fn` via #[async_impl] (no cycle: leaf-macros -> leaf-codegen ->
@@ -28,3 +36,13 @@ erased-serde.workspace = true
 leaf-macros.workspace = true
 # A minimal `block_on` to drive the async filter chain in unit tests — no runtime.
 futures.workspace = true
+# The DI-assembly proof (`tests/dispatch_through_mock.rs`): leaf-boot's cold-pass
+# `App::from_slices` lifts the test's macro-emitted `#[component]`/`#[bean]` seeds,
+# freezes an engine, and the test resolves `Vec<Ref<dyn Route>>`/`WebFilter`/
+# `ControlAdvice` by collection + by-trait injection — the same path the Stage-3
+# `WebServerRunner` will use. Dev-only: leaf-web's production deps stay leaf-core + http.
+leaf-boot.workspace = true
+# Self dev-dependency with the `testing` feature ON, so the integration tests (which
+# compile leaf-web as a normal dependency, where `cfg(test)` is off) still see the
+# `MockServer` harness. The standard Cargo idiom for a test-only public surface.
+leaf-web = { path = ".", features = ["testing"] }

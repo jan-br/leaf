@@ -47,7 +47,15 @@
 //!
 //! All of it is backend-free, assembled from the container via collection +
 //! by-trait injection (`Vec<Ref<dyn Route>>` / `Vec<Ref<dyn WebFilter>>` /
-//! `Vec<Ref<dyn ControlAdvice>>`).
+//! `Vec<Ref<dyn ControlAdvice>>`). Each concern trait (`Route`/`WebFilter`/
+//! `ControlAdvice`/`HttpMessageConverter`) is published as an injectable `dyn` VIEW via
+//! `leaf_core::impl_resolve_view!` (the by-trait-injection seam emitted once per trait),
+//! so a bean providing the view is resolvable as `Ref<dyn _>` and collectible as
+//! `Vec<Ref<dyn _>>` through the SAME path a concrete `Ref<T>` uses.
+//!
+//! - `testing::MockServer` (the `testing` feature / `cfg(test)`) — the in-memory
+//!   pluggability proof: a [`WebServer`] that drives a [`Request`] straight through the
+//!   shared [`Dispatcher`] with NO transport, proving the abstraction is backend-free.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -60,6 +68,13 @@ pub mod handler;
 pub mod request;
 pub mod response;
 pub mod server;
+
+// The in-memory `MockServer` backend (the Stage-1 pluggability proof). A TEST harness,
+// gated behind `cfg(test)` (leaf-web's own tests) or the `testing` feature (an external
+// consumer / leaf-web's integration tests, which enable it via the self dev-dependency)
+// — never production surface.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 // The per-crate anti-DCE SOURCE anchor (ADR-09 Defense MANIFEST): one SourceTag
 // in the link-collected `SOURCES` slice so a binary that lists leaf-web in its
@@ -75,3 +90,6 @@ pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;
 pub use response::{IntoResponse, Response};
 pub use server::{Dispatcher, ServerProperties, WebServer};
+
+#[cfg(any(test, feature = "testing"))]
+pub use testing::MockServer;

@@ -38,6 +38,14 @@ pub trait Route: Send + Sync {
     fn handler(&self) -> &dyn Handler;
 }
 
+// Make `dyn Route` an injectable VIEW (the by-trait-injection seam, emitted ONCE —
+// orphan-rule-OK since `dyn Route` is local to this crate). A controller-macro bean
+// (Stage 2) publishes the `dyn Route` view; the server collects EVERY provider as
+// `Vec<Ref<dyn Route>>` (collection injection) to build its routing table. This is
+// the hand-written equivalent of `#[injectable]` for a framework concern trait —
+// the same shape `leaf-core` uses for its own `dyn CacheManager`/`dyn TransactionManager`.
+leaf_core::impl_resolve_view!(dyn Route);
+
 /// The captured `(name, value)` path parameters a pattern extracts from a
 /// concrete path (e.g. `[("sku", "COFFEE")]` for `/products/{sku}` vs
 /// `/products/COFFEE`); empty for an all-literal route.

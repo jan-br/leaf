@@ -53,6 +53,12 @@ pub trait WebFilter: Send + Sync {
     }
 }
 
+// Make `dyn WebFilter` an injectable VIEW (the by-trait-injection seam, emitted ONCE —
+// orphan-rule-OK since `dyn WebFilter` is local to this crate). Filter beans (any
+// crate's `#[component]` publishing the `dyn WebFilter` view) are collected by the
+// server as `Vec<Ref<dyn WebFilter>>` (collection injection) and run ordered.
+leaf_core::impl_resolve_view!(dyn WebFilter);
+
 /// The continuation handed to a [`WebFilter`]: the remaining (ordered) filters
 /// plus the [`Terminal`]. Calling [`run`] either invokes the next filter or — when
 /// no filters remain — the terminal.

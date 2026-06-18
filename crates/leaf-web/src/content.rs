@@ -70,3 +70,11 @@ pub trait HttpMessageConverter: Send + Sync {
         read: &mut dyn FnMut(&mut dyn erased_serde::Deserializer) -> Result<(), LeafError>,
     ) -> Result<(), LeafError>;
 }
+
+// Make `dyn HttpMessageConverter` an injectable VIEW (the by-trait-injection seam,
+// emitted ONCE — orphan-rule-OK since `dyn HttpMessageConverter` is local to this
+// crate). `leaf-serde`'s `JsonConverter` publishes the `dyn HttpMessageConverter` view
+// (`#[bean(provides = "dyn ::leaf_web::HttpMessageConverter")]`); the rest-controller
+// codegen (Stage 2) and the `Json` extractor inject it as `Ref<dyn HttpMessageConverter>`
+// (and the server may collect `Vec<Ref<dyn HttpMessageConverter>>` for negotiation).
+leaf_core::impl_resolve_view!(dyn HttpMessageConverter);
