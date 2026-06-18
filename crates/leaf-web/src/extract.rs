@@ -22,13 +22,14 @@
 //! the controller codegen (Task 9) has in scope. leaf-web defines their wrapper
 //! types here (so the codegen can dispatch on them structurally) and documents
 //! the seam; the serde-backed reads ride the injected
-//! [`HttpMessageConverter`](crate::HttpMessageConverter) (Task 5) — leaf-web names
+//! [`HttpMessageConverter`] (Task 5) — leaf-web names
 //! no serde data format itself.
 
 use std::collections::HashMap;
 
 use leaf_core::error::{Cause, ErrorKind, LeafError};
 
+use crate::content::HttpMessageConverter;
 use crate::Request;
 
 /// Resolve `Self` from an inbound [`Request`] (Spring's
@@ -75,13 +76,14 @@ pub struct Query<T>(pub T);
 /// A request-body extractor: `T` is deserialized from the body in the negotiated
 /// content-type. Spring's `@RequestBody`.
 ///
-/// `Json<T>` has NO plain [`FromRequest`] impl: deserializing a body into a
-/// `T: DeserializeOwned` needs a serde data format, which leaf-web deliberately
-/// does not depend on. The controller codegen (Task 9) resolves a `Json<T>`
-/// parameter through the injected
-/// [`HttpMessageConverter`](crate::HttpMessageConverter) (the JSON impl is a
-/// `#[component]` bean in `leaf-serde`) — this wrapper exists so the codegen can
-/// dispatch on its structure.
+/// `Json<T>` has NO plain [`FromRequest`] impl (which sees only the request): a body
+/// deserialization needs the content format. Instead it implements the
+/// CONVERTER-AWARE [`FromRequestParts`], deserializing the body through the INJECTED
+/// [`HttpMessageConverter`] (the JSON impl is a `#[component]` bean in `leaf-serde`)
+/// — leaf-web names the serde data MODEL (the `T: DeserializeOwned` bound) but no
+/// serde FORMAT, which stays on the converter's side. The controller codegen (Task
+/// 9) lowers EVERY parameter through the one uniform `FromRequestParts` call site, so
+/// `Json<T>` rides the same seam as a request-only `Path`/`Query`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Json<T>(pub T);
 
@@ -148,6 +150,92 @@ impl FromRequest for Request {
     }
 }
 
+/// The CONVERTER-AWARE argument-extraction seam the controller codegen calls
+/// uniformly, once per handler parameter:
+/// `<ParamTy as FromRequestParts>::from_request_parts(req, converter)`.
+///
+/// It is the superset of [`FromRequest`]: a parameter type satisfies it EITHER via
+/// the request alone (the [`FromRequest`] blanket below — `Path<String>`,
+/// `Query<HashMap>`, the whole-[`Request`]) OR by riding the injected
+/// [`HttpMessageConverter`] (the [`Json<T>`] body deserialization). The codegen
+/// dispatches on the parameter's STRUCTURAL extractor type purely through TRAIT
+/// resolution (which impl applies), never a spelled type name — so one uniform call
+/// site lowers every parameter, `Json<T>` included.
+///
+/// leaf-web names the serde DATA MODEL (the `serde::de::DeserializeOwned` bound on
+/// the [`Json<T>`] impl, the same boundary [`erased_serde`] already crosses) but no
+/// serde FORMAT: the concrete wire format is the injected converter's
+/// (`leaf-serde`'s `JsonConverter` = `serde_json`).
+///
+/// # Errors
+///
+/// An extractor that cannot produce its value (a missing path param, a malformed
+/// body) returns a loud [`LeafError`] — the dispatcher maps it to a 4xx via the
+/// advice chain rather than ever silently defaulting.
+pub trait FromRequestParts: Sized {
+    /// Extract `Self` from `req`, using `converter` for the body-deserializing
+    /// extractors ([`Json<T>`]); the request-only extractors ignore it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LeafError`] when the request/body does not carry what this
+    /// extractor requires (see the trait docs).
+    fn from_request_parts(
+        req: &Request,
+        converter: &dyn HttpMessageConverter,
+    ) -> Result<Self, LeafError>;
+}
+
+/// Every request-only [`FromRequest`] extractor (`Path<String>`, `Query<HashMap>`,
+/// the whole [`Request`]) ALSO satisfies the converter-aware [`FromRequestParts`] —
+/// it just ignores the converter. This blanket is why the controller codegen can
+/// call ONE uniform `from_request_parts(req, converter)` per parameter and let trait
+/// resolution pick the request-only path or the converter-backed [`Json<T>`] path.
+impl<T: FromRequest> FromRequestParts for T {
+    fn from_request_parts(
+        req: &Request,
+        _converter: &dyn HttpMessageConverter,
+    ) -> Result<Self, LeafError> {
+        T::from_request(req)
+    }
+}
+
+/// `Json<T>` body extraction: deserialize the request body into `T` through the
+/// INJECTED [`HttpMessageConverter`] (the format-agnostic seam). leaf-web names no
+/// serde format — it runs [`erased_serde::deserialize`] over the deserializer the
+/// converter lends via [`HttpMessageConverter::with_deserializer`], so the concrete
+/// format (serde_json, in `leaf-serde`'s converter) stays on the converter's side.
+///
+/// This is the ONE extractor that genuinely needs the converter, which is exactly
+/// why the codegen threads it through [`FromRequestParts`] rather than the
+/// request-only [`FromRequest`].
+impl<T: serde::de::DeserializeOwned> FromRequestParts for Json<T> {
+    fn from_request_parts(
+        req: &Request,
+        converter: &dyn HttpMessageConverter,
+    ) -> Result<Self, LeafError> {
+        // Capture the typed value out of the converter's scoped `with_deserializer`
+        // callback: it lends an erased deserializer over the body, we run
+        // `erased_serde::deserialize::<T>` and stash the result.
+        let mut slot: Option<T> = None;
+        converter.with_deserializer(req.body_bytes(), &mut |de| {
+            slot = Some(erased_serde::deserialize::<T>(de).map_err(|e| {
+                LeafError::new(ErrorKind::ConvertError)
+                    .caused_by(Cause::plain("json body extraction", e.to_string()))
+            })?);
+            Ok(())
+        })?;
+        // A successful `with_deserializer` ran the callback to completion (it only
+        // returns `Ok(())` after the callback's `Ok(())`, which fills the slot).
+        slot.map(Json).ok_or_else(|| {
+            LeafError::new(ErrorKind::ConvertError).caused_by(Cause::plain(
+                "json body extraction",
+                "the converter did not run the read callback",
+            ))
+        })
+    }
+}
+
 /// Build the loud [`LeafError`] a failed extraction surfaces (the dispatcher maps
 /// it to a 4xx via the advice chain — never a silent default).
 fn missing(what: &'static str, detail: &'static str) -> LeafError {
@@ -207,5 +295,77 @@ mod tests {
         assert_eq!(whole.path(), "/p/7");
         assert_eq!(whole.query_str(), Some("x=1"));
         assert_eq!(whole.path_param("id"), Some("7"));
+    }
+
+    // ── FromRequestParts (the converter-aware extraction seam, Task 14) ──────────
+
+    use crate::content::HttpMessageConverter;
+
+    /// A tiny `HttpMessageConverter` test double over JSON-ish bytes: it deserializes
+    /// the body via a JSON deserializer it owns on the stack (the same `with_deserializer`
+    /// lend-a-scoped-deserializer shape the real `leaf-serde` converter has), so the
+    /// converter-aware `Json<T>` extraction can be proven IN leaf-web with no leaf-serde.
+    struct TestJsonConverter;
+
+    impl HttpMessageConverter for TestJsonConverter {
+        fn content_type(&self) -> &str {
+            "application/json"
+        }
+        fn write(&self, _value: &dyn erased_serde::Serialize) -> Result<bytes::Bytes, LeafError> {
+            Ok(bytes::Bytes::new())
+        }
+        fn with_deserializer(
+            &self,
+            body: &[u8],
+            read: &mut dyn FnMut(&mut dyn erased_serde::Deserializer) -> Result<(), LeafError>,
+        ) -> Result<(), LeafError> {
+            let mut de = serde_json::Deserializer::from_slice(body);
+            let mut erased = <dyn erased_serde::Deserializer>::erase(&mut de);
+            read(&mut erased)
+        }
+    }
+
+    fn request_with_body(body: &[u8]) -> Request {
+        Request::new(Method::POST, "/orders".parse().expect("uri"), http::HeaderMap::new(), Bytes::copy_from_slice(body))
+    }
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct NewOrder {
+        sku: String,
+        qty: u32,
+    }
+
+    #[test]
+    fn json_body_extracts_through_the_converter() {
+        // `Json<T>` is the converter-backed extraction: `FromRequestParts` hands the
+        // injected converter the body and gets back the typed `T` (NEVER a plain
+        // `FromRequest` — leaf-web names no serde FORMAT; the format rides the converter).
+        let req = request_with_body(br#"{"sku":"COFFEE","qty":2}"#);
+        let conv = TestJsonConverter;
+        let Json(order) = <Json<NewOrder> as FromRequestParts>::from_request_parts(&req, &conv)
+            .expect("the JSON body deserializes through the converter");
+        assert_eq!(order, NewOrder { sku: "COFFEE".to_string(), qty: 2 });
+    }
+
+    #[test]
+    fn json_body_malformed_is_a_loud_error() {
+        let req = request_with_body(b"{ not json ");
+        let conv = TestJsonConverter;
+        let err = <Json<NewOrder> as FromRequestParts>::from_request_parts(&req, &conv)
+            .expect_err("a malformed JSON body must surface a LeafError, not a default");
+        assert_eq!(err.kind, ErrorKind::ConvertError);
+    }
+
+    #[test]
+    fn from_request_parts_blanket_falls_back_to_from_request() {
+        // Every plain `FromRequest` extractor (Path/Query/&Request) ALSO satisfies the
+        // converter-aware `FromRequestParts` via the blanket impl, so the controller
+        // codegen calls ONE uniform `from_request_parts(req, converter)` per parameter
+        // (trait dispatch on the parameter's structural extractor type, never a name).
+        let req = request("/products/COFFEE", vec![("sku".to_string(), "COFFEE".to_string())]);
+        let conv = TestJsonConverter;
+        let Path(sku) = <Path<String> as FromRequestParts>::from_request_parts(&req, &conv)
+            .expect("Path rides the FromRequest blanket through FromRequestParts");
+        assert_eq!(sku, "COFFEE");
     }
 }

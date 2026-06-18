@@ -115,15 +115,21 @@ fn emit_route_bean(
     let route_struct_ident = format_ident!("__LeafRoute_{controller_ident}_{method_ident}");
 
     // The handler's argument resolution: each NON-receiver parameter resolves via its
-    // `FromRequest` extractor — `<ParamTy as ::leaf_web::FromRequest>::from_request(req)`
-    // (TRAIT dispatch on the parameter's STRUCTURAL extractor type, never a spelled
-    // name). The resolved bindings are passed positionally to the controller method.
+    // CONVERTER-AWARE `FromRequestParts` extractor — `<ParamTy as
+    // ::leaf_web::FromRequestParts>::from_request_parts(req, converter)` (TRAIT dispatch
+    // on the parameter's STRUCTURAL extractor type, never a spelled name). One uniform
+    // call site lowers EVERY parameter: the request-only extractors (`Path`/`Query`/
+    // `&Request`) ride the `FromRequest` blanket (ignoring the converter), while a
+    // `Json<T>` body parameter rides the injected `HttpMessageConverter` — trait
+    // resolution, not the macro, picks which. The resolved bindings pass positionally to
+    // the controller method.
     let arg_types = non_receiver_arg_types(method);
     let arg_locals: Vec<syn::Ident> =
         (0..arg_types.len()).map(|i| format_ident!("__arg{i}")).collect();
     let arg_resolves = arg_types.iter().zip(&arg_locals).map(|(ty, local)| {
         quote! {
-            let #local = <#ty as ::leaf_web::FromRequest>::from_request(__req)?;
+            let #local =
+                <#ty as ::leaf_web::FromRequestParts>::from_request_parts(__req, __converter)?;
         }
     });
 
@@ -140,9 +146,7 @@ fn emit_route_bean(
         quote! {
             let __value = #invoke?;
             // The injected `dyn ::leaf_web::HttpMessageConverter` serializes the return
-            // (@ResponseBody). `Ref<dyn _>` derefs to the trait object, so the trait
-            // methods auto-deref through it.
-            let __converter: &dyn ::leaf_web::HttpMessageConverter = &*self.converter;
+            // (@ResponseBody) — the SAME converter the `Json<T>` arg extraction rode.
             let __body = __converter.write(&__value)?;
             ::core::result::Result::Ok(
                 ::leaf_web::Response::ok()
@@ -157,20 +161,34 @@ fn emit_route_bean(
         }
     };
 
-    // The struct's injected fields (field injection through `Injectable`): the
-    // controller bean always; the converter only on the `@ResponseBody` path.
-    let mut deps = vec![Dependency {
-        name: "controller".into(),
-        ty: parse_type(&format!("::leaf_core::Ref<{}>", quote!(#self_ty)))?,
-    }];
-    let converter_field = if response_body {
-        deps.push(Dependency {
+    // The struct's injected fields (field injection through `Injectable`): the controller
+    // bean AND the `HttpMessageConverter`. The converter is injected for BOTH stereotypes
+    // — a `Json<T>` body parameter rides it for EXTRACTION regardless of the return policy
+    // (only `#[rest_controller]` additionally uses it to SERIALIZE the return). The
+    // generated `handle` binds it once up front so the uniform `from_request_parts` arg
+    // loop and the rest-controller return policy share the one `&dyn` view. `&*self.converter`
+    // derefs `Ref<dyn _>` to the trait object.
+    let deps = vec![
+        Dependency {
+            name: "controller".into(),
+            ty: parse_type(&format!("::leaf_core::Ref<{}>", quote!(#self_ty)))?,
+        },
+        Dependency {
             name: "converter".into(),
             ty: parse_type("::leaf_core::Ref<dyn ::leaf_web::HttpMessageConverter>")?,
-        });
-        quote! { converter: ::leaf_core::Ref<dyn ::leaf_web::HttpMessageConverter>, }
+        },
+    ];
+    let converter_field = quote! { converter: ::leaf_core::Ref<dyn ::leaf_web::HttpMessageConverter>, };
+
+    // Bind the injected converter as a `&dyn` view ONCE at the top of `handle` — used by
+    // the uniform `from_request_parts` arg loop (body extraction) and the
+    // `#[rest_controller]` return policy (serialize). When a handler has NO parameters AND
+    // is a plain `#[controller]` (so the converter is genuinely unused), bind it to `_` so
+    // the field stays injected (uniform struct shape) without tripping the unused-var lint.
+    let converter_binding = if arg_types.is_empty() && !response_body {
+        quote! { let _ = &*self.converter; }
     } else {
-        TokenStream::new()
+        quote! { let __converter: &dyn ::leaf_web::HttpMessageConverter = &*self.converter; }
     };
 
     // The generated struct definition + its `Route`/`Handler` trait impls. The struct
@@ -208,6 +226,7 @@ fn emit_route_bean(
                 ::core::result::Result<::leaf_web::Response, ::leaf_core::LeafError>,
             > {
                 ::std::boxed::Box::pin(async move {
+                    #converter_binding
                     #(#arg_resolves)*
                     #return_policy
                 })
@@ -619,11 +638,14 @@ mod tests {
         assert!(s.contains("::leaf_web::http::Method::GET"), "method() == GET: {s}");
         assert!(s.contains(r#""/products/{sku}""#), "path() == the pattern: {s}");
 
-        // (c) the arg resolves via `<Path<String> as FromRequest>::from_request` (trait
-        //     dispatch on the structural extractor type, NOT a name match).
+        // (c) the arg resolves via `<Path<String> as FromRequestParts>::from_request_parts`
+        //     (trait dispatch on the structural extractor type, NOT a name match) — the
+        //     converter-aware seam the codegen calls uniformly per parameter, so a
+        //     `Json<T>` body parameter (which rides the injected converter) lowers through
+        //     the SAME call site as a request-only `Path`/`Query`.
         assert!(
-            s.contains("<Path<String>as::leaf_web::FromRequest>::from_request"),
-            "the Path<String> arg resolves via FromRequest: {s}"
+            s.contains("<Path<String>as::leaf_web::FromRequestParts>::from_request_parts"),
+            "the Path<String> arg resolves via FromRequestParts: {s}"
         );
         // The controller method is invoked on the injected controller.
         assert!(
@@ -686,6 +708,13 @@ mod tests {
         assert!(s.contains("::leaf_web::http::Method::POST"), "the POST verb: {s}");
         assert!(s.contains(r#""/orders""#), "the POST path: {s}");
         assert!(s.contains(r#""/orders/{id}""#), "the GET path: {s}");
+        // The `Json<NewOrder>` body param lowers through the SAME `FromRequestParts` call
+        // site as the `Path<String>` — the converter is threaded in so the body
+        // deserializes through the injected converter (no special-cased name dispatch).
+        assert!(
+            s.contains("<Json<NewOrder>as::leaf_web::FromRequestParts>::from_request_parts"),
+            "the Json<NewOrder> body resolves via FromRequestParts with the converter: {s}"
+        );
         // The non-mapping helper method does NOT contribute a Route.
         assert_eq!(
             s.matches("::core::any::TypeId::of::<dyn::leaf_web::Route>()").count(),

@@ -5,16 +5,28 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# An umbrella-only demo: EXACTLY ONE `leaf` dependency (no internal `leaf-*` crate,
-# no `linkme`, no `tokio`). `features = ["redis"]` pulls the redis capability into the
-# force-link / ExpectedManifest set, so its auto-config participates and backs off to
-# the in-memory cache.
+# An umbrella-only demo: the `leaf` dependency is the framework surface (no internal
+# `leaf-*` crate, no `linkme`, no `tokio`). `features = ["redis"]` pulls the redis
+# capability into the force-link / ExpectedManifest set, so its auto-config participates
+# and backs off to the in-memory cache. `serde` is the data-format vocabulary a JSON web
+# app owns (the request/response DTOs the `#[rest_controller]` serialize) — the one
+# non-leaf runtime dependency, the same shape the umbrella web proof takes.
 [dependencies]
 leaf = { path = "../../crates/leaf", features = ["redis"] }
+serde = { version = "1", features = ["derive"] }
 
 # Mirror the umbrella's capability features so the binary-crate `leaf::force_link!()`
 # shim's `#[cfg(feature = "redis")]` gate (checked in THIS crate's namespace) matches.
 [features]
-default = ["redis"]
+default = ["redis", "web"]
 redis = ["leaf/redis"]
 web = ["leaf/web"]
+
+# The `web`-feature REST proof (`tests/http.rs`) boots the storefront on a dedicated
+# thread and drives real HTTP through it with a `reqwest` client, asserting JSON bodies
+# parsed via `serde_json` — the standard "serve on an ephemeral port and probe it"
+# integration shape the leaf-web-hyper auto-config test uses.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+serde_json = "1"

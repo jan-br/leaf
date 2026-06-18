@@ -26,6 +26,13 @@ bytes.workspace = true
 # surface — leaf-web names no serde data format; the JSON impl lives in leaf-serde. This
 # is the serialization analogue of the neutral `http` value-vocabulary exception.
 erased-serde.workspace = true
+# The serde DATA-MODEL trait (`serde::de::DeserializeOwned`) — NOT a data format — the
+# `Json<T>` body extraction's bound: `FromRequestParts for Json<T>` deserializes the body
+# through the INJECTED `HttpMessageConverter` (which owns the concrete format, e.g.
+# serde_json in leaf-serde) by running `erased_serde::deserialize::<T>` over the
+# converter-lent deserializer. leaf-web names the serde data MODEL (the same boundary
+# `erased-serde` already crosses) but no serde FORMAT — no serde_json / wire format here.
+serde.workspace = true
 
 [features]
 # The in-memory `MockServer` test harness (`src/testing.rs`). Gated so it is never
@@ -53,4 +60,9 @@ leaf-web = { path = ".", features = ["testing"] }
 # `HttpMessageConverter` (`leaf-serde`'s `JsonConverter` bean) and needs serde derive
 # for the response DTO. Dev-only: leaf-web's production deps stay leaf-core + http.
 leaf-serde.workspace = true
-serde = { workspace = true }
+# The `FromRequestParts` converter-aware extraction unit tests drive a `Json<T>` body
+# through a JSON `HttpMessageConverter` test double — they need a serde data format to
+# back the test converter. Dev-only: leaf-web's PRODUCTION deps name no serde format (the
+# `Json<T>` extraction's data model is `serde` the trait via the injected converter; the
+# concrete format lives in `leaf-serde`).
+serde_json = { workspace = true }

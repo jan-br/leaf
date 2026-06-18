@@ -943,6 +943,7 @@ dependencies = [
  "leaf-serde",
  "leaf-web",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1175,6 +1176,8 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tower",
@@ -1338,6 +1341,10 @@ name = "storefront"
 version = "0.1.0"
 dependencies = [
  "leaf",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

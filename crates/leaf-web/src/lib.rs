@@ -95,7 +95,7 @@ pub use http;
 
 pub use advice::ControlAdvice;
 pub use content::HttpMessageConverter;
-pub use extract::{FromRequest, Header, Json, Path, Query, State};
+pub use extract::{FromRequest, FromRequestParts, Header, Json, Path, Query, State};
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;
