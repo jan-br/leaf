@@ -46,6 +46,8 @@ mod converter;
 mod deserializer;
 #[cfg(feature = "serde-bridge")]
 mod error;
+#[cfg(feature = "web-converter")]
+mod http_converter;
 
 #[cfg(feature = "serde-bridge")]
 pub use converter::{register_serde_converter, SerdeConverter};
@@ -53,3 +55,5 @@ pub use converter::{register_serde_converter, SerdeConverter};
 pub use deserializer::{from_env, from_source, ConfigDeserializer};
 #[cfg(feature = "serde-bridge")]
 pub use error::SerdeBridgeError;
+#[cfg(feature = "web-converter")]
+pub use http_converter::{HttpMessageConverterExt, JsonConverter, JsonConverterConfig};

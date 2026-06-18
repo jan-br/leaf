@@ -12,13 +12,32 @@ leaf-core.workspace = true
 # is ON by default (the crate's reason to exist is the bridge), but the
 # `serde = ["dep:serde"]` mapping keeps the dependency strictly feature-keyed.
 serde = { workspace = true, optional = true }
+# The JSON `HttpMessageConverter` impl: leaf-serde is where the web abstraction's
+# content-negotiation seam meets a concrete serde data format (serde_json). The
+# converter is feature-gated behind `web-converter` so the config-bridge build
+# (the crate's original reason to exist) pulls in zero web/json machinery.
+leaf-web = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+# Drive the erased object-safety boundary of `HttpMessageConverter` from the JSON
+# impl (build a `dyn Deserializer`, serialize a `dyn Serialize`).
+erased-serde = { workspace = true, optional = true }
+leaf-macros = { workspace = true, optional = true }
 
 [features]
-default = ["serde-bridge"]
+# The web-converter rides default so the standard `cargo test --workspace` /
+# `cargo doc` gate builds + exercises the JSON `HttpMessageConverter` deliverable;
+# it stays a discrete feature so a config-only consumer can opt out
+# (`default-features = false, features = ["serde-bridge"]`).
+default = ["serde-bridge", "web-converter"]
 # The serde bridge: a `Converter` (serde Deserialize → ConvertCtx/FromConfigValue)
 # plus the `ConfigDeserializer` alternate (bind a config subtree into any serde
 # `Deserialize` type via leaf-core's Binder/Env). Pulls in serde.
 serde-bridge = ["dep:serde"]
+# The web content-negotiation impl: the JSON `HttpMessageConverter` `#[component]`
+# bean over the leaf-web abstraction (serde_json). Strictly feature-keyed so the
+# config-only build stays web-free.
+web-converter = ["dep:serde", "dep:leaf-web", "dep:serde_json", "dep:bytes", "dep:erased-serde", "dep:leaf-macros"]
 
 [dev-dependencies]
 # The bridge tests drive a `#[derive(Deserialize)]` struct, so the dev build

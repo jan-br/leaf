@@ -20,14 +20,19 @@
 //! - [`WebFilter`] / [`Next`] / [`FilterChain`] / [`Terminal`] — the around-advice
 //!   seam: ordered filters wrap the request, each continuing via `Next::run` or
 //!   short-circuiting, with the [`Terminal`] (route dispatch) at the bottom.
+//! - [`HttpMessageConverter`] — the content-negotiation seam: serialize a handler
+//!   return into a body / deserialize a body into a typed value, keyed by
+//!   content-type. The JSON impl is a `#[component]` bean in `leaf-serde`; leaf-web
+//!   names no serde data format (only the `erased-serde` object-safety boundary).
 //!
-//! Later stages add `FromRequest` extractors, `HttpMessageConverter`,
-//! `ControlAdvice`, and the `WebServer`/`Dispatcher` — all backend-free, assembled
-//! from the container via collection + by-trait injection.
+//! Later stages add `FromRequest` extractors, `ControlAdvice`, and the
+//! `WebServer`/`Dispatcher` — all backend-free, assembled from the container via
+//! collection + by-trait injection.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod content;
 pub mod filter;
 pub mod handler;
 pub mod request;
@@ -39,6 +44,7 @@ pub mod response;
 // from "never-linked". The package name (dashes) is the join string.
 leaf_core::declare_source!("leaf-web");
 
+pub use content::HttpMessageConverter;
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;

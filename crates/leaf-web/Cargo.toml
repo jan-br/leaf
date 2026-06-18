@@ -14,6 +14,12 @@ leaf-core.workspace = true
 http.workspace = true
 # The body carrier — a cheaply-cloneable byte buffer at the request/response edge.
 bytes.workspace = true
+# The object-safety boundary for `HttpMessageConverter`: it lets a converter be a
+# `dyn` bean (serialize `&dyn erased_serde::Serialize`, yield a `dyn Deserializer`)
+# with no generic method on the trait object. NOT a serde adoption into the abstraction
+# surface — leaf-web names no serde data format; the JSON impl lives in leaf-serde. This
+# is the serialization analogue of the neutral `http` value-vocabulary exception.
+erased-serde.workspace = true
 
 [dev-dependencies]
 # The `#[cfg(test)]` fake filters/terminal write their around-advice bodies as
