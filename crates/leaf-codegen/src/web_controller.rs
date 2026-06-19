@@ -118,11 +118,12 @@ fn emit_route_bean(
     // CONVERTER-AWARE `FromRequestParts` extractor — `<ParamTy as
     // ::leaf_web::FromRequestParts>::from_request_parts(req, converter, ctx)` (TRAIT
     // dispatch on the parameter's STRUCTURAL extractor type, never a spelled name). One
-    // uniform call site lowers EVERY parameter: the request-only NAME-FREE extractors
-    // (`Query`/`&Request`) ride the `FromRequest` blanket (ignoring both), the
-    // name-dependent `Path<T>` reads the parameter NAME off the threaded binding context,
-    // and a `Json<T>` body parameter rides the injected `HttpMessageConverter` — trait
-    // resolution, not the macro, picks which.
+    // uniform call site lowers EVERY parameter: the request-only `&Request` extractor
+    // rides the `FromRequest` blanket (ignoring both), a `Query<T>` parameter binds the
+    // query string via its own `FromRequestParts` impl, the name-dependent `Path<T>` reads
+    // the parameter NAME off the threaded binding context, and a `Json<T>` body parameter
+    // rides the injected `HttpMessageConverter` — trait resolution, not the macro, picks
+    // which.
     //
     // The per-argument `ExtractCtx` carries the handler PARAMETER NAME (the `Pat::Ident`
     // already on the signature) so the `Path<T>` extractor selects ITS OWN `{name}`

@@ -11,24 +11,25 @@
 //! need a fact read it. The request-only extractions get their [`FromRequest`] impls
 //! here:
 //!
-//! - [`Query`]`<`[`HashMap`]`<String, String>>` — the raw query string parsed into
-//!   a name→value map.
 //! - [`Request`] — the whole request, cloned (the `&Request` extractor).
 //!
 //! [`Path<T>`] (a `{name}` capture, e.g. `sku` from `/products/{sku}`) is request-only
 //! but NAME-dependent: it implements the context-aware [`FromRequestParts`] directly,
 //! selecting ITS OWN capture by the handler parameter's name and parsing it via
-//! [`FromStr`]. The extractions that need a serde data format ([`Json<T>`] body
-//! deserialization, [`Query<T>`] for an arbitrary `Deserialize` target) or the DI
-//! container ([`State<T>`], a collaborator bean) are NOT plain `from_request(req)`
-//! impls — they need a converter / the handler's captured `ResolveCtx` that only
-//! the controller codegen (Task 9) has in scope. leaf-web defines their wrapper
-//! types here (so the codegen can dispatch on them structurally) and documents
-//! the seam; the serde-backed reads ride the injected
-//! [`HttpMessageConverter`] (Task 5) — leaf-web names
-//! no serde data format itself.
+//! [`FromStr`]. [`Query<T>`] binds the request's query string into an arbitrary
+//! `Deserialize` target `T` (the raw `Query<`[`HashMap`](std::collections::HashMap)`<String, String>>` map is one
+//! such `T`) via the `application/x-www-form-urlencoded` data format, which the query's
+//! URL-fixed grammar lets leaf-web name directly — so `Query<T>` implements
+//! [`FromRequestParts`] for any `T: DeserializeOwned` rather than a plain
+//! `from_request(req)`. The extractions that need the NEGOTIABLE body serde format
+//! ([`Json<T>`] body deserialization) or the DI container ([`State<T>`], a collaborator
+//! bean) are likewise NOT plain `from_request(req)` impls — they need the converter /
+//! the handler's captured `ResolveCtx` that only the controller codegen (Task 9) has in
+//! scope. leaf-web defines all the wrapper types here (so the codegen can dispatch on
+//! them structurally) and documents the seam; the BODY read rides the injected
+//! [`HttpMessageConverter`] (Task 5) — leaf-web names no serde format for the body, only
+//! the one fixed query format.
 
-use std::collections::HashMap;
 use std::str::FromStr;
 
 use leaf_core::error::{Cause, ErrorKind, LeafError};
@@ -114,12 +115,18 @@ pub trait FromRequest: Sized {
 pub struct Path<T>(pub T);
 
 /// A query-string extractor: `T` is decoded from the request's query (e.g.
-/// `?page=2&size=10`). Spring's `@RequestParam`.
+/// `?page=2&size=10` → `Pagination { page: 2, size: 10 }`). Spring's `@RequestParam`.
 ///
-/// The [`FromRequest`] impl here covers `Query<HashMap<String, String>>` — the
-/// raw name→value map, needing no serde. A typed `Query<Struct>` rides the serde
-/// data format through the controller codegen (Task 9), not a plain impl here
-/// (leaf-web names no serde format).
+/// `Query<T>` has ONE uniform [`FromRequestParts`] route for ANY `T: DeserializeOwned`:
+/// it binds the `application/x-www-form-urlencoded` query string into `T` (which
+/// percent-decodes keys+values and treats a repeated key as a loud
+/// [`ErrorKind::ConvertError`] — `serde_urlencoded` does not collect repeated keys
+/// into a sequence). The
+/// raw name→value `Query<HashMap<String, String>>` is just one such `T` — there is no
+/// per-target special case. Unlike the request BODY (whose wire format rides the
+/// negotiable injected [`HttpMessageConverter`]), the query grammar is fixed by the
+/// URL, so leaf-web names the query data format (`serde_urlencoded`) directly — a wire
+/// DATA FORMAT, never an HTTP-server backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Query<T>(pub T);
 
@@ -158,24 +165,34 @@ pub struct Header<T>(pub T);
 #[derive(Clone, Debug)]
 pub struct State<T>(pub T);
 
-impl FromRequest for Query<HashMap<String, String>> {
-    /// Parse the raw query string into a name→value map (last value wins on a
-    /// repeated key). An absent query string yields an empty map (a query is
-    /// optional by default; a required key is the typed-target / codegen concern).
-    /// Values are taken verbatim — percent-decoding is a backend / typed-target
-    /// follow-up, not this raw-map extractor's job.
-    fn from_request(req: &Request) -> Result<Self, LeafError> {
-        let mut map = HashMap::new();
-        if let Some(query) = req.query_str() {
-            for pair in query.split('&').filter(|s| !s.is_empty()) {
-                let (key, value) = match pair.split_once('=') {
-                    Some((k, v)) => (k.to_string(), v.to_string()),
-                    None => (pair.to_string(), String::new()),
-                };
-                map.insert(key, value);
-            }
-        }
-        Ok(Query(map))
+impl<T: serde::de::DeserializeOwned> Query<T> {
+    /// Deserialize the request's query string into `T` via the
+    /// `application/x-www-form-urlencoded` data format, which percent-decodes keys and
+    /// values (`?q=hello%20world` → `hello world`, `+` → space). An absent query string
+    /// deserializes the EMPTY input, so an all-optional `T` (or a map) binds to its empty
+    /// form and a missing REQUIRED field is a loud [`ErrorKind::ConvertError`] — never a
+    /// silent default.
+    ///
+    /// REPEATED-KEY behavior: the raw `Query<HashMap<String, String>>` map is LAST-WINS
+    /// (`?sort=a&sort=b` → `sort = "b"`; a map cannot hold duplicates). A TYPED `Query<T>`
+    /// struct does NOT collapse a repeat — `serde_urlencoded` decodes each `key=value` pair
+    /// independently and surfaces a repeated key against a struct field as a loud
+    /// [`ErrorKind::ConvertError`] (`duplicate field`), and it does NOT collect repeated
+    /// keys into a sequence (a `Vec<_>` field over a repeated key likewise fails loudly) —
+    /// never a silent partial bind. A handler that needs ALL values of a repeated key reads
+    /// the raw last-wins `Query<HashMap>` (or a single delimited value) itself.
+    ///
+    /// This is the one place leaf-web names a query data FORMAT; the body's format
+    /// stays negotiable on the injected [`HttpMessageConverter`], but the query
+    /// grammar is fixed by the URL, so there is nothing to negotiate.
+    fn deserialize_query(req: &Request) -> Result<T, LeafError> {
+        let query = req.query_str().unwrap_or("");
+        serde_urlencoded::from_str::<T>(query).map_err(|e| {
+            LeafError::new(ErrorKind::ConvertError).caused_by(Cause::plain(
+                "query parameters",
+                format!("query string `{query}` did not bind: {e}"),
+            ))
+        })
     }
 }
 
@@ -193,18 +210,21 @@ impl FromRequest for Request {
 /// `<ParamTy as FromRequestParts>::from_request_parts(req, converter, ctx)`.
 ///
 /// It is the superset of [`FromRequest`]: a parameter type satisfies it EITHER via
-/// the request alone (the [`FromRequest`] blanket below — `Query<HashMap>`, the
-/// whole-[`Request`]) OR by reading the per-argument binding [`ExtractCtx`] (the
-/// name-dependent [`Path<T>`]) OR by riding the injected [`HttpMessageConverter`]
-/// (the [`Json<T>`] body deserialization). The codegen dispatches on the parameter's
-/// STRUCTURAL extractor type purely through TRAIT resolution (which impl applies),
-/// never a spelled type name — so one uniform call site lowers every parameter,
-/// `Path<T>` and `Json<T>` included.
+/// the request alone (the [`FromRequest`] blanket below — the whole-[`Request`]) OR by
+/// reading the per-argument binding [`ExtractCtx`] (the name-dependent [`Path<T>`]) OR
+/// by binding the query string ([`Query<T>`] via the `application/x-www-form-urlencoded`
+/// data format) OR by riding the injected [`HttpMessageConverter`] (the [`Json<T>`] body
+/// deserialization). The codegen dispatches on the parameter's STRUCTURAL extractor type
+/// purely through TRAIT resolution (which impl applies), never a spelled type name — so
+/// one uniform call site lowers every parameter, `Path<T>` / `Query<T>` / `Json<T>`
+/// included.
 ///
-/// leaf-web names the serde DATA MODEL (the `serde::de::DeserializeOwned` bound on
-/// the [`Json<T>`] impl, the same boundary [`erased_serde`] already crosses) but no
-/// serde FORMAT: the concrete wire format is the injected converter's
-/// (`leaf-serde`'s `JsonConverter` = `serde_json`).
+/// leaf-web names the serde DATA MODEL (the `serde::de::DeserializeOwned` bound on the
+/// [`Json<T>`]/[`Query<T>`] impls, the same boundary [`erased_serde`] already crosses).
+/// For the BODY it names no serde FORMAT — the concrete wire format is the injected
+/// converter's (`leaf-serde`'s `JsonConverter` = `serde_json`); for the QUERY, whose
+/// grammar is fixed by the URL and not negotiable, it names the one fixed format
+/// (`serde_urlencoded`) directly.
 ///
 /// # Errors
 ///
@@ -227,12 +247,12 @@ pub trait FromRequestParts: Sized {
     ) -> Result<Self, LeafError>;
 }
 
-/// Every request-only NAME-FREE [`FromRequest`] extractor (`Query<HashMap>`, the
-/// whole [`Request`]) ALSO satisfies the converter-aware [`FromRequestParts`] — it
-/// just ignores the converter and the binding context. This blanket is why the
-/// controller codegen can call ONE uniform `from_request_parts(req, converter, ctx)`
-/// per parameter and let trait resolution pick the request-only path, the
-/// name-dependent [`Path<T>`] path, or the converter-backed [`Json<T>`] path.
+/// Every request-only NAME-FREE [`FromRequest`] extractor (the whole [`Request`]) ALSO
+/// satisfies the converter-aware [`FromRequestParts`] — it just ignores the converter
+/// and the binding context. This blanket is why the controller codegen can call ONE
+/// uniform `from_request_parts(req, converter, ctx)` per parameter and let trait
+/// resolution pick the request-only path, the name-dependent [`Path<T>`] path, the
+/// query-binding [`Query<T>`] path, or the converter-backed [`Json<T>`] path.
 impl<T: FromRequest> FromRequestParts for T {
     fn from_request_parts(
         req: &Request,
@@ -323,6 +343,33 @@ impl<T: serde::de::DeserializeOwned> FromRequestParts for Json<T> {
     }
 }
 
+/// `Query<T>` query-string extraction: deserialize the request's query into an
+/// arbitrary `Deserialize` target `T` via the `application/x-www-form-urlencoded`
+/// data format (`?page=2&size=10` → `Pagination { page: 2, size: 10 }`), which
+/// percent-decodes keys+values and treats a repeated key as a loud
+/// [`ErrorKind::ConvertError`] (`serde_urlencoded` does not collect repeated keys
+/// into a sequence).
+///
+/// This is the TYPED counterpart to the raw `FromRequest for Query<HashMap<String,
+/// String>>` map: `Query<HashMap<String, String>>` rides THIS impl too (a `HashMap`
+/// is `DeserializeOwned`), so the raw-map and typed paths share one decoding route.
+/// Unlike the body's negotiable wire format (the injected [`HttpMessageConverter`]),
+/// the query grammar is fixed by the URL, so leaf-web names the query format directly
+/// here — a wire DATA FORMAT, never an HTTP-server backend.
+///
+/// A missing REQUIRED field (or a value that does not parse to its field type) is a
+/// loud [`ErrorKind::ConvertError`] the dispatcher maps via the advice chain — never
+/// a silent default.
+impl<T: serde::de::DeserializeOwned> FromRequestParts for Query<T> {
+    fn from_request_parts(
+        req: &Request,
+        _converter: &dyn HttpMessageConverter,
+        _ctx: &ExtractCtx<'_>,
+    ) -> Result<Self, LeafError> {
+        Query::<T>::deserialize_query(req).map(Query)
+    }
+}
+
 /// Build the loud [`LeafError`] a failed extraction surfaces (the dispatcher maps
 /// it to a 4xx via the advice chain — never a silent default).
 fn missing(what: &'static str, detail: &'static str) -> LeafError {
@@ -334,6 +381,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http::Method;
+    use std::collections::HashMap;
 
     fn request(uri: &str, params: Vec<(String, String)>) -> Request {
         let mut req =
@@ -342,11 +390,22 @@ mod tests {
         req
     }
 
+    /// Bind `Query<HashMap<String, String>>` through the SAME `FromRequestParts` seam
+    /// the controller codegen calls — `HashMap` is just one `T: DeserializeOwned`.
+    fn query_map(req: &Request) -> HashMap<String, String> {
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::named("q");
+        let Query(map) = <Query<HashMap<String, String>> as FromRequestParts>::from_request_parts(
+            req, &conv, &ctx,
+        )
+        .expect("the query map binds");
+        map
+    }
+
     #[test]
     fn query_extractor_parses_the_query_into_a_map() {
         let req = request("/search?page=2&size=10", vec![]);
-        let Query(map) =
-            Query::<HashMap<String, String>>::from_request(&req).expect("parses the query");
+        let map = query_map(&req);
         assert_eq!(map.get("page").map(String::as_str), Some("2"));
         assert_eq!(map.get("size").map(String::as_str), Some("10"));
         assert_eq!(map.len(), 2);
@@ -355,9 +414,98 @@ mod tests {
     #[test]
     fn query_extractor_with_no_query_is_an_empty_map() {
         let req = request("/search", vec![]);
-        let Query(map) =
-            Query::<HashMap<String, String>>::from_request(&req).expect("empty query → empty map");
+        let map = query_map(&req);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn query_map_percent_decodes_keys_and_values() {
+        // `?q=hello%20world` must deliver the DECODED "hello world", not the raw
+        // `hello%20world` (the gap T1b fixes). Keys are decoded too, and `+` is a space.
+        let req = request("/search?q=hello%20world&full+name=Jane%20Doe", vec![]);
+        let map = query_map(&req);
+        assert_eq!(map.get("q").map(String::as_str), Some("hello world"));
+        assert_eq!(map.get("full name").map(String::as_str), Some("Jane Doe"));
+    }
+
+    #[test]
+    fn typed_query_struct_binds_via_form_urlencoded() {
+        // `Query<Pagination{page,size}>` must compile and deserialize from the query
+        // string via form-urlencoded — the gap T1b fixes (only `Query<HashMap>` worked).
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Pagination {
+            page: u32,
+            size: u32,
+        }
+        let req = request("/search?page=2&size=10", vec![]);
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::named("pagination");
+        let Query(p) = <Query<Pagination> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect("the typed query binds via form-urlencoded");
+        assert_eq!(p, Pagination { page: 2, size: 10 });
+    }
+
+    #[test]
+    fn typed_query_struct_percent_decodes_values() {
+        // The typed path rides serde_urlencoded, which percent-decodes for free.
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Search {
+            q: String,
+        }
+        let req = request("/search?q=hello%20world", vec![]);
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::named("search");
+        let Query(s) = <Query<Search> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect("the typed query binds and decodes");
+        assert_eq!(s, Search { q: "hello world".to_string() });
+    }
+
+    #[test]
+    fn typed_query_with_no_query_against_required_field_is_a_loud_error() {
+        // A required field absent from an empty query is a loud ConvertError, not a default.
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Required {
+            page: u32,
+        }
+        let req = request("/search", vec![]);
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::named("required");
+        let err = <Query<Required> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect_err("a missing required query field must surface a LeafError, not a default");
+        assert_eq!(err.kind, ErrorKind::ConvertError);
+    }
+
+    #[test]
+    fn query_map_repeated_key_is_last_wins() {
+        // DOCUMENTED behavior for the raw `Query<HashMap>` map: a repeated key collapses
+        // to LAST-WINS (`?sort=asc&sort=desc` → `sort = "desc"`) — a map cannot hold
+        // duplicates. A handler that needs ALL values of a repeated key reads them off the
+        // map (or a single delimited value) itself.
+        let req = request("/items?sort=asc&sort=desc", vec![]);
+        let map = query_map(&req);
+        assert_eq!(map.get("sort").map(String::as_str), Some("desc"));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn typed_query_repeated_key_against_scalar_field_is_a_loud_error() {
+        // DOCUMENTED behavior for a TYPED `Query<T>` struct: `serde_urlencoded` does NOT
+        // collapse a repeated key — a repeated `?sort=asc&sort=desc` against a single
+        // `sort: String` field is a loud `ConvertError` (duplicate field), never a silent
+        // last-wins bind. (For all-values semantics use the raw `Query<HashMap>` last-wins
+        // map or a single delimited value; `serde_urlencoded` does not collect into a
+        // `Vec`, so a `Vec<_>` field over a repeated key likewise fails loudly.)
+        #[derive(serde::Deserialize, PartialEq, Debug)]
+        struct Sort {
+            #[allow(dead_code)]
+            sort: String,
+        }
+        let req = request("/items?sort=asc&sort=desc", vec![]);
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::named("sort");
+        let err = <Query<Sort> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect_err("a repeated key against a scalar struct field is a loud ConvertError");
+        assert_eq!(err.kind, ErrorKind::ConvertError);
     }
 
     #[test]
@@ -433,19 +581,18 @@ mod tests {
 
     #[test]
     fn from_request_parts_blanket_falls_back_to_from_request() {
-        // Every plain `FromRequest` extractor (Query/&Request) ALSO satisfies the
+        // The plain `FromRequest` whole-`&Request` extractor ALSO satisfies the
         // converter-aware `FromRequestParts` via the blanket impl, so the controller
         // codegen calls ONE uniform `from_request_parts(req, converter, ctx)` per parameter
         // (trait dispatch on the parameter's structural extractor type, never a name).
-        let req = request("/search?page=2", vec![]);
+        let req = request("/search?page=2", vec![("id".to_string(), "9".to_string())]);
         let conv = TestJsonConverter;
-        let ctx = ExtractCtx::named("q");
-        let Query(map) =
-            <Query<HashMap<String, String>> as FromRequestParts>::from_request_parts(
-                &req, &conv, &ctx,
-            )
-            .expect("Query rides the FromRequest blanket through FromRequestParts");
-        assert_eq!(map.get("page").map(String::as_str), Some("2"));
+        let ctx = ExtractCtx::named("req");
+        let whole = <Request as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect("&Request rides the FromRequest blanket through FromRequestParts");
+        assert_eq!(whole.path(), "/search");
+        assert_eq!(whole.query_str(), Some("page=2"));
+        assert_eq!(whole.path_param("id"), Some("9"));
     }
 
     // ── Path<T> reads its OWN capture BY NAME via the ExtractCtx (Task T1a) ───────────

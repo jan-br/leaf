@@ -74,6 +74,12 @@ quote = "1"
 syn = { version = "2", features = ["full", "extra-traits", "visit", "visit-mut"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# A PURE serde data format (not a transport backend) for the `Query<T>` extractor:
+# it deserializes a `?key=val&..` query string into an arbitrary `Deserialize` target
+# and percent-decodes keys+values for free. Allowed in `leaf-web` for the same reason
+# `serde_json` backs the JSON converter — it names a wire DATA FORMAT, not an
+# HTTP-server (hyper/tower/axum stay confined to `leaf-web-hyper`).
+serde_urlencoded = "0.7"
 # The object-safety boundary for the leaf-web `HttpMessageConverter` trait: it lets
 # the converter be a `dyn` bean (serialize a `&dyn erased_serde::Serialize`, hand back
 # a `dyn Deserializer`) without a generic method on the trait object. It is the

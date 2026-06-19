@@ -33,6 +33,14 @@ erased-serde.workspace = true
 # converter-lent deserializer. leaf-web names the serde data MODEL (the same boundary
 # `erased-serde` already crosses) but no serde FORMAT — no serde_json / wire format here.
 serde.workspace = true
+# A PURE serde data format (NOT a transport backend) for the `Query<T>` extractor: it
+# deserializes the request's `?key=val&..` query string into an arbitrary `Deserialize`
+# target and percent-decodes keys+values. Unlike the body (whose wire format rides the
+# injected `HttpMessageConverter`), the query format is FIXED by the URL grammar
+# (`application/x-www-form-urlencoded`), so there is nothing to negotiate and naming it
+# here is the same exception the neutral `http`/`erased-serde` vocabulary already takes —
+# it is a wire DATA FORMAT, not an HTTP server (hyper/tower/axum stay in leaf-web-hyper).
+serde_urlencoded.workspace = true
 
 [features]
 # The in-memory `MockServer` test harness (`src/testing.rs`). Gated so it is never
