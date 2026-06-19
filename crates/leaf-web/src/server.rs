@@ -24,7 +24,7 @@ use leaf_core::{BoxFuture, LeafError};
 
 use crate::advice::ControlAdvice;
 use crate::filter::{FilterChain, Terminal, WebFilter};
-use crate::handler::{Route, RouteTable};
+use crate::handler::{Route, RouteOutcome, RouteTable};
 use crate::{Request, Response};
 
 /// The embedded web server's bound address — `@ConfigurationProperties` keyed
@@ -174,16 +174,31 @@ impl Terminal for RouteTerminal<'_> {
     fn dispatch<'a>(&'a self, mut req: Request) -> BoxFuture<'a, Result<Response, LeafError>> {
         Box::pin(async move {
             match self.table.match_route(req.method(), req.path()) {
-                Some((route, params)) => {
+                RouteOutcome::Matched((route, params)) => {
                     // Install the captured path params for the extractors, then run
                     // the route's handler.
                     req.set_path_params(params);
                     route.handler().handle(&req).await
                 }
-                None => Err(route_not_found(&req)),
+                // A pattern matched the PATH but no route answers this method: a
+                // definitive `405` (NOT an error to be mapped by advice / NoSuchBean's
+                // `404`). The route table decided; we emit the response directly with
+                // the `Allow` header listing the methods that DO match the path.
+                RouteOutcome::MethodNotAllowed(allowed) => Ok(method_not_allowed(&allowed)),
+                // No pattern matched the path at all → a NoSuchBean (default → 404).
+                RouteOutcome::NotFound => Err(route_not_found(&req)),
             }
         })
     }
+}
+
+/// Build the `405 Method Not Allowed` response, carrying the `Allow` header that
+/// lists the methods whose patterns matched the requested path (comma-joined, per
+/// RFC 9110). An empty `allowed` would never reach here (the terminal only calls
+/// this for a non-empty set), but it stays well-formed regardless.
+fn method_not_allowed(allowed: &[http::Method]) -> Response {
+    let allow = allowed.iter().map(http::Method::as_str).collect::<Vec<_>>().join(", ");
+    Response::new(StatusCode::METHOD_NOT_ALLOWED).with_header(http::header::ALLOW, allow)
 }
 
 /// The `LeafError` an unmatched route raises (the default mapping → `404`).
@@ -396,6 +411,29 @@ mod tests {
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/boom")));
         // early (order 1) wins → its 404, not late's 502.
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn req(method: Method, path: &str) -> Request {
+        Request::new(method, path.parse().expect("uri"), http::HeaderMap::new(), Bytes::new())
+    }
+
+    #[test]
+    fn wrong_method_on_a_matched_path_is_405_with_allow() {
+        // GET /x is registered; a POST /x must resolve to 405 (path matched, method
+        // mismatched) with an `Allow` header listing the matched methods — NOT a 404
+        // (which stays reserved for a genuinely unmatched path / NoSuchBean).
+        let route: Arc<dyn Route> =
+            Arc::new(FakeRoute { method: Method::GET, path: "/x", handler: FakeHandler::Ok("ok") });
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+
+        let resp = futures::executor::block_on(dispatcher.dispatch(req(Method::POST, "/x")));
+
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers().get(http::header::ALLOW).and_then(|v| v.to_str().ok()),
+            Some("GET"),
+            "405 must carry an Allow header listing the matched methods"
+        );
     }
 
     #[test]

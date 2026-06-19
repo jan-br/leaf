@@ -55,6 +55,56 @@ pub type PathParams = Vec<(String, String)>;
 /// [`PathParams`] its pattern captured.
 pub type RouteMatch<'r> = (&'r dyn Route, PathParams);
 
+/// The structural outcome of matching `(method, path)` against the table.
+///
+/// Richer than a bare `Option` so the dispatcher can DISTINGUISH the two negative
+/// cases the routing ethos demands be kept apart:
+/// - [`NotFound`](RouteOutcome::NotFound) — no pattern matched the path at all
+///   (a `404` / `NoSuchBean` shape).
+/// - [`MethodNotAllowed`](RouteOutcome::MethodNotAllowed) — a pattern matched the
+///   PATH but no registered route answers the request method; carries the methods
+///   that DO match the path (the `Allow` header, a `405`).
+pub enum RouteOutcome<'r> {
+    /// A route matched the method AND the path: the route + its captured params.
+    Matched(RouteMatch<'r>),
+    /// A pattern matched the path but not with this method; the listed methods are
+    /// the ones whose patterns DO match the path (deduped, registration order).
+    MethodNotAllowed(Vec<Method>),
+    /// No pattern matched the concrete path at all.
+    NotFound,
+}
+
+// Hand-written `Debug` (not derived): `dyn Route` is not `Debug`, and requiring it
+// would force every macro-generated route bean to derive `Debug`. We render the
+// matched route by its PATTERN (`Route::path`) plus the captured params instead.
+impl std::fmt::Debug for RouteOutcome<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouteOutcome::Matched((route, params)) => {
+                f.debug_tuple("Matched").field(&route.path()).field(params).finish()
+            }
+            RouteOutcome::MethodNotAllowed(methods) => {
+                f.debug_tuple("MethodNotAllowed").field(methods).finish()
+            }
+            RouteOutcome::NotFound => f.write_str("NotFound"),
+        }
+    }
+}
+
+/// A build-time report over a set of routes: the compiled [`RouteTable`] plus any
+/// duplicate `(method, exact-pattern)` registrations detected while compiling.
+///
+/// Duplicate exact patterns are a wiring bug (the matcher would silently shadow by
+/// slice order); the routing ethos is "loud or nothing", so [`RouteTable::build`]
+/// emits an `eprintln!` diagnostic for each, and this report exposes them for tests
+/// / callers that want to act on them.
+pub struct RouteReport<'r> {
+    /// The compiled table (ready to match).
+    pub table: RouteTable<'r>,
+    /// The duplicate `(method, exact-pattern)` pairs found at build time.
+    pub duplicates: Vec<(Method, String)>,
+}
+
 /// One compiled path pattern: the `/`-split segments, each either a literal or a
 /// `{name}` capture. Built once per [`Route`] at table-build time so matching is
 /// a per-segment walk (no per-request re-parse).
@@ -82,10 +132,32 @@ pub struct RouteTable<'r> {
 
 impl<'r> RouteTable<'r> {
     /// Build a table over the given routes (compiling each path PATTERN into its
-    /// segments once).
+    /// segments once), ordered by SPECIFICITY and surfacing duplicate-route bugs.
+    ///
+    /// Convenience wrapper over [`build_report`](RouteTable::build_report) for
+    /// callers that only want the table; duplicate `(method, exact-pattern)`
+    /// registrations are still reported loudly via `eprintln!` (see `build_report`).
     #[must_use]
     pub fn build(routes: &[&'r dyn Route]) -> Self {
-        let routes = routes
+        RouteTable::build_report(routes).table
+    }
+
+    /// Build a table AND a [`RouteReport`] (the table + detected duplicates).
+    ///
+    /// Two ordering/diagnostic guarantees the bare `Vec`-order matcher could not
+    /// give:
+    /// - SPECIFICITY ordering — routes are stably sorted so a MORE specific
+    ///   pattern (more literal segments / fewer captures) is tried before a less
+    ///   specific same-arity one. A literal segment therefore beats a `{capture}`
+    ///   of the same arity REGARDLESS of contributed (linkme) order, killing the
+    ///   `/users/me` vs `/users/{id}` coin-flip. The sort is stable, so genuinely
+    ///   equal-specificity routes keep their contributed order.
+    /// - DUPLICATE detection — a repeated `(method, exact-pattern)` is a wiring bug
+    ///   (the matcher would silently shadow by slice order). Each is collected into
+    ///   the report AND emitted via `eprintln!` so it is loud at startup.
+    #[must_use]
+    pub fn build_report(routes: &[&'r dyn Route]) -> RouteReport<'r> {
+        let mut compiled: Vec<CompiledRoute<'r>> = routes
             .iter()
             .map(|&route| CompiledRoute {
                 route,
@@ -93,28 +165,93 @@ impl<'r> RouteTable<'r> {
                 segments: compile_pattern(route.path()),
             })
             .collect();
-        RouteTable { routes }
-    }
 
-    /// Match `(method, path)` against the table.
-    ///
-    /// Returns the matching [`Route`] plus the captured `(name, value)` path
-    /// params (empty for an all-literal route), or `None` when no route matches
-    /// the path with that method. A path that matches a pattern but with a
-    /// different method does not match (no method fall-through here).
-    #[must_use]
-    pub fn match_route(&self, method: &Method, path: &str) -> Option<RouteMatch<'r>> {
-        let segments: Vec<&str> = split_path(path);
-        for entry in &self.routes {
-            if entry.method != *method {
-                continue;
-            }
-            if let Some(params) = match_segments(&entry.segments, &segments) {
-                return Some((entry.route, params));
+        // Detect duplicate (method, exact-pattern) registrations on the COMPILED
+        // segments (so equivalent-but-differently-written patterns — trailing
+        // slash, `//` — collapse to the same key, no textual-name comparison).
+        let mut seen: Vec<(Method, String)> = Vec::new();
+        let mut duplicates: Vec<(Method, String)> = Vec::new();
+        for entry in &compiled {
+            let key = (entry.method.clone(), canonical_pattern(&entry.segments));
+            if seen.contains(&key) {
+                if !duplicates.contains(&key) {
+                    eprintln!(
+                        "leaf-web: duplicate route registration — {} {} declared more than once \
+                         (one will shadow the other); each (method, path) must be unique",
+                        key.0, key.1,
+                    );
+                    duplicates.push(key);
+                }
+            } else {
+                seen.push(key);
             }
         }
-        None
+
+        // Order by specificity: most specific first (a smaller specificity rank is
+        // tried earlier). Stable, so equal-specificity routes keep contributed order.
+        compiled.sort_by_key(|e| specificity_rank(&e.segments));
+
+        RouteReport { table: RouteTable { routes: compiled }, duplicates }
     }
+
+    /// Match `(method, path)` against the table, returning a [`RouteOutcome`].
+    ///
+    /// Walks the specificity-ordered routes: the first whose pattern matches the
+    /// path AND whose method equals `method` wins ([`Matched`](RouteOutcome::Matched)).
+    /// If no method matches but at least one pattern matched the PATH, the outcome is
+    /// [`MethodNotAllowed`](RouteOutcome::MethodNotAllowed) carrying those methods
+    /// (the `Allow` set); otherwise [`NotFound`](RouteOutcome::NotFound).
+    #[must_use]
+    pub fn match_route(&self, method: &Method, path: &str) -> RouteOutcome<'r> {
+        let segments: Vec<&str> = split_path(path);
+        let mut allowed: Vec<Method> = Vec::new();
+        for entry in &self.routes {
+            if let Some(params) = match_segments(&entry.segments, &segments) {
+                if entry.method == *method {
+                    return RouteOutcome::Matched((entry.route, params));
+                }
+                // Path matched, method did not: record it for the Allow set.
+                if !allowed.contains(&entry.method) {
+                    allowed.push(entry.method.clone());
+                }
+            }
+        }
+        if allowed.is_empty() {
+            RouteOutcome::NotFound
+        } else {
+            RouteOutcome::MethodNotAllowed(allowed)
+        }
+    }
+}
+
+/// A stable specificity rank for a pattern: routes sort ascending by this, so a
+/// SMALLER rank is tried first (more specific). A literal segment is more specific
+/// than a capture at the same position, so we rank purely by the count of capture
+/// segments (fewer captures = more specific = smaller rank). This is structural —
+/// it counts capture vs literal segments, never inspecting any segment's text.
+fn specificity_rank(segments: &[PatternSegment]) -> usize {
+    segments.iter().filter(|s| s.capture.is_some()).count()
+}
+
+/// A canonical string key for a compiled pattern (every capture normalised to
+/// `{}` so the KEY ignores capture-name spelling — two routes differing only in a
+/// capture's name still collide). Used only for duplicate detection, never for
+/// matching behaviour, and built from the compiled segments (so trailing-slash /
+/// `//` variants of the same pattern share a key).
+fn canonical_pattern(segments: &[PatternSegment]) -> String {
+    let mut out = String::new();
+    for seg in segments {
+        out.push('/');
+        if seg.capture.is_some() {
+            out.push_str("{}");
+        } else {
+            out.push_str(&seg.literal);
+        }
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
 }
 
 /// Split a path into its non-empty `/`-delimited segments (so `/` and `` both
@@ -207,33 +344,36 @@ mod tests {
         let table = RouteTable::build(&routes);
 
         // Parameterized match: captures `sku`.
-        let (matched, params) = table
-            .match_route(&Method::GET, "/products/COFFEE")
-            .expect("matches the /products/{sku} route");
+        let (matched, params) = match table.match_route(&Method::GET, "/products/COFFEE") {
+            RouteOutcome::Matched(m) => m,
+            other => panic!("expected the /products/{{sku}} route, got {other:?}"),
+        };
         assert_eq!(matched.path(), "/products/{sku}");
         assert_eq!(params, vec![("sku".to_string(), "COFFEE".to_string())]);
 
         // Literal match: no captures.
-        let (lit, lit_params) =
-            table.match_route(&Method::GET, "/a").expect("matches the literal /a route");
+        let (lit, lit_params) = match table.match_route(&Method::GET, "/a") {
+            RouteOutcome::Matched(m) => m,
+            other => panic!("expected the literal /a route, got {other:?}"),
+        };
         assert_eq!(lit.path(), "/a");
         assert!(lit_params.is_empty());
     }
 
     #[test]
-    fn route_table_non_match_is_none() {
+    fn route_table_non_match_is_not_found() {
         let a = FakeRoute { method: Method::GET, path: "/a", handler: FakeHandler };
         let routes: Vec<&dyn Route> = vec![&a];
         let table = RouteTable::build(&routes);
 
-        // Unknown path → None.
-        assert!(table.match_route(&Method::GET, "/nope").is_none());
-        // Wrong segment count → None.
-        assert!(table.match_route(&Method::GET, "/a/b").is_none());
+        // Unknown path → NotFound.
+        assert!(matches!(table.match_route(&Method::GET, "/nope"), RouteOutcome::NotFound));
+        // Wrong segment count → NotFound.
+        assert!(matches!(table.match_route(&Method::GET, "/a/b"), RouteOutcome::NotFound));
     }
 
     #[test]
-    fn route_table_wrong_method_is_none() {
+    fn route_table_wrong_method_is_method_not_allowed() {
         let p = FakeRoute {
             method: Method::GET,
             path: "/products/{sku}",
@@ -242,7 +382,65 @@ mod tests {
         let routes: Vec<&dyn Route> = vec![&p];
         let table = RouteTable::build(&routes);
 
-        // Path matches but the method does not → None.
-        assert!(table.match_route(&Method::POST, "/products/COFFEE").is_none());
+        // Path matches but the method does not → MethodNotAllowed listing the
+        // methods whose patterns DO match the concrete path.
+        match table.match_route(&Method::POST, "/products/COFFEE") {
+            RouteOutcome::MethodNotAllowed(allowed) => {
+                assert_eq!(allowed, vec![Method::GET]);
+            }
+            other => panic!("expected MethodNotAllowed, got {other:?}"),
+        }
+    }
+
+    /// A literal segment must beat a same-arity `{capture}` REGARDLESS of the
+    /// order the routes were contributed in (linkme collection order is
+    /// non-deterministic). We build the table in BOTH insertion orders and assert
+    /// `/users/me` always resolves to the literal route, never the capture.
+    #[test]
+    fn literal_beats_capture_regardless_of_order() {
+        let me = FakeRoute { method: Method::GET, path: "/users/me", handler: FakeHandler };
+        let id = FakeRoute { method: Method::GET, path: "/users/{id}", handler: FakeHandler };
+
+        for routes in [
+            vec![&me as &dyn Route, &id as &dyn Route],
+            vec![&id as &dyn Route, &me as &dyn Route],
+        ] {
+            let table = RouteTable::build(&routes);
+            let matched = match table.match_route(&Method::GET, "/users/me") {
+                RouteOutcome::Matched((route, _)) => route,
+                other => panic!("expected a match, got {other:?}"),
+            };
+            assert_eq!(
+                matched.path(),
+                "/users/me",
+                "the literal route must win over the same-arity capture"
+            );
+
+            // The capture still answers a non-literal concrete path.
+            let cap = match table.match_route(&Method::GET, "/users/42") {
+                RouteOutcome::Matched((route, params)) => {
+                    assert_eq!(params, vec![("id".to_string(), "42".to_string())]);
+                    route
+                }
+                other => panic!("expected the capture to match /users/42, got {other:?}"),
+            };
+            assert_eq!(cap.path(), "/users/{id}");
+        }
+    }
+
+    /// Two routes with the same (method, exact pattern) is a wiring bug: `build`
+    /// must surface a LOUD diagnostic rather than silently shadow by slice order.
+    #[test]
+    fn duplicate_route_is_a_loud_diagnostic() {
+        let a = FakeRoute { method: Method::GET, path: "/dup", handler: FakeHandler };
+        let b = FakeRoute { method: Method::GET, path: "/dup", handler: FakeHandler };
+        let routes: Vec<&dyn Route> = vec![&a, &b];
+
+        let report = RouteTable::build_report(&routes);
+        assert!(
+            report.duplicates.iter().any(|(m, p)| *m == Method::GET && p == "/dup"),
+            "build must report the duplicate (GET, /dup), got {:?}",
+            report.duplicates
+        );
     }
 }

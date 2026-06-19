@@ -99,7 +99,9 @@ pub use advice::ControlAdvice;
 pub use content::HttpMessageConverter;
 pub use extract::{ExtractCtx, FromRequest, FromRequestParts, Header, Json, Path, Query};
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
-pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
+pub use handler::{
+    Handler, PathParams, Route, RouteMatch, RouteOutcome, RouteReport, RouteTable,
+};
 pub use request::Request;
 pub use response::{IntoResponse, Response};
 pub use runner::WebServerRunner;
