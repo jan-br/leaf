@@ -197,6 +197,26 @@ pub struct Json<T>(pub T);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header<T>(pub T);
 
+/// A per-request EXTENSION extractor: `T` is read from the request's type-keyed
+/// extensions map (the typed attribute an upstream [`WebFilter`](crate::WebFilter)
+/// attached via [`Request::insert_extension`]). Spring's request-attribute access /
+/// axum's `Extension<T>`.
+///
+/// This is the seam a security/auth filter uses: it authenticates and attaches a
+/// typed `Principal` to the [`Request`] it threads through `next.run(req)`, and the
+/// downstream handler binds it with an `Extension<Principal>` parameter. The extractor
+/// needs NO name from the [`ExtractCtx`] — it resolves PURELY by the type `T` (the
+/// no-type-names rule is about the codegen never branching on a spelled type; resolving
+/// a value by its `TypeId` is the std `Any` mechanism, not a textual-name check). It
+/// rides the same uniform [`FromRequestParts`] seam as every other extractor, so it
+/// requires NO special codegen — trait resolution picks this impl structurally.
+///
+/// A missing extension (no value of type `T` was attached) is a loud
+/// [`ErrorKind::ConvertError`] the dispatcher maps to a `400` — never a panic, never a
+/// silent default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Extension<T>(pub T);
+
 impl<T: serde::de::DeserializeOwned> Query<T> {
     /// Deserialize the request's query string into `T` via the
     /// `application/x-www-form-urlencoded` data format, which percent-decodes keys and
@@ -378,6 +398,34 @@ where
             ))
         })?;
         Ok(Header(value))
+    }
+}
+
+/// `Extension<T>` reads the typed per-request attribute an upstream
+/// [`WebFilter`](crate::WebFilter) attached (via [`Request::insert_extension`]) and
+/// returns it cloned. It needs NO name from the [`ExtractCtx`] — it resolves purely by
+/// the type `T` through std [`Any`](std::any::Any), so the controller codegen dispatches
+/// on the parameter's STRUCTURAL extractor type via plain trait resolution, exactly like
+/// every other extractor (no special codegen).
+///
+/// A missing extension (no value of type `T` on the request) is a loud
+/// [`ErrorKind::ConvertError`] the dispatcher maps to a `400` — never a panic, never a
+/// silent default. `T: Clone` because the request owns the attribute (an `Arc`-backed
+/// store shared across the dispatcher's request clone); the extractor hands the handler
+/// its own copy.
+impl<T: Clone + Send + Sync + 'static> FromRequestParts for Extension<T> {
+    fn from_request_parts(
+        req: &Request,
+        _converter: &dyn HttpMessageConverter,
+        _ctx: &ExtractCtx<'_>,
+    ) -> Result<Self, LeafError> {
+        req.extension::<T>().cloned().map(Extension).ok_or_else(|| {
+            LeafError::new(ErrorKind::ConvertError).caused_by(Cause::plain(
+                "request extension",
+                "no extension of the requested type was attached to the request \
+                 (an upstream WebFilter must `insert_extension` it)",
+            ))
+        })
     }
 }
 

@@ -26,11 +26,12 @@
 //!   bean in `leaf-serde`); Accept-based negotiation among several converters is
 //!   deferred until a second converter is contributed. leaf-web names no serde data
 //!   format (only the `erased-serde` object-safety boundary).
-//! - [`FromRequest`] + [`Path`] / [`Query`] / [`Json`] / [`Header`] —
+//! - [`FromRequest`] + [`Path`] / [`Query`] / [`Json`] / [`Header`] / [`Extension`] —
 //!   the argument-extraction seam: each controller-method parameter resolves from
 //!   the [`Request`] via its STRUCTURAL extractor type (the codegen dispatches on
 //!   shape, never a type name). `Path<String>`, `Query<HashMap>`, the named
-//!   `Header<T>` (its header name from a `#[header("X-Foo")]` attribute) and the whole-
+//!   `Header<T>` (its header name from a `#[header("X-Foo")]` attribute), the typed
+//!   per-request `Extension<T>` (a value an upstream `WebFilter` attached) and the whole-
 //!   `Request` extractor land here; the serde-backed reads (`Json<T>` body, `Query<T>`)
 //!   ride the injected `HttpMessageConverter` — resolved by the controller codegen, so
 //!   leaf-web names no serde format here. Handler-side DI collaborators are NOT an
@@ -99,7 +100,9 @@ pub use http;
 
 pub use advice::ControlAdvice;
 pub use content::HttpMessageConverter;
-pub use extract::{ExtractCtx, FromRequest, FromRequestParts, Header, Json, Path, Query};
+pub use extract::{
+    ExtractCtx, Extension, FromRequest, FromRequestParts, Header, Json, Path, Query,
+};
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{
     Handler, PathParams, Route, RouteMatch, RouteOutcome, RouteReport, RouteTable,
