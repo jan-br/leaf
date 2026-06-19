@@ -1,7 +1,8 @@
 //! `JsonConverter` — the JSON [`HttpMessageConverter`](leaf_web::HttpMessageConverter)
 //! impl (Spring's `MappingJackson2HttpMessageConverter`). It is where the leaf-web
-//! content-negotiation abstraction meets a concrete serde data format
-//! (`serde_json`).
+//! content-type abstraction meets a concrete serde data format (`serde_json`). It is
+//! the SINGLE converter wired today; Accept-based content negotiation among several
+//! converters is deferred until a second converter is contributed.
 //!
 //! It is contributed to the container by the [`JsonConverterConfig`]
 //! `#[configuration]` holder (itself a `#[component]`) via a `#[bean(provides =
@@ -64,8 +65,10 @@ impl<C: HttpMessageConverter + ?Sized> HttpMessageConverterExt for C {}
 ///
 /// It is contributed to the container as the `dyn HttpMessageConverter` view by the
 /// [`JsonConverterConfig`] `#[configuration]` holder's `#[bean]` factory below (the
-/// stereotype-generated registration — no hand-rolled `Provider`), so the server
-/// collects it by trait injection (`Vec<Ref<dyn HttpMessageConverter>>`).
+/// stereotype-generated registration — no hand-rolled `Provider`), so consumers inject
+/// it by trait (`Ref<dyn HttpMessageConverter>`). It is the single converter wired
+/// today; a future second converter would make `Vec<Ref<dyn HttpMessageConverter>>`
+/// collection (for Accept negotiation) meaningful.
 #[derive(Clone, Copy, Default)]
 pub struct JsonConverter;
 
@@ -110,8 +113,8 @@ impl HttpMessageConverter for JsonConverter {
 /// The `#[configuration]` holder that contributes the [`JsonConverter`] as the
 /// `dyn HttpMessageConverter` bean. A managed singleton whose `#[bean]` factory
 /// (`json_converter`) returns the concrete converter and declares the
-/// `dyn HttpMessageConverter` upcast view — the stereotype-generated registration
-/// the server's `Vec<Ref<dyn HttpMessageConverter>>` collection injection finds.
+/// `dyn HttpMessageConverter` upcast view — the stereotype-generated registration the
+/// rest-controller codegen and `Json` extractor inject as `Ref<dyn HttpMessageConverter>`.
 ///
 /// (The struct stereotype takes no `provides` arg; the `#[configuration]` +
 /// `#[bean(provides = "dyn …")]` factory is leaf's idiom for a concrete bean that

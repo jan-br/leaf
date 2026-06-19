@@ -33,8 +33,8 @@ use leaf_core::{ErrorKind, Injectable, LeafError, Ref, ResolveCtx};
 // they are never resolved as attribute macros in their own right.
 use leaf_macros::rest_controller;
 use leaf_web::testing::MockServer;
-use leaf_web::{Dispatcher, Header, Path, Request, Route};
-use serde::Serialize;
+use leaf_web::{Dispatcher, Header, Json, Path, Request, ResponseEntity, Route};
+use serde::{Deserialize, Serialize};
 
 // ─────────────────────────── the controller bean + its DTO ───────────────────────
 //
@@ -45,6 +45,15 @@ use serde::Serialize;
 /// The JSON response DTO a handler returns; the rest-controller policy serializes it.
 #[derive(Serialize, PartialEq, Debug)]
 struct ProductDto {
+    sku: String,
+    name: String,
+    price_cents: u32,
+}
+
+/// The JSON request DTO a `Json<T>` body parameter deserializes (the malformed-body
+/// proof: a body that is not this shape is a `ConvertError` → 400).
+#[derive(Deserialize)]
+struct NewProduct {
     sku: String,
     name: String,
     price_cents: u32,
@@ -115,6 +124,20 @@ impl Catalog {
         let Header(key) = key;
         Ok(ProductDto { sku: key, name: "secure".to_string(), price_cents: 0 })
     }
+
+    /// `POST /catalog` — the `ResponseEntity` proof (Task T3b): the handler returns a
+    /// `201 Created` carrier with a `Location` header and the DTO body. The
+    /// rest-controller policy lowers it through `IntoResponseWith`, so the response is
+    /// 201 + Location + the JSON-serialized DTO — NOT the hard-coded 200 the old policy
+    /// could only produce.
+    #[post("/catalog")]
+    async fn add(&self, body: Json<NewProduct>) -> Result<ResponseEntity<ProductDto>, LeafError> {
+        let Json(np) = body;
+        let dto = ProductDto { sku: np.sku.clone(), name: np.name, price_cents: np.price_cents };
+        Ok(ResponseEntity::created()
+            .with_header(http::header::LOCATION, format!("/products/{}", np.sku))
+            .body(dto))
+    }
 }
 
 // ─────────────────────────────── assembly helpers ────────────────────────────────
@@ -142,13 +165,20 @@ fn assemble_dispatcher() -> Dispatcher {
 
     let routes: Vec<Ref<dyn Route>> =
         block(<Vec<Ref<dyn Route>> as Injectable>::inject(&cx)).expect("routes resolve");
-    assert_eq!(routes.len(), 4, "all generated #[rest_controller] route beans were collected");
+    assert_eq!(routes.len(), 5, "all generated #[rest_controller] route beans were collected");
 
     Dispatcher::new(routes.into_iter().map(Ref::into_arc).collect(), vec![], vec![])
 }
 
 fn request(method: Method, path: &str) -> Request {
     Request::new(method, path.parse().expect("uri"), http::HeaderMap::new(), Bytes::new())
+}
+
+/// A request carrying a JSON body (for the `Json<T>` body-extraction proofs).
+fn request_with_body(method: Method, path: &str, body: &'static [u8]) -> Request {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    Request::new(method, path.parse().expect("uri"), headers, Bytes::from_static(body))
 }
 
 /// A request carrying one header (for the named-header extractor proof).
@@ -214,12 +244,54 @@ fn a_named_header_param_resolves_via_the_header_attribute() {
 #[test]
 fn a_missing_named_header_is_a_loud_error_not_a_silent_default() {
     // A missing `X-Api-Key` header is a loud `ConvertError` the `Header<String>` extractor
-    // raises — the dispatcher maps it (the default floor → 500; an app `#[control_advice]`
-    // can refine `ConvertError` → 400). The point: it is NOT OK and NOT a silent default.
+    // raises — a client fault the default floor now maps to 400 BAD REQUEST (Task T3a:
+    // bad-request/missing-param → 4xx, per the design spec). The point: it is NOT OK and
+    // NOT a silent default; an app `#[control_advice]` can still refine the message.
     let server = MockServer::new(Arc::new(assemble_dispatcher()));
     let resp = block(server.handle(request(Method::GET, "/secure")));
     assert_ne!(resp.status(), StatusCode::OK, "a missing required header must not succeed");
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "ConvertError hits the default floor");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a missing param is a client fault → 400");
+}
+
+#[test]
+fn a_rest_controller_handler_can_return_a_response_entity_with_201_and_a_location() {
+    // Task T3b: a handler returning `ResponseEntity::created().with_header(LOCATION,
+    // ..).body(dto)` lowers through `IntoResponseWith` to a 201 + the Location header +
+    // the JSON-serialized DTO — the status/headers the old hard-coded `Response::ok()`
+    // policy could never set.
+    let server = MockServer::new(Arc::new(assemble_dispatcher()));
+    let resp = block(server.handle(request_with_body(
+        Method::POST,
+        "/catalog",
+        br#"{"sku":"TEA","name":"Earl Grey","price_cents":999}"#,
+    )));
+    assert_eq!(resp.status(), StatusCode::CREATED, "the ResponseEntity status reaches the wire");
+    assert_eq!(
+        resp.headers().get(http::header::LOCATION).and_then(|v| v.to_str().ok()),
+        Some("/products/TEA"),
+        "the ResponseEntity Location header reaches the wire"
+    );
+    assert_eq!(
+        resp.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "the converter's content-type is still set"
+    );
+    let body = std::str::from_utf8(resp.body_bytes()).expect("utf8 body");
+    assert_eq!(body, r#"{"sku":"TEA","name":"Earl Grey","price_cents":999}"#);
+}
+
+#[test]
+fn a_malformed_json_body_maps_to_400_not_500() {
+    // Task T3a: a malformed JSON body to a `Json<T>` handler is a `ConvertError` the
+    // body extractor raises; with no advice, the default floor now maps it to 400 BAD
+    // REQUEST (the design-spec promise), NOT the generic 500.
+    let server = MockServer::new(Arc::new(assemble_dispatcher()));
+    let resp = block(server.handle(request_with_body(
+        Method::POST,
+        "/catalog",
+        br#"{ this is not json "#,
+    )));
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a malformed body is a client fault → 400");
 }
 
 #[test]

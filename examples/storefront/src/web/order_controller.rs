@@ -40,16 +40,23 @@ pub struct OrderController {
 impl OrderController {
     /// `POST /orders` — the `Json<NewOrder>` body resolves through the injected converter
     /// (the converter-backed extraction); the order is placed via `OrderService`, and the
-    /// created `OrderDto` is serialized back to JSON.
+    /// created `OrderDto` is returned as a `201 Created` `ResponseEntity` carrying a
+    /// `Location` header for the new resource (the `@ResponseBody` policy serializes the
+    /// body, the `ResponseEntity` sets the status + header) — the proper REST shape for a
+    /// resource creation, reachable now that the rest-controller return policy is the
+    /// `IntoResponseWith` trait.
     #[post("/orders")]
-    async fn create(&self, body: Json<NewOrder>) -> Result<OrderDto, LeafError> {
+    async fn create(&self, body: Json<NewOrder>) -> Result<ResponseEntity<OrderDto>, LeafError> {
         let Json(NewOrder { sku, qty }) = body;
         let order = self.orders.place_order(sku, qty)?;
-        Ok(OrderDto {
+        let dto = OrderDto {
             id: order.id,
             sku: order.sku,
             qty: order.qty,
             total_cents: order.total_cents,
-        })
+        };
+        Ok(ResponseEntity::created()
+            .with_header(http::header::LOCATION, format!("/orders/{}", dto.id))
+            .body(dto))
     }
 }

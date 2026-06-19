@@ -4,6 +4,9 @@
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
+use leaf_core::LeafError;
+
+use crate::content::HttpMessageConverter;
 
 /// An outbound HTTP response in leaf's backend-free vocabulary: a status, a
 /// header map, and a [`Bytes`] body the backend writes at the edge.
@@ -129,6 +132,134 @@ impl<T: IntoResponse, E: IntoResponse> IntoResponse for Result<T, E> {
     }
 }
 
+/// A `#[rest_controller]` (`@ResponseBody`) return carrier: a status code, response
+/// headers, and a body `T` the converter serializes — Spring's `ResponseEntity<T>`.
+///
+/// A `#[rest_controller]` handler returns either a bare serializable value (→ `200` with
+/// the converter's content-type + serialized body) OR a `ResponseEntity<T>` to set the
+/// status / headers explicitly:
+///
+/// ```ignore
+/// ResponseEntity::created()
+///     .with_header(http::header::LOCATION, "/products/TEA")
+///     .body(dto) // -> 201 Created + Location + the JSON-serialized dto
+/// ```
+///
+/// The codegen lowers EVERY rest-controller return through the uniform
+/// [`IntoResponseWith`] trait (`<#ret as IntoResponseWith>::into_response_with(value,
+/// converter)`), so the bare-value and carrier paths share one structural call site — no
+/// type-name detection.
+#[derive(Clone, Debug)]
+pub struct ResponseEntity<T> {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: T,
+}
+
+impl<T> ResponseEntity<T> {
+    /// A `ResponseEntity` with the given status, no headers, and the body `T`.
+    pub fn with_status(status: StatusCode, body: T) -> Self {
+        ResponseEntity { status, headers: HeaderMap::new(), body }
+    }
+
+    /// Append a header (builder style). A header name/value that cannot be parsed is
+    /// silently dropped (the same lenient policy as [`Response::with_header`]).
+    #[must_use]
+    pub fn with_header<K, V>(mut self, name: K, value: V) -> Self
+    where
+        K: TryInto<HeaderName>,
+        V: TryInto<HeaderValue>,
+    {
+        if let (Ok(n), Ok(v)) = (name.try_into(), value.try_into()) {
+            self.headers.insert(n, v);
+        }
+        self
+    }
+}
+
+impl ResponseEntity<()> {
+    /// A status-only builder (`201 Created`, etc.); attach the body with [`body`].
+    ///
+    /// [`body`]: ResponseEntity::body
+    #[must_use]
+    pub fn status(status: StatusCode) -> Self {
+        ResponseEntity { status, headers: HeaderMap::new(), body: () }
+    }
+
+    /// A `201 Created` status-only builder. Attach the body with [`body`] (typically
+    /// alongside a `Location` header via [`with_header`]).
+    ///
+    /// [`body`]: ResponseEntity::body
+    /// [`with_header`]: ResponseEntity::with_header
+    #[must_use]
+    pub fn created() -> Self {
+        ResponseEntity::status(StatusCode::CREATED)
+    }
+
+    /// Attach the body, keeping the accumulated status + headers — the bridge from a
+    /// status-only builder to a `ResponseEntity<T>` the converter serializes.
+    #[must_use]
+    pub fn body<T>(self, body: T) -> ResponseEntity<T> {
+        ResponseEntity { status: self.status, headers: self.headers, body }
+    }
+}
+
+/// The `#[rest_controller]` (`@ResponseBody`) return policy as a TRAIT the controller
+/// codegen drives uniformly: a handler return becomes a [`Response`], serializing its body
+/// through the injected [`HttpMessageConverter`]. Dispatch is purely structural — the
+/// codegen emits one `<#ret as IntoResponseWith>::into_response_with(value, converter)`
+/// call site for EVERY handler, never branching on the return's spelled type name.
+///
+/// Two impls cover the policy: a blanket impl over any serializable value (→ `200` +
+/// the converter's content-type + serialized body) and an impl for [`ResponseEntity<T>`]
+/// (→ its status + headers + the serialized body). They do not overlap: `ResponseEntity`
+/// deliberately does not implement `erased_serde::Serialize`.
+pub trait IntoResponseWith {
+    /// Serialize `self` into a [`Response`] via `converter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the converter's [`LeafError`] when the body cannot be serialized.
+    fn into_response_with(
+        self,
+        converter: &dyn HttpMessageConverter,
+    ) -> Result<Response, LeafError>;
+}
+
+impl<T: erased_serde::Serialize> IntoResponseWith for T {
+    /// A bare serializable value → `200 OK` with the converter's content-type + the
+    /// serialized body.
+    fn into_response_with(
+        self,
+        converter: &dyn HttpMessageConverter,
+    ) -> Result<Response, LeafError> {
+        let body = converter.write(&self)?;
+        Ok(Response::ok()
+            .with_header(http::header::CONTENT_TYPE, converter.content_type())
+            .with_body(body))
+    }
+}
+
+impl<T: erased_serde::Serialize> IntoResponseWith for ResponseEntity<T> {
+    /// A carrier → its status + headers + the converter-serialized body (the converter's
+    /// content-type is added unless the carrier already set one).
+    fn into_response_with(
+        self,
+        converter: &dyn HttpMessageConverter,
+    ) -> Result<Response, LeafError> {
+        let serialized = converter.write(&self.body)?;
+        let mut resp = Response::new(self.status).with_body(serialized);
+        for (name, value) in &self.headers {
+            resp = resp.with_header(name.clone(), value.clone());
+        }
+        // Set the converter's content-type only if the carrier did not pin one itself.
+        if !self.headers.contains_key(http::header::CONTENT_TYPE) {
+            resp = resp.with_header(http::header::CONTENT_TYPE, converter.content_type());
+        }
+        Ok(resp)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +310,70 @@ mod tests {
         let out = ().into_response();
         assert_eq!(out.status(), StatusCode::NO_CONTENT);
         assert!(out.body_bytes().is_empty());
+    }
+
+    // ── ResponseEntity + IntoResponseWith (the @ResponseBody return policy, T3b) ──
+
+    use crate::content::HttpMessageConverter;
+    use bytes::Bytes as _Bytes;
+    use leaf_core::LeafError;
+
+    /// A trivial converter that "serializes" by recording the call and returning a fixed
+    /// body — enough to prove the `IntoResponseWith` trait drives the converter without a
+    /// serde dependency in leaf-web's own tests.
+    struct FixedConverter;
+
+    impl HttpMessageConverter for FixedConverter {
+        fn content_type(&self) -> &str {
+            "application/test"
+        }
+        fn write(&self, _value: &dyn erased_serde::Serialize) -> Result<_Bytes, LeafError> {
+            Ok(_Bytes::from_static(b"BODY"))
+        }
+        fn with_deserializer(
+            &self,
+            _body: &[u8],
+            _read: &mut dyn FnMut(&mut dyn erased_serde::Deserializer) -> Result<(), LeafError>,
+        ) -> Result<(), LeafError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_bare_serializable_value_is_200_serialized_via_the_converter() {
+        // The plain-value path: a serializable return → 200 with the converter's
+        // content-type + the serialized body. Trait dispatch drives the converter.
+        let resp = IntoResponseWith::into_response_with(42u32, &FixedConverter)
+            .expect("serializes");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body_bytes(), b"BODY".as_slice());
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/test"),
+        );
+    }
+
+    #[test]
+    fn a_response_entity_carries_its_status_headers_and_serialized_body() {
+        // The carrier path: ResponseEntity::created().with_header(LOCATION, ..).body(dto)
+        // → 201 + the Location header + the converter-serialized body (still with the
+        // converter's content-type). Same uniform `into_response_with` entry point.
+        let entity = ResponseEntity::created()
+            .with_header(http::header::LOCATION, "/products/TEA")
+            .body(7u32);
+        let resp = IntoResponseWith::into_response_with(entity, &FixedConverter)
+            .expect("serializes");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.body_bytes(), b"BODY".as_slice());
+        assert_eq!(
+            resp.headers().get(http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/products/TEA"),
+        );
+        assert_eq!(
+            resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/test"),
+            "the converter's content-type is still set on a ResponseEntity body",
+        );
     }
 
     #[test]

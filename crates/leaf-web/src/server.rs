@@ -214,12 +214,19 @@ fn route_not_found(req: &Request) -> LeafError {
 /// (Spring's `DefaultHandlerExceptionResolver`): a user `ControlAdvice` overrides
 /// it by returning `Some` first.
 ///
-/// Convention: a `NoSuchBean` (an unmatched route / missing-resource shape) → `404`;
-/// everything else (construction/internal failures, bad extraction) → `500`. Richer,
-/// app-specific mappings are contributed as advice beans, never patched here.
+/// Convention: a `NoSuchBean` (an unmatched route / missing-resource shape) → `404`; a
+/// client-fault (`ConvertError` from a malformed body / missing param, or a
+/// `ValidationError` bean-constraint violation) → `400`; everything else
+/// (construction/internal failures) → `500`. Richer, app-specific mappings are
+/// contributed as advice beans, never patched here.
 fn default_error_response(err: &LeafError) -> Response {
     let status = match err.kind {
         leaf_core::ErrorKind::NoSuchBean => StatusCode::NOT_FOUND,
+        // A malformed body / missing param / failed bean-validation is a client fault,
+        // not a server fault (the design spec promises bad request → 4xx).
+        leaf_core::ErrorKind::ConvertError | leaf_core::ErrorKind::ValidationError => {
+            StatusCode::BAD_REQUEST
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     Response::new(status)
@@ -441,5 +448,34 @@ mod tests {
         let props = ServerProperties::default();
         assert_eq!(props.host, "127.0.0.1");
         assert_eq!(props.port, 8080);
+    }
+
+    #[test]
+    fn a_convert_error_maps_to_the_default_400_not_500() {
+        // A malformed body / missing param is `ErrorKind::ConvertError`; the design spec
+        // promises bad-request → 4xx, so the default floor must map it to 400 (NOT the
+        // generic 500). A handler that fails with ConvertError (what the Json/Header
+        // extractors raise) flows through the default mapping with no advice.
+        let route: Arc<dyn Route> = Arc::new(FakeRoute {
+            method: Method::GET,
+            path: "/bad",
+            handler: FakeHandler::Err(ErrorKind::ConvertError),
+        });
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+        let resp = futures::executor::block_on(dispatcher.dispatch(get("/bad")));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_validation_error_maps_to_the_default_400() {
+        // A bean-validation violation is likewise a client-fault → 400 at the default floor.
+        let route: Arc<dyn Route> = Arc::new(FakeRoute {
+            method: Method::GET,
+            path: "/invalid",
+            handler: FakeHandler::Err(ErrorKind::ValidationError),
+        });
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+        let resp = futures::executor::block_on(dispatcher.dispatch(get("/invalid")));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

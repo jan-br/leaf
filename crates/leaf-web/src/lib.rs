@@ -20,10 +20,12 @@
 //! - [`WebFilter`] / [`Next`] / [`FilterChain`] / [`Terminal`] — the around-advice
 //!   seam: ordered filters wrap the request, each continuing via `Next::run` or
 //!   short-circuiting, with the [`Terminal`] (route dispatch) at the bottom.
-//! - [`HttpMessageConverter`] — the content-negotiation seam: serialize a handler
+//! - [`HttpMessageConverter`] — the content-type seam: serialize a handler
 //!   return into a body / deserialize a body into a typed value, keyed by
-//!   content-type. The JSON impl is a `#[component]` bean in `leaf-serde`; leaf-web
-//!   names no serde data format (only the `erased-serde` object-safety boundary).
+//!   content-type. A SINGLE converter is wired today (the JSON impl, a `#[component]`
+//!   bean in `leaf-serde`); Accept-based negotiation among several converters is
+//!   deferred until a second converter is contributed. leaf-web names no serde data
+//!   format (only the `erased-serde` object-safety boundary).
 //! - [`FromRequest`] + [`Path`] / [`Query`] / [`Json`] / [`Header`] —
 //!   the argument-extraction seam: each controller-method parameter resolves from
 //!   the [`Request`] via its STRUCTURAL extractor type (the codegen dispatches on
@@ -103,7 +105,7 @@ pub use handler::{
     Handler, PathParams, Route, RouteMatch, RouteOutcome, RouteReport, RouteTable,
 };
 pub use request::Request;
-pub use response::{IntoResponse, Response};
+pub use response::{IntoResponse, IntoResponseWith, Response, ResponseEntity};
 pub use runner::WebServerRunner;
 pub use server::{Dispatcher, ServerProperties, WebServer};
 

@@ -1,6 +1,12 @@
-//! The [`HttpMessageConverter`] content-negotiation seam (Spring's
+//! The [`HttpMessageConverter`] content-type seam (Spring's
 //! `HttpMessageConverter`): serialize a handler return into a body and
 //! deserialize a request body into a typed value, keyed by content-type.
+//!
+//! Today the container contributes a SINGLE converter (`leaf-serde`'s
+//! `JsonConverter`); Accept-based content NEGOTIATION (picking among several
+//! converters by the request's `Accept` header) is deferred until a second converter
+//! lands — there is no converter collection yet, only the one injected `Ref<dyn
+//! HttpMessageConverter>`.
 //!
 //! This trait is the leaf-web ABSTRACTION; the concrete JSON impl
 //! (`JsonConverter`) lives in `leaf-serde` as a `#[component]` bean and is
@@ -37,8 +43,8 @@ use leaf_core::LeafError;
 /// a concrete converter and a `dyn` one.
 pub trait HttpMessageConverter: Send + Sync {
     /// The MIME content-type this converter produces/consumes, e.g.
-    /// `"application/json"`. Used for the `Content-Type` header and (later)
-    /// content negotiation.
+    /// `"application/json"`. Used for the `Content-Type` header (and, once a second
+    /// converter is contributed, Accept-based content negotiation).
     fn content_type(&self) -> &str;
 
     /// Serialize `value` into a body. The value is the erased
@@ -75,6 +81,8 @@ pub trait HttpMessageConverter: Send + Sync {
 // emitted ONCE — orphan-rule-OK since `dyn HttpMessageConverter` is local to this
 // crate). `leaf-serde`'s `JsonConverter` publishes the `dyn HttpMessageConverter` view
 // (`#[bean(provides = "dyn ::leaf_web::HttpMessageConverter")]`); the rest-controller
-// codegen (Stage 2) and the `Json` extractor inject it as `Ref<dyn HttpMessageConverter>`
-// (and the server may collect `Vec<Ref<dyn HttpMessageConverter>>` for negotiation).
+// codegen (Stage 2) and the `Json` extractor inject it as `Ref<dyn HttpMessageConverter>`.
+// A single converter is wired today; when a second one is contributed, the server could
+// collect `Vec<Ref<dyn HttpMessageConverter>>` to negotiate by `Accept` — that collection
+// does NOT exist yet.
 leaf_core::impl_resolve_view!(dyn HttpMessageConverter);

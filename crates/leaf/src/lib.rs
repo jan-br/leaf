@@ -101,7 +101,7 @@ pub use leaf_tx::{
 #[doc(hidden)]
 pub use leaf_starter_web::leaf_web::{
     ControlAdvice, ExtractCtx, FromRequest, FromRequestParts, Handler, HttpMessageConverter,
-    IntoResponse, Next, Request, Response, Route, WebFilter,
+    IntoResponse, IntoResponseWith, Next, Request, Response, ResponseEntity, Route, WebFilter,
 };
 // The neutral HTTP value vocabulary leaf-web re-exports — re-exported AT THE UMBRELLA ROOT
 // too so the controller codegen's `::leaf_web::http::Method::GET` verb token (+ the

@@ -15,8 +15,9 @@
 //!      `CatalogService` (the cacheable price lookup) + `ProductRepository`.
 //!   2. `GET /products/NOPE` → 404 — the unknown SKU's `LeafError` is mapped by the
 //!      `#[control_advice]` (`StorefrontErrors`), not the default floor.
-//!   3. `POST /orders` with a JSON body → 200 with the created order (via `OrderService`,
-//!      the `#[transactional]` place-order path).
+//!   3. `POST /orders` with a JSON body → 201 Created + a `Location` header with the
+//!      created order (via `OrderService`, the `#[transactional]` place-order path) — the
+//!      `ResponseEntity` return carrier through the rest-controller `IntoResponseWith` policy.
 //!   4. The access-log `WebFilter` recorded both requests (its counter, exposed for the
 //!      proof, advanced) — the around-advice seam ran.
 #![cfg(feature = "web")]
@@ -106,14 +107,25 @@ async fn the_storefront_serves_its_domain_over_real_http() {
     let resp = client.get(format!("{base}/products/NOPE")).send().await.expect("GET NOPE");
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "an unknown SKU is 404 via advice");
 
-    // 3. POST /orders with a JSON body → 200 with the created order (via OrderService).
+    // 3. POST /orders with a JSON body → 201 Created with a Location header and the created
+    //    order (via OrderService). The handler returns a `ResponseEntity` so the
+    //    rest-controller `IntoResponseWith` policy sets the 201 + Location, proving the
+    //    return policy is no longer pinned to 200.
     let resp = client
         .post(format!("{base}/orders"))
         .json(&serde_json::json!({ "sku": "COFFEE", "qty": 2 }))
         .send()
         .await
         .expect("POST /orders");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "a placed order is 200");
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "a placed order is 201 Created");
+    assert!(
+        resp.headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|l| l.starts_with("/orders/")),
+        "a created order carries a Location header, got {:?}",
+        resp.headers().get(reqwest::header::LOCATION),
+    );
     let order: serde_json::Value = resp.json().await.expect("JSON order");
     assert_eq!(order["sku"], "COFFEE");
     assert_eq!(order["qty"], 2);

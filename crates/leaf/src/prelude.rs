@@ -95,6 +95,6 @@ pub use leaf_macros::{
 #[cfg(feature = "web")]
 #[doc(no_inline)]
 pub use leaf_starter_web::leaf_web::{
-    ControlAdvice, FromRequest, Header, IntoResponse, Json, Next, Path, Query, Request, Response,
-    WebFilter,
+    http, ControlAdvice, FromRequest, Header, IntoResponse, IntoResponseWith, Json, Next, Path,
+    Query, Request, Response, ResponseEntity, WebFilter,
 };

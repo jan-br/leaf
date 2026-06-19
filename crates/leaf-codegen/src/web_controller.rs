@@ -171,14 +171,14 @@ fn emit_route_bean(
     let return_policy = if response_body {
         quote! {
             let __value = #invoke?;
-            // The injected `dyn ::leaf_web::HttpMessageConverter` serializes the return
-            // (@ResponseBody) — the SAME converter the `Json<T>` arg extraction rode.
-            let __body = __converter.write(&__value)?;
-            ::core::result::Result::Ok(
-                ::leaf_web::Response::ok()
-                    .with_header(::leaf_web::http::header::CONTENT_TYPE, __converter.content_type())
-                    .with_body(__body),
-            )
+            // The @ResponseBody return policy is the uniform `IntoResponseWith` trait,
+            // DRIVEN by the injected `dyn ::leaf_web::HttpMessageConverter` (the SAME
+            // converter the `Json<T>` arg extraction rode). One STRUCTURAL call site
+            // covers BOTH a bare serializable value (→ 200 + the converter's content-type
+            // + serialized body) AND a `::leaf_web::ResponseEntity<T>` (→ its status +
+            // headers + serialized body) — the trait's two impls pick, never the macro by
+            // a spelled return-type name.
+            ::leaf_web::IntoResponseWith::into_response_with(__value, __converter)
         }
     } else {
         quote! {
@@ -742,10 +742,14 @@ mod tests {
             s.contains(".get(") && s.contains(".await"),
             "the handler invokes the controller method: {s}"
         );
-        // The return is serialized through the injected converter's `write` (@ResponseBody).
+        // The return rides the uniform `IntoResponseWith` trait, driven by the injected
+        // converter (@ResponseBody) — so a bare value serializes to 200 AND a
+        // `ResponseEntity<T>` sets its own status/headers, through ONE structural call
+        // site (no type-name detection on the return).
         assert!(
-            s.contains(".write(") && s.contains("HttpMessageConverter"),
-            "a #[rest_controller] return serializes via the injected converter: {s}"
+            s.contains("::leaf_web::IntoResponseWith::into_response_with")
+                && s.contains("HttpMessageConverter"),
+            "a #[rest_controller] return goes through the IntoResponseWith trait: {s}"
         );
     }
 
