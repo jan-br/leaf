@@ -1,31 +1,39 @@
 //! The [`FromRequest`] argument-extraction seam + the typed extractor wrappers
-//! ([`Path`] / [`Query`] / [`Json`] / [`Header`] / [`State`]). Spring's
+//! ([`Path`] / [`Query`] / [`Json`] / [`Header`]). Spring's
 //! `HandlerMethodArgumentResolver` family, expressed in leaf's vocabulary.
 //!
 //! A controller method's parameters each resolve from the inbound [`Request`] via
 //! their STRUCTURAL extractor type — the controller codegen (Task 9) dispatches on
-//! the parameter's shape (`Path<_>` / `Query<_>` / `Json<_>` / `State<_>` /
+//! the parameter's shape (`Path<_>` / `Query<_>` / `Json<_>` / `Header<_>` /
 //! `&Request`), NEVER on a spelled type name, consistent with the no-type-names
 //! rule. The codegen threads a uniform per-argument binding context ([`ExtractCtx`],
-//! carrying the handler parameter NAME) into every extractor; only the impls that
-//! need a fact read it. The request-only extractions get their [`FromRequest`] impls
-//! here:
+//! carrying the handler parameter NAME plus — for a `Header<_>` parameter — the HTTP
+//! header name from its `#[header("X-Foo")]` attribute) into every extractor; only the
+//! impls that need a fact read it. The request-only extractions get their [`FromRequest`]
+//! impls here:
 //!
 //! - [`Request`] — the whole request, cloned (the `&Request` extractor).
+//!
+//! Handler-side DI collaborators are NOT an argument extractor: a controller is an
+//! ordinary managed bean that FIELD-INJECTS its collaborators (`Ref<CatalogService>`),
+//! the sanctioned leaf way — there is no `State<T>` argument type.
 //!
 //! [`Path<T>`] (a `{name}` capture, e.g. `sku` from `/products/{sku}`) is request-only
 //! but NAME-dependent: it implements the context-aware [`FromRequestParts`] directly,
 //! selecting ITS OWN capture by the handler parameter's name and parsing it via
-//! [`FromStr`]. [`Query<T>`] binds the request's query string into an arbitrary
-//! `Deserialize` target `T` (the raw `Query<`[`HashMap`](std::collections::HashMap)`<String, String>>` map is one
+//! [`FromStr`]. [`Header<T>`] is likewise context-aware but reads the HTTP HEADER NAME
+//! the codegen carries from the parameter's `#[header("X-Foo")]` attribute (a header name
+//! is not a valid Rust ident, so it cannot ride the `Pat::Ident`), looks the header up on
+//! the request, and parses it via [`FromStr`]. [`Query<T>`] binds the request's query
+//! string into an arbitrary `Deserialize` target `T` (the raw
+//! `Query<`[`HashMap`](std::collections::HashMap)`<String, String>>` map is one
 //! such `T`) via the `application/x-www-form-urlencoded` data format, which the query's
 //! URL-fixed grammar lets leaf-web name directly — so `Query<T>` implements
 //! [`FromRequestParts`] for any `T: DeserializeOwned` rather than a plain
-//! `from_request(req)`. The extractions that need the NEGOTIABLE body serde format
-//! ([`Json<T>`] body deserialization) or the DI container ([`State<T>`], a collaborator
-//! bean) are likewise NOT plain `from_request(req)` impls — they need the converter /
-//! the handler's captured `ResolveCtx` that only the controller codegen (Task 9) has in
-//! scope. leaf-web defines all the wrapper types here (so the codegen can dispatch on
+//! `from_request(req)`. The extraction that needs the NEGOTIABLE body serde format
+//! ([`Json<T>`] body deserialization) is likewise NOT a plain `from_request(req)` impl —
+//! it needs the converter that only the controller codegen (Task 9) has in scope.
+//! leaf-web defines all the wrapper types here (so the codegen can dispatch on
 //! them structurally) and documents the seam; the BODY read rides the injected
 //! [`HttpMessageConverter`] (Task 5) — leaf-web names no serde format for the body, only
 //! the one fixed query format.
@@ -39,19 +47,29 @@ use crate::Request;
 
 /// The per-argument BINDING CONTEXT the controller codegen threads into EVERY extractor,
 /// uniformly, alongside the request + converter. It carries the static facts about the
-/// handler PARAMETER an extractor may need to resolve itself — at present the parameter
-/// NAME (the `Pat::Ident` the codegen already reads), which the path-parameter extractor
-/// matches against the route's `{name}` captures.
+/// handler PARAMETER an extractor may need to resolve itself:
+///
+/// - the parameter NAME (the `Pat::Ident` the codegen already reads), which the
+///   path-parameter extractor matches against the route's `{name}` captures, and
+/// - an optional HEADER NAME (e.g. `X-Tenant-Id`), which the [`Header<T>`] extractor
+///   reads off the request. A header name is NOT a valid Rust ident, so the codegen
+///   reads it from a `#[header("X-Tenant-Id")]` PARAMETER ATTRIBUTE rather than the
+///   parameter's `Pat::Ident` — it rides this seam, not the parameter name.
 ///
 /// Threading one neutral context to every extractor keeps the codegen's dispatch the
 /// uniform `<Ty as FromRequestParts>::from_request_parts(req, converter, ctx)` — only the
-/// impls that NEED a fact read it (e.g. [`Path<T>`] reads the name); the request-only
-/// extractors ignore it. The macro never branches on the parameter being a `Path`.
+/// impls that NEED a fact read it (e.g. [`Path<T>`] reads the name, [`Header<T>`] reads
+/// the header name); the request-only extractors ignore it. The macro never branches on
+/// the parameter being a `Path`/`Header`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExtractCtx<'a> {
     /// The handler parameter's name (its `Pat::Ident`), if the codegen had one to give.
     /// The path-parameter extractor matches this against the route's `{name}` captures.
     name: Option<&'a str>,
+    /// The HTTP header name a [`Header<T>`] parameter binds, carried from its
+    /// `#[header("X-Foo")]` attribute (a header name is not a Rust ident, so it cannot
+    /// ride the parameter name). `None` for every non-header parameter.
+    header_name: Option<&'a str>,
 }
 
 impl<'a> ExtractCtx<'a> {
@@ -59,20 +77,35 @@ impl<'a> ExtractCtx<'a> {
     /// `fn handler(&self, sku: Path<String>)` parameter has a `Pat::Ident`).
     #[must_use]
     pub fn named(name: &'a str) -> Self {
-        ExtractCtx { name: Some(name) }
+        ExtractCtx { name: Some(name), header_name: None }
+    }
+
+    /// A context carrying the parameter NAME plus the HTTP HEADER NAME a [`Header<T>`]
+    /// parameter binds (from its `#[header("X-Foo")]` attribute). The header name is the
+    /// one fact a header extractor needs and the parameter's `Pat::Ident` cannot carry.
+    #[must_use]
+    pub fn for_header(name: &'a str, header_name: &'a str) -> Self {
+        ExtractCtx { name: Some(name), header_name: Some(header_name) }
     }
 
     /// A context carrying no parameter name (a destructured / wildcard parameter the
     /// codegen could not name). Name-dependent extractors fail loudly rather than guess.
     #[must_use]
     pub fn empty() -> Self {
-        ExtractCtx { name: None }
+        ExtractCtx { name: None, header_name: None }
     }
 
     /// The handler parameter's name, if any.
     #[must_use]
     pub fn name(&self) -> Option<&'a str> {
         self.name
+    }
+
+    /// The HTTP header name a [`Header<T>`] parameter binds (its `#[header("X-Foo")]`
+    /// attribute), if any. `None` for every non-header parameter.
+    #[must_use]
+    pub fn header_name(&self) -> Option<&'a str> {
+        self.header_name
     }
 }
 
@@ -144,26 +177,25 @@ pub struct Query<T>(pub T);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Json<T>(pub T);
 
-/// A single-header extractor: `T` is read from the named request header. Spring's
-/// `@RequestHeader`.
+/// A single-header extractor: `T` is read from the named request header and parsed via
+/// [`FromStr`]. Spring's `@RequestHeader("X-Foo")`.
 ///
-/// `Header<T>` carries no header NAME on its own, so it has no plain
-/// [`FromRequest`] impl: the name is a codegen concern (Spring's
-/// `@RequestHeader("X-Foo")`). The controller codegen (Task 9) reads the named
-/// header off the [`Request`] directly; this wrapper exists so the codegen can
-/// dispatch on its structure.
+/// `Header<T>` carries no header NAME on its own — a header name (e.g. `X-Tenant-Id`) is
+/// not a valid Rust ident, so it cannot ride the handler parameter's `Pat::Ident` the way
+/// a [`Path<T>`] capture name does. Instead the controller codegen reads it from a
+/// `#[header("X-Tenant-Id")]` PARAMETER ATTRIBUTE and threads it through the per-argument
+/// binding [`ExtractCtx`] (the `header_name` seam). Like [`Path<T>`], `Header<T>` is
+/// therefore a context-aware [`FromRequestParts`] extractor rather than a plain
+/// `from_request(req)`: it reads the header name off the [`ExtractCtx`], looks the header up
+/// on the [`Request`] ([`Request::header`]), and parses it to `T` via [`FromStr`]
+/// (`Header<String>` is the identity case; `Header<u32>` parses a numeric header). A missing
+/// header, a missing header name (no `#[header(..)]` attr), or a parse failure is a loud
+/// [`ErrorKind::ConvertError`] the dispatcher maps to a 4xx — never a panic, never a silent
+/// default. Because the name reaches it through the uniform context, the controller codegen
+/// still dispatches purely on the parameter's STRUCTURAL extractor type — it never branches
+/// on `Header`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header<T>(pub T);
-
-/// A DI-collaborator extractor: `T` is a bean resolved from the container (Spring's
-/// constructor-injected collaborator, surfaced as a handler argument).
-///
-/// `State<T>` has NO plain [`FromRequest`] impl: a bean is resolved from the
-/// handler's captured `ResolveCtx`, which only the controller codegen (Task 9) has
-/// in scope — not from the [`Request`]. This wrapper exists so the codegen can
-/// dispatch on its structure and fill it from the captured `Ref<T>`.
-#[derive(Clone, Debug)]
-pub struct State<T>(pub T);
 
 impl<T: serde::de::DeserializeOwned> Query<T> {
     /// Deserialize the request's query string into `T` via the
@@ -303,6 +335,49 @@ where
             ))
         })?;
         Ok(Path(value))
+    }
+}
+
+/// `Header<T>` reads its NAMED request header — the header name carried in the binding
+/// [`ExtractCtx`] (from the parameter's `#[header("X-Foo")]` attribute, NOT its
+/// `Pat::Ident`, because a header name is not a valid Rust ident) — and parses it to `T`
+/// via [`FromStr`]. `Header<String>` is the identity parse; `Header<u32>` parses a numeric
+/// header value.
+///
+/// A missing header name in the context (no `#[header(..)]` attribute), a header absent
+/// from the request, or a parse failure is a loud [`ErrorKind::ConvertError`] the
+/// dispatcher maps via the advice chain — never a panic, never a silent default.
+/// `T::Err: Display` so the failed parse's own message is carried in the cause.
+impl<T> FromRequestParts for Header<T>
+where
+    T: FromStr,
+    T::Err: core::fmt::Display,
+{
+    fn from_request_parts(
+        req: &Request,
+        _converter: &dyn HttpMessageConverter,
+        ctx: &ExtractCtx<'_>,
+    ) -> Result<Self, LeafError> {
+        let name = ctx.header_name().ok_or_else(|| {
+            LeafError::new(ErrorKind::ConvertError).caused_by(Cause::plain(
+                "header",
+                "the header extractor has no header name to read \
+                 (annotate the parameter with `#[header(\"X-Foo\")]`)",
+            ))
+        })?;
+        let raw = req.header(name).ok_or_else(|| {
+            LeafError::new(ErrorKind::ConvertError).caused_by(Cause::plain(
+                "header",
+                format!("no `{name}` header on the request"),
+            ))
+        })?;
+        let value = raw.parse::<T>().map_err(|e| {
+            LeafError::new(ErrorKind::ConvertError).caused_by(Cause::plain(
+                "header",
+                format!("header `{name}` = `{raw}` did not parse: {e}"),
+            ))
+        })?;
+        Ok(Header(value))
     }
 }
 
@@ -662,6 +737,81 @@ mod tests {
             &ExtractCtx::named("sku"),
         )
         .expect_err("a missing named capture must surface a LeafError, not a default");
+        assert_eq!(err.kind, ErrorKind::ConvertError);
+    }
+
+    // ── Header<T> reads its NAMED header via the ExtractCtx header name (Task T1c) ─────
+
+    /// Build a request carrying one header, so the named-header extractor has something
+    /// to read.
+    fn request_with_header(name: &'static str, value: &'static str) -> Request {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(name, http::HeaderValue::from_static(value));
+        Request::new(Method::GET, "/h".parse().expect("uri"), headers, Bytes::new())
+    }
+
+    #[test]
+    fn header_extractor_reads_the_named_header() {
+        // `Header<String>` reads the header NAME the codegen carries in the ExtractCtx
+        // (`#[header("X-Api-Key")]`), parses it via FromStr, and returns the value. The
+        // header name is NOT a Rust ident, so it rides the binding context, not the param
+        // name.
+        let req = request_with_header("X-Api-Key", "s3cr3t");
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::for_header("k", "X-Api-Key");
+        let Header(k) = <Header<String> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect("the named header binds");
+        assert_eq!(k, "s3cr3t");
+    }
+
+    #[test]
+    fn header_extractor_parses_a_typed_value() {
+        // `Header<u32>` parses the header value via FromStr (the identity case is
+        // `Header<String>`); a numeric header value parses to u32.
+        let req = request_with_header("X-Count", "42");
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::for_header("count", "X-Count");
+        let Header(n) = <Header<u32> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect("the numeric header parses to u32");
+        assert_eq!(n, 42u32);
+    }
+
+    #[test]
+    fn header_extractor_missing_header_is_a_loud_error() {
+        // A missing header (the request does not carry `X-Api-Key`) is a loud
+        // ConvertError the dispatcher maps to 400 — never a silent default.
+        let req = request_with_header("X-Other", "v");
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::for_header("k", "X-Api-Key");
+        let err = <Header<String> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect_err("a missing required header must surface a LeafError, not a default");
+        assert_eq!(err.kind, ErrorKind::ConvertError);
+    }
+
+    #[test]
+    fn header_extractor_bad_parse_is_a_loud_error() {
+        // A present-but-unparseable header value (`abc` against `Header<u32>`) is a loud
+        // ConvertError, never a panic.
+        let req = request_with_header("X-Count", "abc");
+        let conv = TestJsonConverter;
+        let ctx = ExtractCtx::for_header("count", "X-Count");
+        let err = <Header<u32> as FromRequestParts>::from_request_parts(&req, &conv, &ctx)
+            .expect_err("a non-numeric header value must surface a LeafError, not panic");
+        assert_eq!(err.kind, ErrorKind::ConvertError);
+    }
+
+    #[test]
+    fn header_extractor_with_no_header_name_in_context_is_a_loud_error() {
+        // Without a header name in the binding context (the codegen had no `#[header(..)]`
+        // attr to give), the extractor fails loudly rather than guessing.
+        let req = request_with_header("X-Api-Key", "v");
+        let conv = TestJsonConverter;
+        let err = <Header<String> as FromRequestParts>::from_request_parts(
+            &req,
+            &conv,
+            &ExtractCtx::named("k"),
+        )
+        .expect_err("a header extractor with no header name must fail loudly");
         assert_eq!(err.kind, ErrorKind::ConvertError);
     }
 }

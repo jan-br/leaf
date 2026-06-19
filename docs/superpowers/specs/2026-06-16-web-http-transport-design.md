@@ -114,9 +114,12 @@ backend supersedes it by providing the same `dyn WebServer` view.
   the return-value policy). The macro dispatches on the parameter's **structural** form (a
   leaf `Path<T>`/`Query<T>`/`Json<T>`/`&Request` extractor type — trait dispatch via an
   `ArgFrom`-style trait, NEVER a type-name match, consistent with the no-type-names rule).
-- **Argument resolution** — `Path<T>`, `Query<T>`, `Json<T>` (body), `Header<T>`,
-  `State<Ref<Bean>>` (DI a collaborator), `&Request`. Each is a leaf extractor trait
+- **Argument resolution** — `Path<T>`, `Query<T>`, `Json<T>` (body), `Header<T>`
+  (its HTTP header name from a `#[header("X-Foo")]` parameter attribute, since a header
+  name is not a valid Rust ident), `&Request`. Each is a leaf extractor trait
   (`FromRequest`) the handler codegen calls — Spring's `HandlerMethodArgumentResolver`.
+  Handler-side DI is NOT an argument extractor: a controller field-injects its
+  collaborators (`Ref<CatalogService>`), the sanctioned leaf way — there is no `State<T>`.
 
 ### 4. DI integration — the payoff of by-trait + collection injection
 
@@ -126,7 +129,7 @@ keyed by `(method, path)`. The **server resolves its routing table and chain by 
 - `Vec<Ref<dyn WebFilter>>` — every filter/interceptor any crate contributed, ordered.
 - `Vec<Ref<dyn ControlAdvice>>` — every exception handler any crate contributed.
 
-So a controller is an ordinary bean (DI'd collaborators via `State`/constructor); the
+So a controller is an ordinary bean (DI'd collaborators via field injection); the
 server is auto-configured and **assembles itself from the container** — no central
 registry, no codegen-time wiring. This is exactly what the collection + by-trait injection
 were built for.
@@ -193,7 +196,7 @@ leaf's DI.
 | `@GetMapping`/`@RequestMapping` | `#[get("/..")]`/`#[route(..)]` |
 | `WebServer`/`WebServerFactory` (pluggable Tomcat/Netty) | `WebServer`/`ServerFactory` (pluggable backend) |
 | `DispatcherServlet` + `HandlerMapping`/`HandlerAdapter` | the server's routing table + `Handler` dispatch |
-| `HandlerMethodArgumentResolver` | `FromRequest` extractors (`Path`/`Query`/`Json`/`State`) |
+| `HandlerMethodArgumentResolver` | `FromRequest` extractors (`Path`/`Query`/`Json`/`Header`) |
 | `HttpMessageConverter` | `HttpMessageConverter` (`leaf-serde` JSON) |
 | servlet `Filter` / `HandlerInterceptor` | `WebFilter`/`FilterChain` |
 | `@ControllerAdvice` + `@ExceptionHandler` | `#[control_advice]` + `ControlAdvice` |

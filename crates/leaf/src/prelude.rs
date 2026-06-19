@@ -36,7 +36,7 @@
 //!   `delete` / `route` and the global-error `control_advice` / `exception_handler`
 //!   macros, plus the leaf-web types a handler/filter/advice names — `Request` /
 //!   `Response` / `IntoResponse`, the `FromRequest` extractors `Path` / `Query` /
-//!   `Json` / `Header` / `State`, and the `WebFilter` / `Next` / `ControlAdvice`
+//!   `Json` / `Header`, and the `WebFilter` / `Next` / `ControlAdvice`
 //!   extension traits. (`controller` is in the always-on stereotype list above.)
 
 // ── every annotation macro (the maximal-magic surface, charter §2.10) ──
@@ -79,7 +79,7 @@ pub use crate::runtime::bootstrap;
 // The HTTP transport stereotypes + the request-mapping method attrs + the global-error
 // macro, plus the leaf-web types a controller/filter/advice names in its signatures
 // (`Request`/`Response`/`IntoResponse`, the `FromRequest` extractors `Path`/`Query`/
-// `Json`/`Header`/`State`, and the `WebFilter`/`Next`/`ControlAdvice` extension traits).
+// `Json`/`Header`, and the `WebFilter`/`Next`/`ControlAdvice` extension traits).
 // Brought in flat so `use leaf::prelude::*;` is the whole web surface — the same maximal-
 // magic shape the cross-cutting concerns already have. `#[controller]` is in the always-on
 // macro glob above (it predates this stack as a bare marker); the rest land here.
@@ -96,5 +96,5 @@ pub use leaf_macros::{
 #[doc(no_inline)]
 pub use leaf_starter_web::leaf_web::{
     ControlAdvice, FromRequest, Header, IntoResponse, Json, Next, Path, Query, Request, Response,
-    State, WebFilter,
+    WebFilter,
 };

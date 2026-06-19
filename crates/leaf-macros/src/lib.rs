@@ -157,7 +157,16 @@ fn expand_controller(
     let parsed = parse_macro_input!(item as Item);
     match parsed {
         Item::Impl(item_impl) => {
-            let cleaned = strip_inner_attrs(item_impl.clone(), MAPPING_ATTRS);
+            // Strip the method-position mapping attrs (`#[get]`/…) AND the parameter-position
+            // `#[header("X-Foo")]` helper attrs from the RE-EMITTED impl: the controller-impl
+            // iterator OWNS both (the mapping attr lowers to a `Route`; the header attr's name
+            // is threaded into the `Header<T>` extractor's binding context). A leftover
+            // `#[header(..)]` on a parameter is not a real attribute macro, so it would fail
+            // to compile if re-emitted — the iterator already consumed it.
+            let cleaned = strip_param_attrs(
+                strip_inner_attrs(item_impl.clone(), MAPPING_ATTRS),
+                &[HEADER_PARAM_ATTR],
+            );
             match leaf_codegen::web_controller::expand_controller_impl(&item_impl, response_body) {
                 Ok(rows) => quote! { #cleaned #rows }.into(),
                 Err(err) => {
@@ -526,6 +535,37 @@ fn strip_inner_attrs(mut item: ItemImpl, names: &[&str]) -> ItemImpl {
                     .last()
                     .is_some_and(|s| names.iter().any(|n| s.ident == n))
             });
+        }
+    }
+    item
+}
+
+/// The PARAMETER-position helper attr the controller-impl iterator consumes off a handler
+/// method's parameters: `#[header("X-Foo")]` carries a `Header<T>` extractor's HTTP header
+/// name (which is not a valid Rust ident, so it cannot ride the parameter's `Pat::Ident`).
+const HEADER_PARAM_ATTR: &str = "header";
+
+/// Strip the named PARAMETER-position helper attrs (`#[header("X-Foo")]`) off every method
+/// parameter of the re-emitted impl. The controller-impl iterator already consumed them to
+/// thread their value into the extractor's binding context; a leftover helper attr on a
+/// parameter is not a real attribute macro and would fail to compile if re-emitted.
+///
+/// This is the parameter-position counterpart to [`strip_inner_attrs`] (which strips
+/// method-position attrs). Matching is on the attribute path's LAST segment so a
+/// `#[leaf::header(..)]`-qualified form is stripped too.
+fn strip_param_attrs(mut item: ItemImpl, names: &[&str]) -> ItemImpl {
+    for inner in &mut item.items {
+        if let syn::ImplItem::Fn(func) = inner {
+            for arg in &mut func.sig.inputs {
+                if let syn::FnArg::Typed(pat_ty) = arg {
+                    pat_ty.attrs.retain(|a| {
+                        !a.path()
+                            .segments
+                            .last()
+                            .is_some_and(|s| names.iter().any(|n| s.ident == n))
+                    });
+                }
+            }
         }
     }
     item

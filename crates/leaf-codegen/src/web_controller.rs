@@ -132,15 +132,25 @@ fn emit_route_bean(
     // branches on the parameter being a `Path`. A destructured / unnamed parameter yields
     // an empty context (name-dependent extractors then fail loudly rather than guess).
     // The resolved bindings pass positionally to the controller method.
-    let args = non_receiver_args(method);
+    let args = non_receiver_args(method)?;
     let arg_locals: Vec<syn::Ident> =
         (0..args.len()).map(|i| format_ident!("__arg{i}")).collect();
     let arg_resolves = args.iter().zip(&arg_locals).enumerate().map(|(i, (arg, local))| {
         let ty = &arg.ty;
         let ctx_local = format_ident!("__ctx{i}");
-        let ctx_init = match &arg.name {
-            Some(name) => quote! { ::leaf_web::ExtractCtx::named(#name) },
-            None => quote! { ::leaf_web::ExtractCtx::empty() },
+        // The per-argument binding context. A `#[header("X-Foo")]` parameter carries its
+        // HTTP HEADER NAME (which is not a valid Rust ident, so it cannot ride the
+        // parameter's `Pat::Ident`) — the header-aware context the `Header<T>` extractor
+        // reads. Every other parameter carries just its NAME (the `Path<T>` capture key) or
+        // an empty context (a destructured / wildcard parameter). The macro picks the
+        // CONSTRUCTOR by the presence of the attribute, NOT by the parameter's type — the
+        // dispatch stays the uniform structural `FromRequestParts` seam.
+        let ctx_init = match (&arg.name, &arg.header_name) {
+            (Some(name), Some(header)) => {
+                quote! { ::leaf_web::ExtractCtx::for_header(#name, #header) }
+            }
+            (Some(name), None) => quote! { ::leaf_web::ExtractCtx::named(#name) },
+            (None, _) => quote! { ::leaf_web::ExtractCtx::empty() },
         };
         quote! {
             let #ctx_local = #ctx_init;
@@ -407,19 +417,32 @@ fn has_self_receiver(func: &ImplItemFn) -> bool {
 /// One NON-receiver handler parameter: its extractor TYPE (used verbatim so the trait
 /// dispatch is purely structural, never a name match) + its parameter NAME (the
 /// `Pat::Ident`, if it has one — threaded into the extractor's binding [`ExtractCtx`] so
-/// the name-dependent `Path<T>` extractor selects its own `{name}` capture).
+/// the name-dependent `Path<T>` extractor selects its own `{name}` capture) + an OPTIONAL
+/// HTTP header NAME (from a `#[header("X-Foo")]` parameter attribute — a header name is
+/// not a valid Rust ident, so it rides this attribute instead of the parameter name, and
+/// the `Header<T>` extractor reads it off the binding context).
 struct HandlerArg {
     /// The parameter's extractor type, used VERBATIM (structural trait dispatch).
     ty: Type,
     /// The parameter's name (`Pat::Ident`), or `None` for a destructured / wildcard pat.
     name: Option<String>,
+    /// The HTTP header name from a `#[header("X-Foo")]` parameter attribute, or `None`.
+    header_name: Option<String>,
 }
+
+/// The parameter-attribute name that carries a `Header<T>` extractor's HTTP header name.
+const HEADER_ATTR: &str = "header";
 
 /// The NON-receiver arguments of a method, in order — each is one handler parameter
 /// resolved via its `FromRequestParts` extractor. The type is used VERBATIM (purely
 /// structural dispatch); the name (if the parameter is a plain `Pat::Ident`) rides into
-/// the per-argument binding context.
-fn non_receiver_args(func: &ImplItemFn) -> Vec<HandlerArg> {
+/// the per-argument binding context, and a `#[header("X-Foo")]` parameter attribute
+/// supplies the header name for a `Header<T>` extractor.
+///
+/// # Errors
+/// [`EmitError`] when a `#[header(..)]` parameter attribute is malformed (not a single
+/// string-literal header name).
+fn non_receiver_args(func: &ImplItemFn) -> Result<Vec<HandlerArg>, EmitError> {
     func.sig
         .inputs
         .iter()
@@ -429,11 +452,38 @@ fn non_receiver_args(func: &ImplItemFn) -> Vec<HandlerArg> {
                     syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
                     _ => None,
                 };
-                Some(HandlerArg { ty: (*pat_ty.ty).clone(), name })
+                let header_name = match header_attr_value(&pat_ty.attrs) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(Ok(HandlerArg { ty: (*pat_ty.ty).clone(), name, header_name }))
             }
             FnArg::Receiver(_) => None,
         })
         .collect()
+}
+
+/// The HTTP header name carried by a parameter's `#[header("X-Foo")]` attribute, if it has
+/// one (matched on the attribute path's LAST segment so a `#[leaf::header(..)]`-qualified
+/// form is recognised too). `None` when no `#[header(..)]` attribute is present.
+///
+/// # Errors
+/// [`EmitError`] when the `#[header(..)]` attribute carries no single string-literal header
+/// name (e.g. `#[header]` or `#[header(X-Foo)]`).
+fn header_attr_value(attrs: &[syn::Attribute]) -> Result<Option<String>, EmitError> {
+    let Some(attr) = attrs
+        .iter()
+        .find(|a| a.path().segments.last().is_some_and(|s| s.ident == HEADER_ATTR))
+    else {
+        return Ok(None);
+    };
+    let lit: syn::LitStr = attr.parse_args().map_err(|e| EmitError {
+        message: format!(
+            "`#[{HEADER_ATTR}(..)]` needs a single string header-name argument \
+             (e.g. `#[{HEADER_ATTR}(\"X-Tenant-Id\")]`): {e}"
+        ),
+    })?;
+    Ok(Some(lit.value()))
 }
 
 /// The NON-receiver argument count of a method — the structural ARITY the
@@ -738,6 +788,45 @@ mod tests {
             s.contains("from_request_parts(__req,__converter,&__ctx0)")
                 && s.contains("from_request_parts(__req,__converter,&__ctx1)"),
             "each extractor call passes its own binding context: {s}"
+        );
+    }
+
+    #[test]
+    fn a_header_param_carries_its_header_name_via_a_header_attribute() {
+        // Task T1c: a `#[header("X-Api-Key")]` parameter attribute carries the HTTP header
+        // NAME (which is NOT a valid Rust ident, so it cannot ride the parameter's
+        // `Pat::Ident`). The codegen consumes the attribute, threads the header name into
+        // the per-argument `ExtractCtx::for_header(<param-name>, <header-name>)`, and STRIPS
+        // the `#[header(..)]` attribute from the re-emitted handler call (so the controller
+        // method does not see a stray attribute). Dispatch stays the uniform structural
+        // `FromRequestParts` seam — the macro never branches on the parameter being a
+        // `Header`.
+        let item = impl_item(
+            r#"impl Api {
+                #[get("/secure")]
+                async fn secure(&self, #[header("X-Api-Key")] k: Header<String>) -> Result<(), LeafError> {
+                    todo!()
+                }
+            }"#,
+        );
+        let ts = expand_controller_impl(&item, true).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // The extractor call carries BOTH the parameter name and the header name.
+        assert!(
+            s.contains(r#"::leaf_web::ExtractCtx::for_header("k","X-Api-Key")"#),
+            "the header param's extractor gets ExtractCtx::for_header(\"k\", \"X-Api-Key\"): {s}"
+        );
+        // It lowers through the SAME uniform FromRequestParts seam — never a Header-name branch.
+        assert!(
+            s.contains("<Header<String>as::leaf_web::FromRequestParts>::from_request_parts"),
+            "the Header<String> param lowers through the uniform FromRequestParts call site: {s}"
+        );
+        // The `#[header(..)]` attribute is CONSUMED — the emitted controller invocation does
+        // not carry a stray `header` attribute token.
+        assert!(
+            !s.contains("#[header") && !s.contains("# [header"),
+            "the #[header(..)] attribute is stripped from the emitted artifact: {s}"
         );
     }
 

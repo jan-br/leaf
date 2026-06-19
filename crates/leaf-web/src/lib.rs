@@ -24,14 +24,16 @@
 //!   return into a body / deserialize a body into a typed value, keyed by
 //!   content-type. The JSON impl is a `#[component]` bean in `leaf-serde`; leaf-web
 //!   names no serde data format (only the `erased-serde` object-safety boundary).
-//! - [`FromRequest`] + [`Path`] / [`Query`] / [`Json`] / [`Header`] / [`State`] —
+//! - [`FromRequest`] + [`Path`] / [`Query`] / [`Json`] / [`Header`] —
 //!   the argument-extraction seam: each controller-method parameter resolves from
 //!   the [`Request`] via its STRUCTURAL extractor type (the codegen dispatches on
-//!   shape, never a type name). `Path<String>`, `Query<HashMap>` and the whole-
-//!   `Request` extractor land here; the serde-backed reads (`Json<T>` body,
-//!   `Query<T>`) ride the injected `HttpMessageConverter` and the DI-collaborator
-//!   `State<T>` rides the handler's captured ctx — both resolved by the controller
-//!   codegen, so leaf-web names no serde format here.
+//!   shape, never a type name). `Path<String>`, `Query<HashMap>`, the named
+//!   `Header<T>` (its header name from a `#[header("X-Foo")]` attribute) and the whole-
+//!   `Request` extractor land here; the serde-backed reads (`Json<T>` body, `Query<T>`)
+//!   ride the injected `HttpMessageConverter` — resolved by the controller codegen, so
+//!   leaf-web names no serde format here. Handler-side DI collaborators are NOT an
+//!   argument extractor: a controller field-injects them (`Ref<CatalogService>`), the
+//!   sanctioned leaf way — there is no `State<T>`.
 //!
 //! - [`ControlAdvice`] — the global error-handling seam (Spring's
 //!   `@ControllerAdvice`/`@ExceptionHandler`): an ordered chain that maps a
@@ -95,7 +97,7 @@ pub use http;
 
 pub use advice::ControlAdvice;
 pub use content::HttpMessageConverter;
-pub use extract::{ExtractCtx, FromRequest, FromRequestParts, Header, Json, Path, Query, State};
+pub use extract::{ExtractCtx, FromRequest, FromRequestParts, Header, Json, Path, Query};
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{Handler, PathParams, Route, RouteMatch, RouteTable};
 pub use request::Request;

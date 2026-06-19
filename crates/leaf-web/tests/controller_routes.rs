@@ -33,7 +33,7 @@ use leaf_core::{ErrorKind, Injectable, LeafError, Ref, ResolveCtx};
 // they are never resolved as attribute macros in their own right.
 use leaf_macros::rest_controller;
 use leaf_web::testing::MockServer;
-use leaf_web::{Dispatcher, Path, Request, Route};
+use leaf_web::{Dispatcher, Header, Path, Request, Route};
 use serde::Serialize;
 
 // ─────────────────────────── the controller bean + its DTO ───────────────────────
@@ -102,6 +102,19 @@ impl Catalog {
         let Path(oid) = oid;
         Ok(ProductDto { sku: oid, name: format!("user-{uid}"), price_cents: uid as u32 })
     }
+
+    /// `GET /secure` — the named-header proof (Task T1c): the HTTP header name
+    /// `X-Api-Key` is NOT a valid Rust ident, so it rides a `#[header("X-Api-Key")]`
+    /// PARAMETER attribute. The controller-impl iterator consumes the attribute, threads
+    /// the header name into the `Header<String>` extractor's binding context, and strips
+    /// the attribute from this re-emitted method (so it compiles). The handler echoes the
+    /// header value into the DTO; a missing header is a loud `ConvertError` (400-mappable)
+    /// the dispatcher surfaces rather than ever silently defaulting.
+    #[get("/secure")]
+    async fn secure(&self, #[header("X-Api-Key")] key: Header<String>) -> Result<ProductDto, LeafError> {
+        let Header(key) = key;
+        Ok(ProductDto { sku: key, name: "secure".to_string(), price_cents: 0 })
+    }
 }
 
 // ─────────────────────────────── assembly helpers ────────────────────────────────
@@ -129,13 +142,20 @@ fn assemble_dispatcher() -> Dispatcher {
 
     let routes: Vec<Ref<dyn Route>> =
         block(<Vec<Ref<dyn Route>> as Injectable>::inject(&cx)).expect("routes resolve");
-    assert_eq!(routes.len(), 3, "all generated #[rest_controller] route beans were collected");
+    assert_eq!(routes.len(), 4, "all generated #[rest_controller] route beans were collected");
 
     Dispatcher::new(routes.into_iter().map(Ref::into_arc).collect(), vec![], vec![])
 }
 
 fn request(method: Method, path: &str) -> Request {
     Request::new(method, path.parse().expect("uri"), http::HeaderMap::new(), Bytes::new())
+}
+
+/// A request carrying one header (for the named-header extractor proof).
+fn request_with_header(method: Method, path: &str, name: &'static str, value: &'static str) -> Request {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(name, http::HeaderValue::from_static(value));
+    Request::new(method, path.parse().expect("uri"), headers, Bytes::new())
 }
 
 // ──────────────────────────────────── the proof ──────────────────────────────────
@@ -177,6 +197,29 @@ fn a_handler_error_rides_the_advice_chain_to_the_default_500() {
     // default mapping turns NoSuchBean → 404 (the dispatcher never errors out).
     let resp = block(server.handle(request(Method::GET, "/products/NOPE")));
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn a_named_header_param_resolves_via_the_header_attribute() {
+    // Task T1c end to end: `#[header("X-Api-Key")] key: Header<String>` compiles (the
+    // iterator stripped the helper attribute from the re-emitted method) AND resolves the
+    // header value at runtime. The handler echoes the header into the DTO `sku`.
+    let server = MockServer::new(Arc::new(assemble_dispatcher()));
+    let resp = block(server.handle(request_with_header(Method::GET, "/secure", "X-Api-Key", "s3cr3t")));
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = std::str::from_utf8(resp.body_bytes()).expect("utf8 body");
+    assert_eq!(body, r#"{"sku":"s3cr3t","name":"secure","price_cents":0}"#);
+}
+
+#[test]
+fn a_missing_named_header_is_a_loud_error_not_a_silent_default() {
+    // A missing `X-Api-Key` header is a loud `ConvertError` the `Header<String>` extractor
+    // raises — the dispatcher maps it (the default floor → 500; an app `#[control_advice]`
+    // can refine `ConvertError` → 400). The point: it is NOT OK and NOT a silent default.
+    let server = MockServer::new(Arc::new(assemble_dispatcher()));
+    let resp = block(server.handle(request(Method::GET, "/secure")));
+    assert_ne!(resp.status(), StatusCode::OK, "a missing required header must not succeed");
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "ConvertError hits the default floor");
 }
 
 #[test]
