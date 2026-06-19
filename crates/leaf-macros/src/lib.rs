@@ -280,7 +280,10 @@ pub fn control_advice(attr: TokenStream, item: TokenStream) -> TokenStream {
     match parsed {
         Item::Impl(item_impl) => {
             let cleaned = strip_inner_attrs(item_impl.clone(), &["exception_handler"]);
-            match leaf_codegen::web_controller::expand_control_advice_impl(&item_impl) {
+            match leaf_codegen::web_controller::expand_control_advice_impl_with(
+                &item_impl,
+                attr.into(),
+            ) {
                 Ok(rows) => quote! { #cleaned #rows }.into(),
                 Err(err) => {
                     let error = compile_error(&err);
@@ -1377,6 +1380,34 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn runner(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(item as ItemStruct);
     match app::emit_runner(&parsed) {
+        Ok(rows) => quote! { #parsed #rows }.into(),
+        Err(err) => {
+            let error = compile_error(&err);
+            quote! { #parsed #error }.into()
+        }
+    }
+}
+
+/// `#[web_filter]` — an around-advice `leaf_web::WebFilter` bean (Spring's servlet
+/// `Filter` / `HandlerInterceptor`). Structurally a `#[component]` that ALSO declares it
+/// is injectable as `dyn ::leaf_web::WebFilter` (the `provides[]` upcast the server's
+/// `Vec<Ref<dyn WebFilter>>` collection injection resolves) — the SAME `provides`-a-view
+/// shape `#[runner]` (`dyn Runner`) and `#[control_advice]`-struct (`dyn ControlAdvice`)
+/// use. The user supplies the behaviour separately:
+///
+/// ```ignore
+/// #[web_filter] struct AccessLog { /* injected fields */ }
+/// #[async_impl] impl WebFilter for AccessLog {
+///     async fn filter(&self, req: Request, next: Next<'_>) -> Result<Response, LeafError> { .. }
+///     fn order(&self) -> i32 { 10 } // optional chain order, on the user's trait impl
+/// }
+/// ```
+///
+/// A generic filter hard-errors with the `register_component!(Concrete)` hint.
+#[proc_macro_attribute]
+pub fn web_filter(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as ItemStruct);
+    match leaf_codegen::web_controller::expand_web_filter_struct(&parsed, attr.into()) {
         Ok(rows) => quote! { #parsed #rows }.into(),
         Err(err) => {
             let error = compile_error(&err);

@@ -33,8 +33,9 @@
 //! - **The bootstrap bridge:** [`bootstrap`] (the default-runtime run entry).
 //! - **The web surface** (only with the `web` capability feature): the HTTP
 //!   stereotypes + request-mapping attrs `rest_controller` / `get` / `post` / `put` /
-//!   `delete` / `route` and the global-error `control_advice` / `exception_handler`
-//!   macros, plus the leaf-web types a handler/filter/advice names — `Request` /
+//!   `delete` / `route`, the around-advice `web_filter` stereotype, and the global-error
+//!   `control_advice` / `exception_handler` macros, plus the leaf-web types a
+//!   handler/filter/advice names — `Request` /
 //!   `Response` / `IntoResponse`, the `FromRequest` extractors `Path` / `Query` /
 //!   `Json` / `Header`, and the `WebFilter` / `Next` / `ControlAdvice`
 //!   extension traits. (`controller` is in the always-on stereotype list above.)
@@ -90,7 +91,7 @@ pub use crate::runtime::bootstrap;
 #[cfg(feature = "web")]
 #[doc(no_inline)]
 pub use leaf_macros::{
-    control_advice, delete, exception_handler, get, post, put, rest_controller, route,
+    control_advice, delete, exception_handler, get, post, put, rest_controller, route, web_filter,
 };
 #[cfg(feature = "web")]
 #[doc(no_inline)]

@@ -582,6 +582,52 @@ pub fn expand_control_advice_struct(
     descriptor::emit(&input)
 }
 
+// ═══════════════════════════════ #[web_filter] ═══════════════════════════════
+//
+// The around-advice filter stereotype (Spring's servlet `Filter` / `HandlerInterceptor`),
+// expressed in leaf's DI (Task T4). A STRUCT stereotype — structurally a `#[component]`
+// (so the filter is registered + resolvable, its collaborators field-injected) that ALSO
+// `provides` the `dyn ::leaf_web::WebFilter` view, so the server's
+// `Vec<Ref<dyn WebFilter>>` collection injection finds it. The exact `provides`-a-view
+// shape `#[runner]` (the `dyn Runner` view) and `#[control_advice]`-struct (the `dyn
+// ControlAdvice` view) use — no type-name detection, no hand-rolled marker-trait impl.
+//
+// The user supplies the behaviour separately:
+//     #[web_filter] struct AccessLog { /* injected fields */ }
+//     #[async_impl] impl WebFilter for AccessLog { async fn filter(..) {..} }
+// and (optionally) the chain `fn order(&self) -> i32` in that `impl WebFilter` block —
+// the order lives on the user's trait impl (a struct stereotype cannot inject a method
+// into a trait impl the user writes), so `#[web_filter]` itself is provides-view-only.
+
+/// Lower a `#[web_filter] struct AccessLog { .. }` to its `#[component]`-equivalent bean
+/// registration PLUS the `dyn ::leaf_web::WebFilter` `provides[]` view (so the server's
+/// `Vec<Ref<dyn WebFilter>>` collection injection finds it). Structurally a plain
+/// `#[component]` differing ONLY in the declared filter view — exactly the `#[runner]` /
+/// `#[control_advice]`-struct `provides`-a-view shape.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) when the struct is generic / its stereotype
+/// annotation is malformed (surfaced by [`stereotype::struct_input`]).
+pub fn expand_web_filter_struct(
+    item: &ItemStruct,
+    attr: TokenStream,
+) -> Result<TokenStream, EmitError> {
+    let args = stereotype::parse_args(attr)?;
+    let mut input = stereotype::struct_input(
+        item,
+        Stereotype::Component,
+        args.name,
+        args.role,
+        args.scope,
+        args.constructor,
+    )?;
+    // Declare the WebFilter upcast view so the server collects this bean by the
+    // `dyn WebFilter` contract (the one place a filter differs from a plain component) —
+    // the SAME provides[] machinery the stereotypes/`#[runner]`/`#[control_advice]` use.
+    input.provides.push(ServiceView { dyn_ty: parse_type("dyn ::leaf_web::WebFilter")? });
+    descriptor::emit(&input)
+}
+
 /// Lower a `#[control_advice] impl Errors { #[exception_handler] fn .. }` block to ONE
 /// generated `impl ::leaf_web::ControlAdvice for Errors` whose `handle` delegates to the
 /// `#[exception_handler]` method(s) — tried in declaration order, first `Some` wins.
@@ -595,6 +641,25 @@ pub fn expand_control_advice_struct(
 /// [`EmitError`] (→ `compile_error!`) when the impl is generic / a trait impl, no method
 /// carries `#[exception_handler]`, or a handler method takes no `self` receiver.
 pub fn expand_control_advice_impl(item: &ItemImpl) -> Result<TokenStream, EmitError> {
+    expand_control_advice_impl_with(item, TokenStream::new())
+}
+
+/// The `#[control_advice(order = N)]` impl form: same lowering as
+/// [`expand_control_advice_impl`], but an explicit `order = N` arg makes the generated
+/// `impl ControlAdvice` emit `fn order(&self) -> i32 { N }` — the dispatcher's stable
+/// precedence sort key (the dispatcher stable-sorts advice by `order()`; the trait
+/// default is `0`). Mirrors the `#[advice(order = N)]` / `#[aspect(order = N)]` order
+/// plumbing: parse an integer `order`, thread it into the generated impl. No `order`
+/// arg → no `fn order` override (the trait default `0` stands).
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) per [`expand_control_advice_impl`], plus a
+/// malformed `order` arg (a non-integer / unknown key).
+pub fn expand_control_advice_impl_with(
+    item: &ItemImpl,
+    attr: TokenStream,
+) -> Result<TokenStream, EmitError> {
+    let order = parse_advice_order(attr)?;
     let self_ty = self_ty_of(item)?;
     let advice_ident = type_ident(&self_ty);
     if !item.generics.params.is_empty() {
@@ -654,6 +719,13 @@ pub fn expand_control_advice_impl(item: &ItemImpl) -> Result<TokenStream, EmitEr
     // declines (`None`) if none map the error — the dispatcher's chain / default floor
     // takes over. The error/request binding idents are `__err`/`__req` even when an
     // arm ignores the request (the unused-binding allow covers it).
+    // An explicit `order = N` emits `fn order(&self) -> i32 { N }` (the dispatcher's
+    // stable precedence sort key); omitted → no override (the trait default `0` stands).
+    let order_fn = order.map(|n| {
+        quote! {
+            fn order(&self) -> i32 { #n }
+        }
+    });
     Ok(quote! {
         #[allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
         impl ::leaf_web::ControlAdvice for #self_ty {
@@ -666,8 +738,61 @@ pub fn expand_control_advice_impl(item: &ItemImpl) -> Result<TokenStream, EmitEr
                 #(#arms)*
                 ::core::option::Option::None
             }
+            #order_fn
         }
     })
+}
+
+/// Parse the OPTIONAL `order = N` argument of a `#[control_advice(order = N)]` struct/
+/// impl attribute into an explicit `i32` chain order, mirroring how `#[advice(order =
+/// N)]` parses its order. An empty attribute → `None` (the trait default `0` stands).
+///
+/// # Errors
+/// [`EmitError`] on a malformed attribute, an unknown key, or a non-integer `order`.
+fn parse_advice_order(attr: TokenStream) -> Result<Option<i32>, EmitError> {
+    if attr.is_empty() {
+        return Ok(None);
+    }
+    let parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
+    let metas = syn::parse::Parser::parse2(parser, attr).map_err(|e| EmitError {
+        message: format!("malformed `#[control_advice(..)]` argument: {e}"),
+    })?;
+    let mut order = None;
+    for meta in metas {
+        let Meta::NameValue(nv) = meta else {
+            return Err(EmitError {
+                message: "`#[control_advice(..)]` arguments must be `key = value` pairs".into(),
+            });
+        };
+        let key = nv.path.get_ident().map(ToString::to_string).unwrap_or_default();
+        if key != "order" {
+            return Err(EmitError {
+                message: format!(
+                    "unknown `#[control_advice]` argument `{key}` (expected `order = N`)"
+                ),
+            });
+        }
+        order = Some(order_int_value(&nv.value)?);
+    }
+    Ok(order)
+}
+
+/// The integer value of an `order = N` right-hand side (allowing a leading `-`),
+/// mirroring `advisor::int_value`.
+fn order_int_value(expr: &syn::Expr) -> Result<i32, EmitError> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit { lit: Lit::Int(i), .. }) => {
+            i.base10_parse::<i32>().map_err(|e| EmitError {
+                message: format!("`order` must be an i32 integer: {e}"),
+            })
+        }
+        syn::Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => {
+            Ok(-order_int_value(expr)?)
+        }
+        other => Err(EmitError {
+            message: format!("`order` must be an integer literal, got `{}`", quote! { #other }),
+        }),
+    }
 }
 
 /// Find an attribute by its path's last segment (`#[exception_handler]`), matching the
@@ -1040,5 +1165,98 @@ mod tests {
         let err = expand_control_advice_impl(&item)
             .expect_err("a generic control-advice impl hard-errors");
         assert!(err.message.contains("generic"), "got: {}", err.message);
+    }
+
+    // ── #[control_advice(order = N)] — the dispatcher-precedence knob (Task T4 b) ──
+
+    #[test]
+    fn a_control_advice_impl_with_an_order_arg_emits_a_fn_order() {
+        // `#[control_advice(order = 5)]` on the impl form makes the generated `impl
+        // ControlAdvice` emit `fn order(&self) -> i32 { 5 }` so the dispatcher's
+        // stable order-sort gives this advice a deterministic precedence (advice.rs
+        // defaults to 0 otherwise). Mirrors the `#[advice(order = N)]` plumbing.
+        let item = impl_item(
+            r#"impl Errors {
+                #[exception_handler]
+                fn h(&self, e: &LeafError) -> Option<Response> { todo!() }
+            }"#,
+        );
+        let attr: TokenStream = syn::parse_str("order = 5").expect("tokens");
+        let ts = expand_control_advice_impl_with(&item, attr).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("fnorder(&self)->i32{5i32}") || s.contains("fnorder(&self)->i32{5}"),
+            "an order arg emits `fn order(&self) -> i32 {{ 5 }}`: {s}"
+        );
+    }
+
+    #[test]
+    fn a_control_advice_impl_without_order_emits_no_order_override() {
+        // No `order` arg → the generated impl emits NO `fn order` (the trait default 0
+        // applies), exactly as before the order knob existed.
+        let item = impl_item(
+            r#"impl Errors {
+                #[exception_handler]
+                fn h(&self, e: &LeafError) -> Option<Response> { todo!() }
+            }"#,
+        );
+        let s = flat(&expand_control_advice_impl_with(&item, TokenStream::new()).expect("emits"));
+        assert!(!s.contains("fnorder"), "no order arg → no `fn order` override: {s}");
+    }
+
+    // ── #[web_filter] STRUCT stereotype (Task T4 a) ──
+
+    #[test]
+    fn a_web_filter_struct_provides_the_dyn_web_filter_view() {
+        // `#[web_filter] struct AccessLog;` is a `#[component]`-equivalent bean that
+        // ALSO `provides` the `dyn ::leaf_web::WebFilter` view (so the server's
+        // `Vec<Ref<dyn WebFilter>>` collection injection finds it) — the SAME
+        // `provides`-a-view shape `#[runner]`/`#[control_advice]`-struct use.
+        let ts = expand_web_filter_struct(&struct_item("struct AccessLog;"), TokenStream::new())
+            .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        // It rides the COMPONENTS channel (a plain `#[component]`-equivalent bean).
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "the filter bean is a COMPONENTS row: {s}"
+        );
+        // It declares the `dyn ::leaf_web::WebFilter` provides[] view.
+        assert!(
+            s.contains("::core::any::TypeId::of::<dyn::leaf_web::WebFilter>()"),
+            "the filter bean must declare the `dyn ::leaf_web::WebFilter` view: {s}"
+        );
+    }
+
+    #[test]
+    fn a_web_filter_struct_field_injects_its_collaborators() {
+        // `#[web_filter]` is structurally a `#[component]`: its fields are injection
+        // points routed through `Injectable` (trait dispatch), exactly like any
+        // stereotype. So the collaborator a filter needs is field-injected.
+        let ts = expand_web_filter_struct(
+            &struct_item("struct AccessLog { audit: leaf_core::Ref<Audit> }"),
+            TokenStream::new(),
+        )
+        .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("<leaf_core::Ref<Audit>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "a `#[web_filter]` field is field-injected via the Injectable trait: {s}"
+        );
+        assert!(
+            s.contains("::core::any::TypeId::of::<dyn::leaf_web::WebFilter>()"),
+            "and still provides the `dyn WebFilter` view: {s}"
+        );
+    }
+
+    #[test]
+    fn a_web_filter_struct_honours_name_and_scope_args() {
+        // The shared stereotype args (`name`/`scope`/`role`/`constructor`) flow through
+        // exactly like every other struct stereotype.
+        let attr: TokenStream = syn::parse_str(r#"name = "accessLog""#).expect("tokens");
+        let s = flat(&expand_web_filter_struct(&struct_item("struct AccessLog;"), attr).expect("emits"));
+        assert!(s.contains(r#"Some("accessLog")"#), "an explicit name flows through: {s}");
     }
 }
