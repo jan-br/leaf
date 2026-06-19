@@ -90,6 +90,18 @@ impl Catalog {
     async fn create(&self) -> Result<ProductDto, LeafError> {
         Ok(ProductDto { sku: "TEA".to_string(), name: "Earl Grey".to_string(), price_cents: 999 })
     }
+
+    /// `GET /users/{uid}/orders/{oid}` — the multi-capture proof (Task T1a): `uid:
+    /// Path<u64>` binds to the FIRST capture (typed-parsed), `oid: Path<String>` to the
+    /// SECOND. Each `Path` reads ITS OWN `{name}` via the threaded binding context — the
+    /// fix for the regression where both bound to the first capture. The handler echoes
+    /// both into the DTO so the test can prove the binding end to end.
+    #[get("/users/{uid}/orders/{oid}")]
+    async fn user_order(&self, uid: Path<u64>, oid: Path<String>) -> Result<ProductDto, LeafError> {
+        let Path(uid) = uid;
+        let Path(oid) = oid;
+        Ok(ProductDto { sku: oid, name: format!("user-{uid}"), price_cents: uid as u32 })
+    }
 }
 
 // ─────────────────────────────── assembly helpers ────────────────────────────────
@@ -117,7 +129,7 @@ fn assemble_dispatcher() -> Dispatcher {
 
     let routes: Vec<Ref<dyn Route>> =
         block(<Vec<Ref<dyn Route>> as Injectable>::inject(&cx)).expect("routes resolve");
-    assert_eq!(routes.len(), 2, "both generated #[rest_controller] route beans were collected");
+    assert_eq!(routes.len(), 3, "all generated #[rest_controller] route beans were collected");
 
     Dispatcher::new(routes.into_iter().map(Ref::into_arc).collect(), vec![], vec![])
 }
@@ -165,4 +177,20 @@ fn a_handler_error_rides_the_advice_chain_to_the_default_500() {
     // default mapping turns NoSuchBean → 404 (the dispatcher never errors out).
     let resp = block(server.handle(request(Method::GET, "/products/NOPE")));
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn a_multi_capture_route_binds_each_path_param_to_its_own_named_capture() {
+    // Task T1a end to end: `/users/{uid}/orders/{oid}` with `uid: Path<u64>` + `oid:
+    // Path<String>`. The dispatcher installs BOTH captures by name; the generated handler
+    // threads each parameter's name through the binding context so `uid` binds to the
+    // FIRST capture (typed-parsed to u64) and `oid` to the SECOND — the regression fix
+    // (both used to bind to the first). The handler echoes them into the DTO.
+    let server = MockServer::new(Arc::new(assemble_dispatcher()));
+    let resp = block(server.handle(request(Method::GET, "/users/7/orders/A42")));
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = std::str::from_utf8(resp.body_bytes()).expect("utf8 body");
+    // sku=oid (the SECOND capture, "A42"), name=user-{uid} (the FIRST capture, 7),
+    // price_cents=uid (7) — proving uid != oid and each bound to its own segment.
+    assert_eq!(body, r#"{"sku":"A42","name":"user-7","price_cents":7}"#);
 }

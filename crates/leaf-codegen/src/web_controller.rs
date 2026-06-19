@@ -116,20 +116,35 @@ fn emit_route_bean(
 
     // The handler's argument resolution: each NON-receiver parameter resolves via its
     // CONVERTER-AWARE `FromRequestParts` extractor — `<ParamTy as
-    // ::leaf_web::FromRequestParts>::from_request_parts(req, converter)` (TRAIT dispatch
-    // on the parameter's STRUCTURAL extractor type, never a spelled name). One uniform
-    // call site lowers EVERY parameter: the request-only extractors (`Path`/`Query`/
-    // `&Request`) ride the `FromRequest` blanket (ignoring the converter), while a
-    // `Json<T>` body parameter rides the injected `HttpMessageConverter` — trait
-    // resolution, not the macro, picks which. The resolved bindings pass positionally to
-    // the controller method.
-    let arg_types = non_receiver_arg_types(method);
+    // ::leaf_web::FromRequestParts>::from_request_parts(req, converter, ctx)` (TRAIT
+    // dispatch on the parameter's STRUCTURAL extractor type, never a spelled name). One
+    // uniform call site lowers EVERY parameter: the request-only NAME-FREE extractors
+    // (`Query`/`&Request`) ride the `FromRequest` blanket (ignoring both), the
+    // name-dependent `Path<T>` reads the parameter NAME off the threaded binding context,
+    // and a `Json<T>` body parameter rides the injected `HttpMessageConverter` — trait
+    // resolution, not the macro, picks which.
+    //
+    // The per-argument `ExtractCtx` carries the handler PARAMETER NAME (the `Pat::Ident`
+    // already on the signature) so the `Path<T>` extractor selects ITS OWN `{name}`
+    // capture (a multi-capture route binds each `Path` to its own segment, not all to the
+    // first). The context is threaded UNIFORMLY to every extractor; the macro never
+    // branches on the parameter being a `Path`. A destructured / unnamed parameter yields
+    // an empty context (name-dependent extractors then fail loudly rather than guess).
+    // The resolved bindings pass positionally to the controller method.
+    let args = non_receiver_args(method);
     let arg_locals: Vec<syn::Ident> =
-        (0..arg_types.len()).map(|i| format_ident!("__arg{i}")).collect();
-    let arg_resolves = arg_types.iter().zip(&arg_locals).map(|(ty, local)| {
+        (0..args.len()).map(|i| format_ident!("__arg{i}")).collect();
+    let arg_resolves = args.iter().zip(&arg_locals).enumerate().map(|(i, (arg, local))| {
+        let ty = &arg.ty;
+        let ctx_local = format_ident!("__ctx{i}");
+        let ctx_init = match &arg.name {
+            Some(name) => quote! { ::leaf_web::ExtractCtx::named(#name) },
+            None => quote! { ::leaf_web::ExtractCtx::empty() },
+        };
         quote! {
+            let #ctx_local = #ctx_init;
             let #local =
-                <#ty as ::leaf_web::FromRequestParts>::from_request_parts(__req, __converter)?;
+                <#ty as ::leaf_web::FromRequestParts>::from_request_parts(__req, __converter, &#ctx_local)?;
         }
     });
 
@@ -185,7 +200,7 @@ fn emit_route_bean(
     // `#[rest_controller]` return policy (serialize). When a handler has NO parameters AND
     // is a plain `#[controller]` (so the converter is genuinely unused), bind it to `_` so
     // the field stays injected (uniform struct shape) without tripping the unused-var lint.
-    let converter_binding = if arg_types.is_empty() && !response_body {
+    let converter_binding = if args.is_empty() && !response_body {
         quote! { let _ = &*self.converter; }
     } else {
         quote! { let __converter: &dyn ::leaf_web::HttpMessageConverter = &*self.converter; }
@@ -388,18 +403,42 @@ fn has_self_receiver(func: &ImplItemFn) -> bool {
     func.sig.inputs.iter().any(|a| matches!(a, FnArg::Receiver(_)))
 }
 
-/// The NON-receiver argument types of a method, in order — each is one handler
-/// parameter resolved via its `FromRequest` extractor (the type is used VERBATIM so the
-/// trait dispatch is purely structural, never a name match).
-fn non_receiver_arg_types(func: &ImplItemFn) -> Vec<Type> {
+/// One NON-receiver handler parameter: its extractor TYPE (used verbatim so the trait
+/// dispatch is purely structural, never a name match) + its parameter NAME (the
+/// `Pat::Ident`, if it has one — threaded into the extractor's binding [`ExtractCtx`] so
+/// the name-dependent `Path<T>` extractor selects its own `{name}` capture).
+struct HandlerArg {
+    /// The parameter's extractor type, used VERBATIM (structural trait dispatch).
+    ty: Type,
+    /// The parameter's name (`Pat::Ident`), or `None` for a destructured / wildcard pat.
+    name: Option<String>,
+}
+
+/// The NON-receiver arguments of a method, in order — each is one handler parameter
+/// resolved via its `FromRequestParts` extractor. The type is used VERBATIM (purely
+/// structural dispatch); the name (if the parameter is a plain `Pat::Ident`) rides into
+/// the per-argument binding context.
+fn non_receiver_args(func: &ImplItemFn) -> Vec<HandlerArg> {
     func.sig
         .inputs
         .iter()
         .filter_map(|a| match a {
-            FnArg::Typed(pat_ty) => Some((*pat_ty.ty).clone()),
+            FnArg::Typed(pat_ty) => {
+                let name = match &*pat_ty.pat {
+                    syn::Pat::Ident(pi) => Some(pi.ident.to_string()),
+                    _ => None,
+                };
+                Some(HandlerArg { ty: (*pat_ty.ty).clone(), name })
+            }
             FnArg::Receiver(_) => None,
         })
         .collect()
+}
+
+/// The NON-receiver argument count of a method — the structural ARITY the
+/// `#[control_advice]` impl dispatches on (the error alone vs. error + request).
+fn non_receiver_arg_count(func: &ImplItemFn) -> usize {
+    func.sig.inputs.iter().filter(|a| matches!(a, FnArg::Typed(_))).count()
 }
 
 /// The concrete `Self` type of an impl block.
@@ -537,7 +576,7 @@ pub fn expand_control_advice_impl(item: &ItemImpl) -> Result<TokenStream, EmitEr
         }
         // Dispatch on the handler's ARITY (structural): one non-receiver param → the
         // error alone; two → the error + the request. Never a spelled type name.
-        let extra = non_receiver_arg_types(func).len();
+        let extra = non_receiver_arg_count(func);
         let call = if extra >= 2 {
             quote! { self.#method_ident(__err, __req) }
         } else {
@@ -656,6 +695,48 @@ mod tests {
         assert!(
             s.contains(".write(") && s.contains("HttpMessageConverter"),
             "a #[rest_controller] return serializes via the injected converter: {s}"
+        );
+    }
+
+    #[test]
+    fn each_path_param_is_extracted_with_its_own_name_in_the_binding_context() {
+        // Task T1a: a multi-capture route binds EACH `Path` parameter to ITS OWN
+        // `{name}`. The codegen threads a per-argument `ExtractCtx` carrying the handler
+        // PARAMETER NAME (`uid`/`oid`) into the uniform `from_request_parts` call — so the
+        // name-dependent `Path<T>` extractor selects its own capture. The dispatch stays
+        // the uniform `<Ty as FromRequestParts>::from_request_parts(req, conv, ctx)`; the
+        // macro NEVER branches on the parameter being a `Path`.
+        let item = impl_item(
+            r#"impl Api {
+                #[get("/users/{uid}/orders/{oid}")]
+                async fn get(&self, uid: Path<u64>, oid: Path<String>) -> Result<(), LeafError> {
+                    todo!()
+                }
+            }"#,
+        );
+        let ts = expand_controller_impl(&item, true).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // Each extractor call carries the parameter's OWN name in an `ExtractCtx::named`.
+        assert!(
+            s.contains(r#"::leaf_web::ExtractCtx::named("uid")"#),
+            "the first param's extractor gets ExtractCtx::named(\"uid\"): {s}"
+        );
+        assert!(
+            s.contains(r#"::leaf_web::ExtractCtx::named("oid")"#),
+            "the second param's extractor gets ExtractCtx::named(\"oid\"): {s}"
+        );
+        // The dispatch is still the uniform FromRequestParts seam — never a Path-name branch.
+        assert!(
+            s.contains("<Path<u64>as::leaf_web::FromRequestParts>::from_request_parts")
+                && s.contains("<Path<String>as::leaf_web::FromRequestParts>::from_request_parts"),
+            "both params lower through the uniform FromRequestParts call site: {s}"
+        );
+        // The context is threaded as the third argument to the uniform call.
+        assert!(
+            s.contains("from_request_parts(__req,__converter,&__ctx0)")
+                && s.contains("from_request_parts(__req,__converter,&__ctx1)"),
+            "each extractor call passes its own binding context: {s}"
         );
     }
 
