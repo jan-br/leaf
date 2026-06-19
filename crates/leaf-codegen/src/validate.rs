@@ -161,32 +161,22 @@ fn lower_constraint(
     }
 }
 
-/// Emit the `#[validate(nested)]` cascade: a scalar nested field enters once; a
-/// `Vec<T>` nested field cascades each element under an indexed `<seg>[{i}]` path
-/// (the cascade.rs `items[{i}]` token pattern).
-fn emit_nested(fid: &syn::Ident, seg: &str, ty: &Type) -> TokenStream {
-    if is_vec(ty) {
-        let fmt = format!("{seg}[{{i}}]");
-        quote! {
-            for (i, x) in self.#fid.iter().enumerate() {
-                __c.enter(&::std::format!(#fmt), ::leaf_validation::addr_of(x), x);
-            }
-        }
-    } else {
-        quote! {
-            __c.enter(#seg, ::leaf_validation::addr_of(&self.#fid), &self.#fid);
+/// Emit the `#[validate(nested)]` cascade as ONE uniform, alias-safe call site.
+///
+/// The cardinal rule (charter §2.x): the codegen must NEVER decide the cascade SHAPE
+/// (element-wise over a `Vec<T>` vs a single `enter`) from the field type's spelled name.
+/// It emits `(&&CascadeTag(&self.field)).leaf_cascade(__c, "<seg>")`; the runtime autoref
+/// ladder ([`leaf_validation::cascade`]) resolves the REAL field type — a `Vec<T>`
+/// cascades element-wise under `<seg>[{i}]`, any other nested object `enter`s once. A
+/// `type Items = Vec<Inner>;` alias resolves identically (no name-based Vec check).
+fn emit_nested(fid: &syn::Ident, seg: &str, _ty: &Type) -> TokenStream {
+    quote! {
+        {
+            #[allow(unused_imports)]
+            use ::leaf_validation::{CascadeList as _, CascadeOne as _};
+            (&&::leaf_validation::CascadeTag(&self.#fid)).leaf_cascade(__c, #seg);
         }
     }
-}
-
-/// Whether a field type is a `Vec<T>` (the indexed-cascade nested shape).
-fn is_vec(ty: &Type) -> bool {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-    {
-        return seg.ident == "Vec";
-    }
-    false
 }
 
 /// The single-segment ident of a constraint key path (`min`, `range`, …).
@@ -384,36 +374,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_lowers_a_scalar_nested_field_through_enter() {
+    fn validate_lowers_a_scalar_nested_field_through_the_uniform_tag() {
         let s = flat(
             &emit_validate(&derive("struct Order { #[validate(nested)] customer: Customer }"))
                 .expect("emits"),
         );
+        // The cardinal rule: the nested cascade emits the ONE uniform type-driven tag
+        // (NEVER a spelled `enter`/indexed-loop chosen from the field type's name). The
+        // autoref ladder routes `Customer` to the single-object rung at runtime.
         assert!(
             s.contains(
-                r#"__c.enter("customer",::leaf_validation::addr_of(&self.customer),&self.customer)"#
+                r#"(&&::leaf_validation::CascadeTag(&self.customer)).leaf_cascade(__c,"customer")"#
             ),
             "got: {s}"
         );
     }
 
     #[test]
-    fn validate_lowers_a_vec_nested_field_through_an_indexed_enter() {
+    fn validate_lowers_a_vec_nested_field_through_the_same_uniform_tag() {
+        // The cardinal rule, headline: a `Vec<Item>` nested field emits the EXACT SAME
+        // uniform tag as a scalar nested field — the codegen never spells `Vec` or the
+        // indexed loop (the name-based Vec violation is gone). The element-wise vs
+        // single-object choice is the runtime autoref ladder's, keyed on the real type.
         let s = flat(
             &emit_validate(&derive("struct Order { #[validate(nested)] items: Vec<Item> }"))
                 .expect("emits"),
         );
-        // The Vec<T> nested field cascades each element under `items[{i}]` (cascade.rs).
-        assert!(
-            s.contains("for(i,x)inself.items.iter().enumerate()"),
-            "got: {s}"
-        );
         assert!(
             s.contains(
-                r#"__c.enter(&::std::format!("items[{i}]"),::leaf_validation::addr_of(x),x)"#
+                r#"(&&::leaf_validation::CascadeTag(&self.items)).leaf_cascade(__c,"items")"#
             ),
             "got: {s}"
         );
+        // No spelled indexed loop survives in the emitted cascade.
+        assert!(!s.contains(".iter().enumerate()"), "no spelled Vec loop survives: {s}");
     }
 
     #[test]

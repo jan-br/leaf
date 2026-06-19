@@ -159,6 +159,62 @@ impl<V: ValidateInto + ?Sized> Validate for AsValidate<'_, V> {
     }
 }
 
+// ───────────────── type-driven nested-cascade dispatch (alias-safe) ──────────────
+//
+// The cardinal rule (charter §2.x): a macro/codegen must NEVER decide behaviour from a
+// type's TEXTUAL NAME. The `#[derive(Validate)]` codegen used to read a
+// `#[validate(nested)]` field's spelled leading segment (`seg.ident == "Vec"`) to choose
+// the cascade SHAPE — an element-wise indexed loop over a `Vec<T>` vs a single `enter`
+// for a scalar nested object. A `type Items = Vec<Inner>;` alias defeats that: the
+// classifier sees the ident `Items` (not `Vec`) and would cascade the whole alias as ONE
+// nested object instead of element-wise, so a per-element violation path
+// (`items[1].qty`) silently collapses.
+//
+// This moves the SHAPE choice to the TYPE SYSTEM via an autoref ladder (the anyhow-style
+// stable trick), so the derive emits ONE uniform call site
+// `(&&::leaf_validation::CascadeTag(&self.field)).leaf_cascade(c, "field")` and never
+// spells `Vec`. The `&` (exact-match) rung specialises `Vec<T: ValidateInto>` to the
+// element-wise indexed cascade; the bare-value rung handles any other `T: ValidateInto`
+// as a single `enter`. A `Vec<T>` resolves to the element-wise rung regardless of any
+// alias, identically to the un-aliased type.
+
+/// The dispatch tag wrapping a borrow of a `#[validate(nested)]` field. The
+/// `#[derive(Validate)]` codegen builds `CascadeTag(&self.field)` and resolves the
+/// cascade shape through the autoref ladder below — never from the field type's spelled
+/// name (an alias resolves to the same element/scalar shape).
+pub struct CascadeTag<'a, T: ?Sized>(pub &'a T);
+
+/// The element-wise (`Vec<T>`) rung of the nested-cascade ladder. Implemented for a
+/// `&CascadeTag<Vec<T>>`, whose `&self` receiver `&&CascadeTag<Vec<T>>` EXACTLY matches
+/// the `&&CascadeTag` call site — the highest-priority candidate — so a `Vec<T>` field
+/// always cascades element-wise.
+pub trait CascadeList {
+    /// Cascade each element of the list under an indexed `<segment>[{i}]` path.
+    fn leaf_cascade(&self, c: &mut Cascade<'_>, segment: &str);
+}
+
+impl<T: ValidateInto> CascadeList for &CascadeTag<'_, Vec<T>> {
+    fn leaf_cascade(&self, c: &mut Cascade<'_>, segment: &str) {
+        for (i, x) in self.0.iter().enumerate() {
+            c.enter(&format!("{segment}[{i}]"), addr_of(x), x);
+        }
+    }
+}
+
+/// The single-object rung of the nested-cascade ladder. Implemented for a bare-value
+/// `CascadeTag<T>`, reached when a field is NOT a `Vec<T>` — so a scalar nested object
+/// `enter`s once under `<segment>`.
+pub trait CascadeOne {
+    /// Cascade a single nested object under `<segment>`.
+    fn leaf_cascade(&self, c: &mut Cascade<'_>, segment: &str);
+}
+
+impl<T: ValidateInto + ?Sized> CascadeOne for CascadeTag<'_, T> {
+    fn leaf_cascade(&self, c: &mut Cascade<'_>, segment: &str) {
+        c.enter(segment, addr_of(self.0), self.0);
+    }
+}
+
 /// Validate a ROOT object, returning the populated [`ValidationContext`].
 ///
 /// Drives `root.validate_into` under a fresh cascade with an empty path + a fresh
@@ -245,6 +301,33 @@ mod tests {
         assert_eq!(
             cx.violations()[0].path, "items[1].qty",
             "the nested violation reports the full cascade path"
+        );
+    }
+
+    // ── the cardinal-rule regression: an ALIASED Vec<T> nested field ────────────
+    //
+    // `type Items = Vec<Item>;` — the old codegen read the spelled ident `Items` (not
+    // `Vec`) and would cascade the whole alias as ONE nested object, collapsing the
+    // per-element `items[{i}].qty` paths. The type-driven autoref ladder resolves the
+    // REAL `Vec<Item>` to the element-wise rung, so this cascades IDENTICALLY to the
+    // un-aliased `Vec<Item>` in `nested_cascade_builds_a_dotted_indexed_path`.
+    type AliasedItems = Vec<Item>;
+
+    #[derive(Validate)]
+    struct AliasedOrder {
+        #[validate(nested)]
+        items: AliasedItems,
+    }
+
+    #[test]
+    fn an_aliased_vec_nested_field_still_cascades_element_wise() {
+        let order = AliasedOrder { items: vec![Item { qty: 1 }, Item { qty: 0 }] };
+        let cx = validate_root(&order);
+        assert_eq!(cx.violations().len(), 1, "only the second item is invalid");
+        assert_eq!(
+            cx.violations()[0].path, "items[1].qty",
+            "the aliased Vec<Item> field cascades element-wise under the indexed path, \
+             identical to a bare Vec<Item>"
         );
     }
 

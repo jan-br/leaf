@@ -74,6 +74,7 @@
 
 pub mod advice;
 pub mod bind;
+pub mod bind_field;
 pub mod bootstrap;
 pub mod conditions;
 pub mod convert;
@@ -99,6 +100,7 @@ pub mod order;
 pub mod placeholder;
 pub mod provider;
 pub mod proxy;
+pub mod return_shape;
 pub mod registry;
 pub mod relaxed;
 
@@ -227,6 +229,7 @@ pub use bind::{
     ConfigBindOutcome, ConfigBindThunk, ConfigurationPropertySource, ConfigurationPropertyState,
     ConversionService, Converter, Field, NodeSchema, NoopBindHandler, StackCps,
 };
+pub use bind_field::{BindFieldList, BindFieldNested, BindFieldScalar, ConfigFieldTag};
 
 pub use metadata::{
     collect_config_metadata, find_by_prefix, group_to_row, CodeSpan, ConfigGroup, Deprecation,
@@ -338,6 +341,7 @@ pub use proxy::{
     MethodJoinPoint, MethodJoinPointSpec, MethodTable, Next, Not, Or, OwnedTarget, Pointcut,
     ProxyPlan, ResolveError, Returns, ScopeTarget, Tail, TargetSource, Within,
 };
+pub use return_shape::ReturnShape;
 
 // - events: the in-process observer bus + the dispatch multicaster (C5 — a
 //   SEPARATE shape from advice). The publish/subscribe model (`ApplicationListener`,

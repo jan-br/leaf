@@ -95,6 +95,9 @@ pub use advisor::{
 pub use bind_handler::{
     canonical_key, validate_config, validate_config_dyn, ValidationBindHandler,
 };
-pub use cascade::{addr_of, validate_root, AsValidate, Cascade, ValidateInto, VisitedSet};
+pub use cascade::{
+    addr_of, validate_root, AsValidate, Cascade, CascadeList, CascadeOne, CascadeTag,
+    ValidateInto, VisitedSet,
+};
 pub use interceptor::{arg_validator, ArgValidator, MethodValidationInterceptor};
 pub use violations::{aggregate, has_violations, render_violation};

@@ -1216,13 +1216,17 @@ mod tests {
         let s = flat(&ts);
         // The method table + join points still emit.
         assert!(s.contains("pubstatic__leaf_methods_LedgerService"), "got: {s}");
-        // The tx advisor row keyed by the bean TypeId, with the manager + return-T.
+        // The tx advisor row keyed by the bean TypeId, with the manager + the WHOLE
+        // return type (the classifier keys on `Result<i64, LeafError>`, NEVER a
+        // name-peeled Ok type — the cardinal rule).
         assert!(
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]"),
             "got: {s}"
         );
         assert!(
-            s.contains("::leaf_tx::make_transaction_interceptor_for::<LedgerTxManager,i64>"),
+            s.contains(
+                "::leaf_tx::make_transaction_interceptor_for::<LedgerTxManager,Result<i64,LeafError>>"
+            ),
             "got: {s}"
         );
     }

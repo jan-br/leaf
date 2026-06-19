@@ -165,8 +165,10 @@ pub enum BindMethod {
 pub struct Field {
     /// The field's canonical kebab name (derived from the snake_case ident).
     pub canonical: &'static str,
-    /// The field's value schema (fn-pointer indirection handles recursion).
-    pub schema: &'static NodeSchema,
+    /// The field's value schema accessor (a `fn` indirection: the schema node is
+    /// resolved through the type-driven [`crate::bind_field`] dispatch ladder, never
+    /// from a type's spelled name, so an aliased field type documents identically).
+    pub schema: fn() -> &'static NodeSchema,
     /// Whether the field has a default (so absence is `Unbound`, not an error).
     pub has_default: bool,
 }
@@ -603,12 +605,12 @@ mod tests {
     static SERVER_FIELDS: &[Field] = &[
         Field {
             canonical: "port",
-            schema: &NodeSchema::Scalar,
+            schema: || &NodeSchema::Scalar,
             has_default: true,
         },
         Field {
             canonical: "host",
-            schema: &NodeSchema::Scalar,
+            schema: || &NodeSchema::Scalar,
             has_default: true,
         },
     ];
@@ -714,12 +716,12 @@ mod tests {
     static APP_FIELDS: &[Field] = &[
         Field {
             canonical: "name",
-            schema: &NodeSchema::Scalar,
+            schema: || &NodeSchema::Scalar,
             has_default: true,
         },
         Field {
             canonical: "server",
-            schema: &SERVER_SCHEMA,
+            schema: || &SERVER_SCHEMA,
             has_default: true,
         },
     ];

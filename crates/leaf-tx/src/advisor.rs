@@ -143,14 +143,16 @@ where
 /// returning `Result<T, LeafError>`, so a business `Result::Err` (returned through
 /// the chain's `Ok(ErasedRet)`) also drives the commit-vs-rollback decision.
 ///
-/// `M` is the concrete manager bean type; `T` is the advised method's `Ok` type
-/// (its return is `Result<T, LeafError>`). The monomorphized fn-item coerces to the
-/// bare [`MakeInterceptor`] fn-pointer, baking the per-`T` classifier in.
+/// `M` is the concrete manager bean type; `R` is the advised method's WHOLE return type
+/// (a `Result<T, LeafError>`, bounded by the sealed [`ReturnShape`](leaf_core::ReturnShape)
+/// — so the codegen never name-peels `Result` and a `Result` alias classifies
+/// identically). The monomorphized fn-item coerces to the bare [`MakeInterceptor`]
+/// fn-pointer, baking the per-`R` classifier in.
 #[must_use]
-pub const fn make_transaction_interceptor_for<M, T>() -> MakeInterceptor
+pub const fn make_transaction_interceptor_for<M, R>() -> MakeInterceptor
 where
     M: TransactionManager + 'static,
-    T: std::any::Any + Send + 'static,
+    R: leaf_core::ReturnShape,
 {
     |container: &dyn Container| {
         Box::pin(async move {
@@ -165,7 +167,7 @@ where
             let manager: Arc<M> = erased.downcast::<M>().map_err(|_| manager_mismatch())?;
             let manager: Arc<dyn TransactionManager> = manager;
             let interceptor = TransactionInterceptor::new(manager, TxAttribute::DEFAULT)
-                .with_return_classifier(result_classifier::<T>());
+                .with_return_classifier(result_classifier::<R>());
             Ok(Arc::new(interceptor) as Arc<dyn Interceptor>)
         }) as BoxFuture<'_, Result<Arc<dyn Interceptor>, LeafError>>
     }
@@ -180,12 +182,12 @@ where
 /// dispatches on the parameter's SYNTACTIC SHAPE, never a spelled name), so the app
 /// names the VIEW and whatever bean provides `dyn TransactionManager` (the
 /// auto-configured in-memory default, an integration crate's manager, …) backs it —
-/// no concrete pin, no wrapper. `T` is the advised method's `Ok` type (the per-`T`
-/// `Result` classifier rides exactly as in the concrete builder).
+/// no concrete pin, no wrapper. `R` is the advised method's WHOLE return type (the
+/// per-`R` `Result` classifier rides exactly as in the concrete builder).
 #[must_use]
-pub const fn make_transaction_interceptor_for_view<T>() -> MakeInterceptor
+pub const fn make_transaction_interceptor_for_view<R>() -> MakeInterceptor
 where
-    T: std::any::Any + Send + 'static,
+    R: leaf_core::ReturnShape,
 {
     |container: &dyn Container| {
         Box::pin(async move {
@@ -194,7 +196,7 @@ where
             let manager: Arc<dyn TransactionManager> =
                 view_from_holder::<dyn TransactionManager>(holder)?.into_arc();
             let interceptor = TransactionInterceptor::new(manager, TxAttribute::DEFAULT)
-                .with_return_classifier(result_classifier::<T>());
+                .with_return_classifier(result_classifier::<R>());
             Ok(Arc::new(interceptor) as Arc<dyn Interceptor>)
         }) as BoxFuture<'_, Result<Arc<dyn Interceptor>, LeafError>>
     }
@@ -231,19 +233,20 @@ where
 /// Like [`tx_advisor_pairing`] but binds a per-return-type
 /// [`result_classifier`] (via
 /// [`make_transaction_interceptor_for`]) so a method returning `Result<T, LeafError>`
-/// rolls back on a business `Result::Err` too. `T` is the advised method's `Ok` type.
+/// rolls back on a business `Result::Err` too. `R` is the advised method's WHOLE return
+/// type (bounded [`ReturnShape`](leaf_core::ReturnShape)).
 #[must_use]
-pub const fn tx_advisor_pairing_for<M, T>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
+pub const fn tx_advisor_pairing_for<M, R>(pointcut: &'static dyn Pointcut) -> AdvisorPairingRow
 where
     M: TransactionManager + 'static,
-    T: std::any::Any + Send + 'static,
+    R: leaf_core::ReturnShape,
 {
     AdvisorPairingRow {
         contract: tx_advisor_contract(),
         order: tx_order_key(),
         role: Role::Infrastructure,
         pointcut,
-        make_interceptor: make_transaction_interceptor_for::<M, T>(),
+        make_interceptor: make_transaction_interceptor_for::<M, R>(),
     }
 }
 

@@ -41,15 +41,18 @@ use crate::template::ResilientRetry;
 /// per concrete `T`.
 pub type ReturnClassifier = fn(&ErasedRet) -> Option<LeafError>;
 
-/// A [`ReturnClassifier`] for a method returning `Result<T, LeafError>`: downcasts
-/// the erased return and clones the `Err` payload (the business failure the retry
-/// policy classifies), or `None` on `Ok` / a type mismatch (degrades to "treat as
-/// success", never a panic).
+/// A [`ReturnClassifier`] for a method whose WHOLE return type is `R` (a
+/// `Result<T, LeafError>`): projects the business `Err` through `R`'s sealed
+/// [`ReturnShape`](leaf_core::ReturnShape) impl, or `None` on `Ok` / a type mismatch
+/// (degrades to "treat as success", never a panic).
+///
+/// Keyed on the WHOLE return type `R` — NOT the peeled `Ok` type — so the `#[retryable]`
+/// codegen never name-peels `Result` and a `type ApiResult<T> = …` alias classifies
+/// identically. A non-`Result` return fails the `R: ReturnShape` bound (a clear compile
+/// error): the classifier is only meaningful for a `Result`-returning method.
 #[must_use]
-pub fn result_classifier<T: std::any::Any + Send>() -> ReturnClassifier {
-    |ret: &ErasedRet| -> Option<LeafError> {
-        ret.0.downcast_ref::<Result<T, LeafError>>().and_then(|r| r.as_ref().err().cloned())
-    }
+pub fn result_classifier<R: leaf_core::ReturnShape>() -> ReturnClassifier {
+    <R as leaf_core::ReturnShape>::classify_business_err
 }
 
 /// The around-advice [`Interceptor`] that retries the call on a retryable error.
@@ -245,7 +248,7 @@ mod tests {
         // A method returning Result<i64, LeafError> reports failure THROUGH Ok(ErasedRet);
         // the classifier detects it and retries.
         let r = RetryInterceptor::from_policy(RetryPolicy::new(3), Arc::new(NoBackoff))
-            .with_return_classifier(result_classifier::<i64>());
+            .with_return_classifier(result_classifier::<Result<i64, LeafError>>());
         let interceptor: Arc<dyn Interceptor> = Arc::new(r);
         let chain = AdviceChain::new(Box::new([interceptor]));
         let target = nop_target();

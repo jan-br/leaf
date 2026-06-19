@@ -6,9 +6,13 @@
 //!
 //! 1. **`derive(BindTarget)`** — lower a `struct` to the const
 //!    `::leaf_core::NodeSchema` + the cursor-calling `::leaf_core::BindTarget::bind`
-//!    impl (the JavaBean field-fold), via ABSOLUTE `::leaf_core` paths. A scalar
-//!    field binds through `cursor.scalar::<T>(name)`; a nested `BindTarget` field
-//!    binds through `cursor.nested`; a `Vec<T>` through `cursor.list`.
+//!    impl (the JavaBean field-fold), via ABSOLUTE `::leaf_core` paths. Every field
+//!    folds through ONE uniform type-driven dispatch tag
+//!    (`(&&&::leaf_core::ConfigFieldTag::<Ty>::new()).leaf_bind_field(..)`); the runtime
+//!    autoref ladder (leaf-core's `bind_field`) — NOT the codegen — resolves the real
+//!    field type to scalar (`cursor.scalar`) / list (`cursor.list`) / nested
+//!    (`cursor.nested`), so an aliased field type binds identically (the cardinal rule:
+//!    no type-NAME decisions in the codegen).
 //! 2. **`#[config_properties(prefix = "app")]`** — emit the `derive(BindTarget)`
 //!    artifact PLUS one `::leaf_core::ConfigMetadataRow` into the `CONFIG_METADATA`
 //!    slice (the anti-DCE/config-doc anchor) and one const `::leaf_core::ConfigGroup`
@@ -39,22 +43,10 @@ struct BindField {
     ident: syn::Ident,
     /// The canonical kebab name (the relaxed-binding key the cursor reads).
     canonical: String,
-    /// The field type (drives the scalar/nested/list cursor call).
+    /// The field type. The bind/schema lowering dispatches on this type through the
+    /// runtime [`leaf_core::bind_field`] autoref ladder — NEVER on its spelled name —
+    /// so a re-exported scalar alias or `type Tags = Vec<String>;` binds identically.
     ty: Type,
-    /// The field's binding shape.
-    shape: FieldShape,
-}
-
-/// The binding shape of a field — which `BindCursor` helper lowers it + which
-/// `NodeSchema` node documents it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FieldShape {
-    /// A leaf scalar coerced via `FromConfigValue` (`cursor.scalar`).
-    Scalar,
-    /// A homogeneous list `Vec<T>` (`cursor.list`).
-    List,
-    /// A nested `BindTarget` object (`cursor.nested`).
-    Nested,
 }
 
 /// Derive the [`leaf_core::BindTarget`] artifact for a `struct`: the const
@@ -111,48 +103,20 @@ fn struct_fields(input: &DeriveInput) -> Result<Vec<BindField>, EmitError> {
     for f in &named.named {
         let ident = f.ident.clone().expect("a named field has an ident");
         let canonical = canonical_name(&ident.to_string());
-        let shape = field_shape(&f.ty);
-        out.push(BindField { ident, canonical, ty: f.ty.clone(), shape });
+        out.push(BindField { ident, canonical, ty: f.ty.clone() });
     }
     Ok(out)
 }
 
-/// Classify a field's binding shape from its type: `Vec<T>` → `List`; a primitive
-/// scalar / `String` / common leaf → `Scalar`; anything else → `Nested` (a
-/// `BindTarget` object). This is a conservative structural classification; the
-/// monomorphized `bind` call still type-checks against the real trait bound.
-fn field_shape(ty: &Type) -> FieldShape {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-    {
-        let name = seg.ident.to_string();
-        if name == "Vec" {
-            return FieldShape::List;
-        }
-        if is_scalar_ident(&name) {
-            return FieldShape::Scalar;
-        }
-        return FieldShape::Nested;
-    }
-    // A non-path type (reference, array, …) is treated as a scalar leaf.
-    FieldShape::Scalar
-}
-
-/// Whether a leading type ident names a built-in scalar leaf (the
-/// `FromConfigValue` grammar set). Anything else is a nested object.
-fn is_scalar_ident(name: &str) -> bool {
-    matches!(
-        name,
-        "String"
-            | "bool"
-            | "char"
-            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-            | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-            | "f32" | "f64"
-            | "Duration" | "Period" | "DataSize"
-            | "PathBuf"
-            | "IpAddr" | "SocketAddr"
-    )
+/// The uniform, alias-safe per-field dispatch tag: `(&&&ConfigFieldTag::<Ty>::new())`.
+///
+/// The triple-`&` autoref ladder (leaf-core's `bind_field`) resolves the binding shape
+/// from the REAL field type `Ty` through DISJOINT trait bounds the framework owns —
+/// `Vec<T: FromConfigValue>` → list, `T: BindTarget` → nested, `T: FromConfigValue` →
+/// scalar — so the codegen never spells `Vec`/`String`/a scalar set and an aliased
+/// field type binds identically (the cardinal rule: no type-NAME decisions).
+fn field_tag(ty: &Type) -> TokenStream {
+    quote! { (&&&::leaf_core::ConfigFieldTag::<#ty>::new()) }
 }
 
 /// Emit the const `NodeSchema` for the struct (one `Field` per struct field).
@@ -163,13 +127,19 @@ fn emit_schema(ident: &syn::Ident, fields: &[BindField]) -> TokenStream {
 
     let field_rows = fields.iter().map(|f| {
         let canonical = &f.canonical;
-        let node = field_node_schema(f);
-        // A field with a Default-derivable type is treated as "has a default" so
-        // absence is Unbound, not an error (the JavaBean default-fill convention).
+        let tag = field_tag(&f.ty);
+        // The schema node is resolved through the SAME type-driven autoref ladder as the
+        // bind call (a `fn() -> &'static NodeSchema` accessor), never from the type's
+        // spelled name. A field with a Default-derivable type "has a default" so absence
+        // is Unbound, not an error (the JavaBean default-fill convention).
         quote! {
             ::leaf_core::Field {
                 canonical: #canonical,
-                schema: #node,
+                schema: || {
+                    #[allow(unused_imports)]
+                    use ::leaf_core::{BindFieldList as _, BindFieldNested as _, BindFieldScalar as _};
+                    #tag.leaf_node_schema()
+                },
                 has_default: true,
             }
         }
@@ -186,20 +156,6 @@ fn emit_schema(ident: &syn::Ident, fields: &[BindField]) -> TokenStream {
     }
 }
 
-/// The `&'static NodeSchema` reference a `Field` points at, by shape. A scalar is
-/// the shared `&::leaf_core::NodeSchema::Scalar` const; a list wraps the element
-/// scalar schema; a nested object references the inner type's derived `SCHEMA`.
-fn field_node_schema(f: &BindField) -> TokenStream {
-    match f.shape {
-        FieldShape::Scalar => quote! { &::leaf_core::NodeSchema::Scalar },
-        FieldShape::List => quote! { &::leaf_core::NodeSchema::List(&::leaf_core::NodeSchema::Scalar) },
-        FieldShape::Nested => {
-            let ty = &f.ty;
-            quote! { <#ty as ::leaf_core::BindTarget>::SCHEMA }
-        }
-    }
-}
-
 /// Emit the `impl ::leaf_core::BindTarget` block: the `const SCHEMA` pointer + the
 /// cursor-calling `bind` fold.
 fn emit_bind_impl(ident: &syn::Ident, fields: &[BindField]) -> TokenStream {
@@ -209,14 +165,16 @@ fn emit_bind_impl(ident: &syn::Ident, fields: &[BindField]) -> TokenStream {
     let binds = fields.iter().map(|f| {
         let fid = &f.ident;
         let canonical = &f.canonical;
-        let ty = &f.ty;
-        let call = match f.shape {
-            FieldShape::Scalar => quote! { __cursor.scalar::<#ty>(#canonical) },
-            FieldShape::List => {
-                let elem = vec_elem(ty);
-                quote! { __cursor.list::<#elem>(#canonical) }
+        let tag = field_tag(&f.ty);
+        // ONE uniform call site: the autoref ladder picks scalar/list/nested from the
+        // field's REAL type (the `use … as _` brings the three trait rungs into scope so
+        // method resolution can reach them; the `&&&` Vec<T> list rung is tried first).
+        let call = quote! {
+            {
+                #[allow(unused_imports)]
+                use ::leaf_core::{BindFieldList as _, BindFieldNested as _, BindFieldScalar as _};
+                #tag.leaf_bind_field(__cursor, #canonical)
             }
-            FieldShape::Nested => quote! { __cursor.nested::<#ty>(#canonical) },
         };
         quote! {
             match #call {
@@ -249,19 +207,6 @@ fn emit_bind_impl(ident: &syn::Ident, fields: &[BindField]) -> TokenStream {
             }
         }
     }
-}
-
-/// The element type `T` of a `Vec<T>` (or the type itself if not a `Vec`).
-fn vec_elem(ty: &Type) -> Type {
-    if let Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "Vec"
-        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(inner)) = args.args.first()
-    {
-        return inner.clone();
-    }
-    ty.clone()
 }
 
 // ─────────────────────── #[config_properties(prefix=...)] ────────────────────
@@ -757,11 +702,16 @@ mod tests {
     }
 
     #[test]
-    fn bind_target_emits_the_bindtarget_impl_with_a_scalar_fold() {
+    fn bind_target_emits_the_bindtarget_impl_with_a_uniform_typed_fold() {
         let s = flat(&emit_bind_target(&derive("struct P { port: u16 }")).expect("emits"));
         assert!(s.contains("impl::leaf_core::BindTargetforP"), "got: {s}");
-        // A scalar field folds through cursor.scalar::<u16>("port").
-        assert!(s.contains(r#"__cursor.scalar::<u16>("port")"#), "got: {s}");
+        // The cardinal rule: the field folds through the ONE uniform type-driven dispatch
+        // tag (NEVER a spelled `scalar`/`list`/`nested` chosen from the type name). The
+        // autoref ladder resolves the real `u16` to the scalar rung at runtime.
+        assert!(
+            s.contains(r#"(&&&::leaf_core::ConfigFieldTag::<u16>::new()).leaf_bind_field(__cursor,"port")"#),
+            "got: {s}"
+        );
         // The const SCHEMA pointer references the emitted schema static.
         assert!(s.contains("constSCHEMA:&'static::leaf_core::NodeSchema"), "got: {s}");
     }
@@ -770,24 +720,40 @@ mod tests {
     fn snake_case_field_canonicalizes_to_kebab() {
         let s = flat(&emit_bind_target(&derive("struct P { max_connections: u32 }")).expect("emits"));
         assert!(s.contains(r#"canonical:"max-connections""#), "got: {s}");
-        // The cursor reads the kebab canonical key.
-        assert!(s.contains(r#"__cursor.scalar::<u32>("max-connections")"#), "got: {s}");
+        // The uniform dispatch tag reads the kebab canonical key (the type-driven ladder,
+        // never a spelled cursor method).
+        assert!(
+            s.contains(r#"(&&&::leaf_core::ConfigFieldTag::<u32>::new()).leaf_bind_field(__cursor,"max-connections")"#),
+            "got: {s}"
+        );
     }
 
     #[test]
-    fn a_vec_field_binds_as_a_list() {
+    fn a_vec_field_emits_the_same_uniform_tag_as_any_other_field() {
+        // The cardinal rule, headline: a `Vec<String>` field emits the EXACT SAME uniform
+        // dispatch tag as a scalar or nested field — the codegen never spells `Vec`/`list`
+        // (the name-based Vec violation is gone). The list-vs-scalar-vs-nested choice
+        // is the runtime autoref ladder's, keyed on the real `Vec<String>` type.
         let s = flat(&emit_bind_target(&derive("struct P { hosts: Vec<String> }")).expect("emits"));
-        // The list field folds through cursor.list::<String> and a List node schema.
-        assert!(s.contains(r#"__cursor.list::<String>("hosts")"#), "got: {s}");
-        assert!(s.contains("::leaf_core::NodeSchema::List(&::leaf_core::NodeSchema::Scalar)"), "got: {s}");
+        assert!(
+            s.contains(r#"(&&&::leaf_core::ConfigFieldTag::<Vec<String>>::new()).leaf_bind_field(__cursor,"hosts")"#),
+            "got: {s}"
+        );
+        // No spelled list/scalar/nested cursor method survives in the emitted fold.
+        assert!(!s.contains("__cursor.list::"), "no spelled cursor.list survives: {s}");
+        assert!(!s.contains("__cursor.scalar::"), "no spelled cursor.scalar survives: {s}");
     }
 
     #[test]
-    fn a_nested_struct_field_binds_through_nested() {
+    fn a_nested_struct_field_emits_the_same_uniform_tag() {
         let s = flat(&emit_bind_target(&derive("struct P { server: ServerProps }")).expect("emits"));
-        assert!(s.contains(r#"__cursor.nested::<ServerProps>("server")"#), "got: {s}");
-        // Its schema references the inner type's derived SCHEMA pointer.
-        assert!(s.contains("<ServerPropsas::leaf_core::BindTarget>::SCHEMA"), "got: {s}");
+        // Same uniform tag — the autoref ladder routes `ServerProps` (a BindTarget) to the
+        // nested rung at runtime; the codegen never spells `nested` or the SCHEMA path.
+        assert!(
+            s.contains(r#"(&&&::leaf_core::ConfigFieldTag::<ServerProps>::new()).leaf_bind_field(__cursor,"server")"#),
+            "got: {s}"
+        );
+        assert!(!s.contains("__cursor.nested::"), "no spelled cursor.nested survives: {s}");
     }
 
     #[test]

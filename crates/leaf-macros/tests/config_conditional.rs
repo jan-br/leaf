@@ -80,6 +80,65 @@ fn derive_bind_target_schema_is_an_object_of_the_fields() {
     }
 }
 
+// ── the cardinal-rule regression: an ALIASED field type binds identically ────────
+//
+// The `#[derive(BindTarget)]` codegen used to classify each field shape from its type's
+// SPELLED leading segment (`seg.ident == "Vec"`, an `is_scalar_ident` std-type NAME
+// set). A type ALIAS defeats a name classifier: `type Tags = Vec<String>;` reads as the
+// ident `Tags`, so the old codegen would have bound it as a NESTED object (the default
+// for an unrecognised name) rather than a repeated-key LIST. The type-driven autoref
+// ladder resolves the REAL `Vec<String>` regardless of the alias, so these bind exactly
+// as the un-aliased forms do.
+
+type Tags = Vec<String>; // a list alias (the dangerous case)
+type Hostname = String; // a re-exported scalar alias
+
+#[derive(Default, Debug, PartialEq, BindTarget)]
+struct AliasedProps {
+    tags: Tags,
+    name: Hostname,
+}
+
+#[test]
+fn an_aliased_vec_field_binds_as_a_repeated_key_list_not_a_nested_object() {
+    use leaf_core::{
+        Binder, CanonicalName, ConversionService, EnvBuilder, MapPropertySource, NoopBindHandler,
+        StackCps,
+    };
+    use std::sync::Arc;
+
+    let mut b = EnvBuilder::new();
+    b.add_last(Arc::new(MapPropertySource::from_pairs(
+        "test",
+        [
+            // The repeated-key list form (`a.tags[0]`, `a.tags[1]`) — only a LIST bind
+            // reads these; a nested-object misbind would leave `tags` empty.
+            ("a.tags[0]".to_string(), "red".to_string()),
+            ("a.tags[1]".to_string(), "green".to_string()),
+            ("a.name".to_string(), "leaf.dev".to_string()),
+        ],
+    )));
+    let cps = StackCps::new(b.seal_env());
+    let conv = ConversionService::new();
+    let h = NoopBindHandler;
+    let binder = Binder::new(&cps, &conv, &h);
+    let prefix = CanonicalName::parse("a").unwrap();
+
+    let bound = binder
+        .bind::<AliasedProps>(&prefix)
+        .bound()
+        .expect("the aliased bind target binds");
+    assert_eq!(
+        bound,
+        AliasedProps {
+            // The `type Tags = Vec<String>;` field bound as a repeated-key LIST…
+            tags: vec!["red".to_string(), "green".to_string()],
+            // …and the `type Hostname = String;` field bound as a scalar.
+            name: "leaf.dev".into(),
+        }
+    );
+}
+
 // ═══════════════════════ #[config_properties] ═══════════════════════════════
 
 #[derive(Default, Debug, PartialEq)]

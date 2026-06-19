@@ -53,17 +53,19 @@ use crate::rollback::should_rollback;
 /// — a NOTE in the crate docs.)
 pub type ReturnClassifier = fn(&leaf_core::ErasedRet) -> Option<LeafError>;
 
-/// A [`ReturnClassifier`] for a method returning `Result<T, LeafError>`: downcasts
-/// the erased return to `Result<T, LeafError>` and clones the `Err` payload (the
-/// business failure the rollback rules classify), or `None` on `Ok` / a type
-/// mismatch (which degrades to "treat as success", never a panic).
+/// A [`ReturnClassifier`] for a method whose WHOLE return type is `R` (a
+/// `Result<T, LeafError>`): projects the business `Err` through `R`'s sealed
+/// [`ReturnShape`](leaf_core::ReturnShape) impl, or `None` on `Ok` / a type mismatch
+/// (which degrades to "treat as success", never a panic).
+///
+/// Keyed on the WHOLE return type `R` — NOT the peeled `Ok` type — so the
+/// `#[transactional]` codegen never name-peels `Result` and a `type ApiResult<T> = …`
+/// alias classifies identically. A non-`Result` return fails the `R: ReturnShape` bound
+/// (a clear compile error), the right behaviour: the classifier is only meaningful for a
+/// `Result`-returning method.
 #[must_use]
-pub fn result_classifier<T: std::any::Any + Send>() -> ReturnClassifier {
-    |ret: &leaf_core::ErasedRet| -> Option<LeafError> {
-        ret.0
-            .downcast_ref::<Result<T, LeafError>>()
-            .and_then(|r| r.as_ref().err().cloned())
-    }
+pub fn result_classifier<R: leaf_core::ReturnShape>() -> ReturnClassifier {
+    <R as leaf_core::ReturnShape>::classify_business_err
 }
 
 /// The around-advice [`Interceptor`] that demarcates a transaction over the call.
@@ -447,7 +449,7 @@ mod tests {
         let mgr = Arc::new(InMemoryTransactionManager::new());
         let interceptor: Arc<dyn Interceptor> = Arc::new(
             TransactionInterceptor::new(mgr.clone(), TxAttribute::DEFAULT)
-                .with_return_classifier(result_classifier::<i64>()),
+                .with_return_classifier(result_classifier::<Result<i64, LeafError>>()),
         );
         let chain = AdviceChain::new(Box::new([interceptor]));
         let target = nop_target();
@@ -475,7 +477,7 @@ mod tests {
         let mgr = Arc::new(InMemoryTransactionManager::new());
         let interceptor: Arc<dyn Interceptor> = Arc::new(
             TransactionInterceptor::new(mgr.clone(), TxAttribute::DEFAULT)
-                .with_return_classifier(result_classifier::<i64>()),
+                .with_return_classifier(result_classifier::<Result<i64, LeafError>>()),
         );
         let chain = AdviceChain::new(Box::new([interceptor]));
         let target = nop_target();

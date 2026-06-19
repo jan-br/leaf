@@ -539,7 +539,10 @@ fn emit_transactional(
     let manager = args.manager.as_ref().ok_or_else(|| EmitError {
         message: "#[transactional] requires `manager = …`".into(),
     })?;
-    let ret = result_ok_ty(&sig.ret_type);
+    // The classifier is keyed on the WHOLE return type (bounded `ReturnShape`), NEVER the
+    // name-peeled `Ok` type — so a `type ApiResult<T> = Result<T, LeafError>;` alias
+    // classifies identically and a non-`Result` return is a clear compile error.
+    let ret = &sig.ret_type;
     let contract = unique_contract("leaf::tx::TransactionAdvisor", bean_ident, sig);
     let statics =
         pointcut_statics(self_ty, &types_ident, &pointcut_ident, quote! { ::leaf_tx::TxPointcut });
@@ -757,7 +760,10 @@ fn emit_retryable(
     let pointcut_ident = format_ident!("__LEAF_RETRY_POINTCUT_{}", base);
     let row_ident = format_ident!("__LEAF_RETRY_ADVISOR_{}", base);
     let max = args.max;
-    let ret = result_ok_ty(&sig.ret_type);
+    // Keyed on the WHOLE return type (bounded `ReturnShape`), NEVER the name-peeled `Ok`
+    // type — a `Result` alias classifies identically; a non-`Result` return is a compile
+    // error (the retry classifier is only meaningful for a `Result`-returning method).
+    let ret = &sig.ret_type;
     let backoff = lower_backoff(&args.backoff);
     let contract = unique_contract("leaf::resilience::RetryAdvisor", bean_ident, sig);
     let statics = pointcut_statics(
@@ -872,21 +878,6 @@ fn lower_backoff(backoff: &Backoff) -> TokenStream {
             )) as ::std::sync::Arc<dyn ::leaf_core::BackoffPolicy>
         },
     }
-}
-
-/// The `Ok` type of a `Result<T, E>` return (for the tx/retry classifier), or the
-/// whole type if it is not a `Result<…>` (the classifier degrades to "never classify
-/// a non-Result return" — the interceptor only uses it for a `Result`-returning method).
-fn result_ok_ty(ret: &Type) -> Type {
-    if let Type::Path(tp) = ret
-        && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "Result"
-        && let syn::PathArguments::AngleBracketed(ab) = &seg.arguments
-        && let Some(syn::GenericArgument::Type(ok)) = ab.args.first()
-    {
-        return ok.clone();
-    }
-    ret.clone()
 }
 
 // ─────────────────────── small attr-item parsing ────────────────────────────
@@ -1200,10 +1191,13 @@ mod tests {
             s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::ADVISOR_PAIRINGS)]"),
             "got: {s}"
         );
-        // The named manager + the `Result<i64,_>` Ok-type classifier ride the builder,
-        // at the pinned TX_ORDER, with a per-method-unique contract.
+        // The named manager + the WHOLE-return-type classifier (NEVER a name-peeled Ok
+        // type) ride the builder, at the pinned TX_ORDER, with a per-method-unique
+        // contract. The classifier is keyed on the full `Result<i64, LeafError>`.
         assert!(
-            s.contains("::leaf_tx::make_transaction_interceptor_for::<LedgerTxManager,i64>"),
+            s.contains(
+                "::leaf_tx::make_transaction_interceptor_for::<LedgerTxManager,Result<i64,LeafError>>"
+            ),
             "got: {s}"
         );
         assert!(s.contains("order:::leaf_tx::tx_order_key()"), "got: {s}");
@@ -1244,9 +1238,10 @@ mod tests {
             )
             .expect("emits"),
         );
-        // The by-VIEW builder (no concrete manager generic), with only the return-T.
+        // The by-VIEW builder (no concrete manager generic), keyed on the WHOLE return
+        // type (never a name-peeled Ok type).
         assert!(
-            s.contains("::leaf_tx::make_transaction_interceptor_for_view::<i64>()"),
+            s.contains("::leaf_tx::make_transaction_interceptor_for_view::<Result<i64,LeafError>>()"),
             "the dyn-view manager rides the by-trait builder: {s}"
         );
         assert!(
@@ -1484,8 +1479,12 @@ mod tests {
         assert!(s.contains("::leaf_resilience::ResiliencePointcut::new"), "got: {s}");
         assert!(s.contains("::leaf_core::RetryPolicy::new(5u32)"), "got: {s}");
         assert!(s.contains("::leaf_resilience::NoBackoff"), "got: {s}");
-        // The `Result<i64,_>` Ok-type classifier so a business `Err` drives the retry.
-        assert!(s.contains("::leaf_resilience::result_classifier::<i64>()"), "got: {s}");
+        // The WHOLE-return-type classifier (NEVER a name-peeled Ok type) so a business
+        // `Err` drives the retry; keyed on the full `Result<i64, LeafError>`.
+        assert!(
+            s.contains("::leaf_resilience::result_classifier::<Result<i64,LeafError>>()"),
+            "got: {s}"
+        );
         assert!(s.contains("::leaf_resilience::retry_order_key()"), "got: {s}");
         // The emitted interceptor binds the PROCESS-DEFAULT reactive sleeper so a
         // timed backoff is REAL once a runtime sleeper is installed (it degrades to
@@ -1551,7 +1550,7 @@ mod tests {
         assert!(err.message.contains("gate"), "got: {}", err.message);
     }
 
-    // ── emit_concern dispatch + result-ok-ty helper ──────────────────────────────
+    // ── emit_concern dispatch + whole-return-type classifier (no name-peeling) ─────
 
     #[test]
     fn emit_concern_dispatches_to_the_right_concern() {
@@ -1567,10 +1566,37 @@ mod tests {
     }
 
     #[test]
-    fn result_ok_ty_unwraps_result_else_passes_through() {
-        let ok = result_ok_ty(&ty("Result<i64, E>"));
-        assert_eq!(quote! { #ok }.to_string(), "i64");
-        let passthrough = result_ok_ty(&ty("u32"));
-        assert_eq!(quote! { #passthrough }.to_string(), "u32");
+    fn tx_and_retry_classifiers_key_on_the_whole_return_type_never_the_peeled_ok() {
+        // The cardinal-rule regression at the codegen level: the tx + retry classifiers
+        // are keyed on the WHOLE `sig.ret_type` token (so a `type ApiResult<T> = …` alias
+        // — which a name-based Result peeler would mis-read — flows through
+        // unchanged), NEVER a name-peeled `Ok` type. An aliased return type is emitted
+        // VERBATIM (the alias resolves to the same `ReturnShape` impl at the use site).
+        let txs = flat(
+            &emit_transactional(
+                &parse_transactional(parse("manager = M")).unwrap(),
+                "S",
+                &ty("S"),
+                &sig("S::f", "ApiResult<i64>", None),
+            )
+            .expect("emits"),
+        );
+        assert!(
+            txs.contains("::leaf_tx::make_transaction_interceptor_for::<M,ApiResult<i64>>"),
+            "the tx classifier keys on the WHOLE (aliased) return type: {txs}"
+        );
+        let rty = flat(
+            &emit_retryable(
+                &parse_retryable(parse("max = 2")).unwrap(),
+                "S",
+                &ty("S"),
+                &sig("S::f", "ApiResult<i64>", None),
+            )
+            .expect("emits"),
+        );
+        assert!(
+            rty.contains("::leaf_resilience::result_classifier::<ApiResult<i64>>()"),
+            "the retry classifier keys on the WHOLE (aliased) return type: {rty}"
+        );
     }
 }
