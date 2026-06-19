@@ -20,7 +20,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -62,6 +62,10 @@ impl WebServer for HyperServer {
         let addr = format!("{}:{}", props.host, props.port);
         let listener = TcpListener::bind(&addr).await.map_err(|e| bind_error(&addr, &e))?;
 
+        // The request-body cap (bytes) copied out of `props` so each `'static` connection
+        // task owns it — the edge enforces it BEFORE the whole body is buffered.
+        let max_body = props.max_request_body_bytes;
+
         loop {
             // Accept the next connection. An accept error is transient (per-connection,
             // e.g. a fd limit) — log-and-continue would need a logger; here we surface
@@ -76,7 +80,7 @@ impl WebServer for HyperServer {
                 let service = service_fn(move |hyper_req: hyper::Request<Incoming>| {
                     // Clone again per request so each request future owns its handle.
                     let req_dispatcher = Arc::clone(&conn_dispatcher);
-                    async move { serve_one(req_dispatcher, hyper_req).await }
+                    async move { serve_one(req_dispatcher, hyper_req, max_body).await }
                 });
 
                 // hyper-util's auto builder negotiates HTTP/1 (and HTTP/2 if enabled) on
@@ -93,25 +97,57 @@ impl WebServer for HyperServer {
 /// Handle one hyper request end to end at the boundary: convert in → dispatch →
 /// convert out. The dispatcher never errors out, so this is `Infallible` (every failure
 /// is already a [`Response`]).
+///
+/// `max_body` caps the buffered request body at the edge: if the incoming body exceeds
+/// it, we SHORT-CIRCUIT with a `413 Payload Too Large` and never reach the dispatcher —
+/// the oversize body is never materialized wholesale, so it cannot exhaust memory.
 async fn serve_one(
     dispatcher: Arc<Dispatcher>,
     hyper_req: hyper::Request<Incoming>,
+    max_body: usize,
 ) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
-    let leaf_req = to_leaf_request(hyper_req).await;
-    let leaf_resp = dispatcher.dispatch(leaf_req).await;
-    Ok(to_hyper_response(leaf_resp))
+    match to_leaf_request(hyper_req, max_body).await {
+        Ok(leaf_req) => Ok(to_hyper_response(dispatcher.dispatch(leaf_req).await)),
+        // The body blew the cap before it was buffered: emit 413 at the edge.
+        Err(BodyEdgeError::TooLarge) => {
+            Ok(to_hyper_response(Response::new(http::StatusCode::PAYLOAD_TOO_LARGE)))
+        }
+    }
+}
+
+/// An edge failure that PRECEDES dispatch (it bounds an allocation the dispatcher would
+/// otherwise be forced to make). The only variant today is the body-size overflow that
+/// maps to `413`.
+enum BodyEdgeError {
+    /// The request body exceeded the configured `max_request_body_bytes` cap.
+    TooLarge,
 }
 
 /// Convert a hyper `Request<Incoming>` into a leaf [`Request`], collecting the streamed
 /// body into [`Bytes`] at the edge (the leaf abstraction is body-eager: the whole body
 /// is materialized before dispatch).
-async fn to_leaf_request(hyper_req: hyper::Request<Incoming>) -> Request {
+///
+/// The body is wrapped in [`http_body_util::Limited`] so collection ABORTS once more than
+/// `max_body` bytes have arrived — the cap is enforced as the body streams in, before the
+/// whole thing is buffered. A `Limited` overflow yields [`BodyEdgeError::TooLarge`] (→ a
+/// 413 at the caller); any OTHER body-read failure (a truncated/aborted client body)
+/// degrades to an empty body rather than poisoning the request — the handler/extractor
+/// then sees no bytes and can map that to a 4xx via the advice chain.
+async fn to_leaf_request(
+    hyper_req: hyper::Request<Incoming>,
+    max_body: usize,
+) -> Result<Request, BodyEdgeError> {
     let (parts, body) = hyper_req.into_parts();
-    // A body-read failure (a truncated/aborted client body) degrades to an empty body
-    // rather than poisoning the request — the handler/extractor then sees no bytes and
-    // can map that to a 4xx via the advice chain.
-    let bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-    Request::new(parts.method, parts.uri, parts.headers, bytes)
+    let bytes = match Limited::new(body, max_body).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        // `Limited` boxes a `LengthLimitError` on overflow; distinguish it from a generic
+        // read failure so an oversize body becomes a 413 (not a silently empty body).
+        Err(err) if err.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+            return Err(BodyEdgeError::TooLarge);
+        }
+        Err(_) => Bytes::new(),
+    };
+    Ok(Request::new(parts.method, parts.uri, parts.headers, bytes))
 }
 
 /// Convert a leaf [`Response`] into a hyper `Response<Full<Bytes>>`, copying the status,

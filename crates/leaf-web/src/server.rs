@@ -44,12 +44,23 @@ pub struct ServerProperties {
     /// The bind port (`leaf.web.server.port`; `0` = an ephemeral OS-assigned port, used
     /// by tests).
     pub port: u16,
+    /// The maximum request body size, in bytes, the server will buffer
+    /// (`leaf.web.server.max-request-body-bytes`). A request whose body exceeds this cap
+    /// is rejected with `413 Payload Too Large` at the transport edge BEFORE the whole
+    /// body is materialized, so an oversize (or unbounded) body can never exhaust memory.
+    /// Defaults to 2 MiB. This is a transport-neutral policy knob: it bounds an
+    /// allocation the abstraction layer mandates, naming no backend.
+    pub max_request_body_bytes: usize,
 }
 
 impl Default for ServerProperties {
-    /// `127.0.0.1:8080` — a safe local default.
+    /// `127.0.0.1:8080` with a 2 MiB request-body cap — safe local defaults.
     fn default() -> Self {
-        ServerProperties { host: "127.0.0.1".to_string(), port: 8080 }
+        ServerProperties {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            max_request_body_bytes: 2 * 1024 * 1024,
+        }
     }
 }
 
@@ -448,6 +459,44 @@ mod tests {
         let props = ServerProperties::default();
         assert_eq!(props.host, "127.0.0.1");
         assert_eq!(props.port, 8080);
+        // The body-size cap defaults to 2 MiB — a sane ceiling that protects against an
+        // unbounded body allocation (OOM/DoS) while comfortably fitting ordinary JSON.
+        assert_eq!(props.max_request_body_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_request_body_bytes_binds_from_config_like_host_and_port() {
+        // The cap is a plain `#[config_properties]` field, so it binds from the
+        // `leaf.web.server.*` namespace exactly like host/port (kebab key →
+        // snake_case field), proving it is operator-configurable.
+        use leaf_core::{
+            Binder, CanonicalName, ConversionService, EnvBuilder, MapPropertySource,
+            NoopBindHandler, StackCps,
+        };
+        use std::sync::Arc;
+
+        let mut b = EnvBuilder::new();
+        b.add_last(Arc::new(MapPropertySource::from_pairs(
+            "test",
+            [
+                ("leaf.web.server.host".to_string(), "0.0.0.0".to_string()),
+                ("leaf.web.server.port".to_string(), "9090".to_string()),
+                ("leaf.web.server.max-request-body-bytes".to_string(), "4096".to_string()),
+            ],
+        )));
+        let cps = StackCps::new(b.seal_env());
+        let conv = ConversionService::new();
+        let h = NoopBindHandler;
+        let binder = Binder::new(&cps, &conv, &h);
+        let prefix = CanonicalName::parse("leaf.web.server").unwrap();
+
+        let bound = binder
+            .bind::<ServerProperties>(&prefix)
+            .bound()
+            .expect("ServerProperties binds from the env");
+        assert_eq!(bound.host, "0.0.0.0");
+        assert_eq!(bound.port, 9090);
+        assert_eq!(bound.max_request_body_bytes, 4096);
     }
 
     #[test]

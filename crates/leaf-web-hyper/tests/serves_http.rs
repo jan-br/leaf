@@ -132,7 +132,7 @@ async fn hyper_server_serves_real_http_through_the_dispatcher() {
     // Bind the server on a free ephemeral port; serve in a background task (serve runs
     // until shutdown, so it must not block the test).
     let port = free_port();
-    let props = ServerProperties { host: "127.0.0.1".to_string(), port };
+    let props = ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() };
     let server = Arc::new(HyperServer::new());
 
     let serve_server = server.clone();
@@ -177,6 +177,51 @@ async fn hyper_server_serves_real_http_through_the_dispatcher() {
     assert_eq!(seen, vec!["/ping", "/boom", "/echo", "/nope"]);
 
     // Tear the background server task down (it serves until shutdown otherwise).
+    serving.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversize_request_body_is_413_within_limit_succeeds() {
+    // The hyper backend caps the buffered request body at `max_request_body_bytes`
+    // (enforced at the transport edge, before the whole body is materialized): a body
+    // OVER the cap is rejected with `413 Payload Too Large` without ever allocating it
+    // wholesale; a body WITHIN the cap still round-trips through the dispatcher.
+    let routes: Vec<Arc<dyn Route>> =
+        vec![Arc::new(FakeRoute { method: Method::POST, path: "/echo", handler: FakeHandler::Echo })];
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![]));
+
+    // A deliberately tiny cap so the test never allocates megabytes.
+    let limit = 16usize;
+    let port = free_port();
+    let props = ServerProperties {
+        host: "127.0.0.1".to_string(),
+        port,
+        max_request_body_bytes: limit,
+    };
+    let server = Arc::new(HyperServer::new());
+
+    let serve_server = server.clone();
+    let serve_dispatcher = dispatcher.clone();
+    let serve_props = props.clone();
+    let serving =
+        tokio::spawn(async move { serve_server.serve(serve_dispatcher, &serve_props).await });
+
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    wait_until_up(port).await;
+
+    // Within the cap (8 <= 16): the body round-trips → 200.
+    let small = "a".repeat(8);
+    let resp =
+        client.post(format!("{base}/echo")).body(small.clone()).send().await.expect("small POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.expect("small echo"), small);
+
+    // Over the cap (64 > 16): rejected with 413 — no panic, no silent truncation.
+    let big = "b".repeat(64);
+    let resp = client.post(format!("{base}/echo")).body(big).send().await.expect("big POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
     serving.abort();
 }
 
