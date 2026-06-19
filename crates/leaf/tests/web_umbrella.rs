@@ -25,11 +25,16 @@
 // need. This is a SOURCE alias of the existing `leaf` dep, NOT a new Cargo dependency.
 extern crate leaf as leaf_web;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use leaf::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// The process-wide counter the [`AccessLog`] filter advances on every request and the
+/// `GET /_filter_count` probe reads back — observable demo state so the test can PROVE the
+/// around-advice ran end-to-end over real HTTP (not just a bare TCP connect).
+static FILTER_COUNT: AtomicI64 = AtomicI64::new(0);
 
 // ─────────────────────────── the user's web beans ───────────────────────────
 //
@@ -83,25 +88,32 @@ impl Catalog {
         let Path(sku) = sku;
         Ok(ProductDto { name: format!("Touched {sku}"), sku, price_cents: 0 })
     }
+
+    /// `GET /_filter_count` — a plaintext probe exposing the access-log filter's counter,
+    /// so the test can PROVE the `WebFilter` around-advice ran on every request.
+    #[get("/_filter_count")]
+    async fn filter_count(&self) -> Result<i64, LeafError> {
+        Ok(FILTER_COUNT.load(Ordering::SeqCst))
+    }
 }
 
-/// A `#[component]` `WebFilter` reached through the prelude's `WebFilter`/`Next` re-exports
-/// + `#[async_impl]` desugaring — proving the extension-bean surface flows through the
-/// umbrella too. `#[injectable]` publishes the `dyn WebFilter` view the server collects.
-#[component]
+/// A `#[web_filter]` `WebFilter` reached through the prelude's `web_filter`/`WebFilter`/
+/// `Next` re-exports + `#[async_impl]` desugaring — proving the extension-bean surface
+/// flows through the umbrella too. `#[web_filter]` is the one-annotation stereotype: a
+/// `#[component]` that ALSO publishes the `dyn ::leaf_web::WebFilter` view the server
+/// collects (no hand-rolled marker-trait + wrong-view registration). It counts every
+/// request so the test can assert the around-advice ran end-to-end.
+#[web_filter]
+#[derive(Default)]
 struct AccessLog;
-
-#[injectable]
-trait MarkAccessLog: WebFilter {}
 
 #[async_impl]
 impl WebFilter for AccessLog {
     async fn filter(&self, req: Request, next: Next<'_>) -> Result<Response, LeafError> {
+        FILTER_COUNT.fetch_add(1, Ordering::SeqCst);
         next.run(req).await
     }
 }
-
-impl MarkAccessLog for AccessLog {}
 
 /// A `#[control_advice]` mapping a `LeafError` to a `Response` — the global error seam,
 /// reached as a prelude macro; its generated `impl ::leaf_web::ControlAdvice` resolves
@@ -141,9 +153,7 @@ fn free_port() -> u16 {
 }
 
 /// Poll a raw TCP connect until the embedded server is accepting connections (the runner
-/// binds asynchronously inside the boot task). A bare connect — not an HTTP request — so
-/// the readiness probe never reaches the dispatcher; it just proves the bundle wired +
-/// the FALLBACK backend bound the port.
+/// binds asynchronously inside the boot task).
 async fn wait_until_up(port: u16) -> bool {
     for _ in 0..400 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
@@ -152,6 +162,29 @@ async fn wait_until_up(port: u16) -> bool {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     false
+}
+
+/// A minimal HTTP/1.1 `GET` over a raw `TcpStream` — the umbrella's `leaf` dependency set
+/// stays HTTP-client-free (no `reqwest`), so the proof speaks the wire protocol directly.
+/// Returns `(status_line, body)`; reads to EOF (the server closes the connection per the
+/// `Connection: close` request).
+async fn http_get(port: u16, path: &str) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream =
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect to the server");
+    let req =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.expect("write the request");
+    stream.flush().await.expect("flush the request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read the response");
+    let text = String::from_utf8_lossy(&raw).into_owned();
+
+    let status = text.lines().next().unwrap_or_default().to_string();
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    (status, body)
 }
 
 /// The blessed web path BOOTS + SERVES, umbrella-only: enabling `web` pulls the curated
@@ -198,7 +231,22 @@ async fn the_umbrella_web_stack_boots_and_serves_through_the_facade() {
          assembled the dispatcher + the FALLBACK hyper backend served"
     );
 
-    // The handle keeps the boot thread alive; dropping it leaves the server parked on the
-    // accept loop, torn down when the test process exits.
-    let _keep_alive: Arc<()> = Arc::new(());
+    // A REAL HTTP request through the dispatcher: `GET /products/COFFEE` resolves the
+    // rest-controller route + serializes the DTO — proving the wired stack serves, not just
+    // that the port is bound.
+    let (status, body) = http_get(port, "/products/COFFEE").await;
+    assert!(status.contains("200"), "a mapped route is 200, got status line {status:?}");
+    assert!(body.contains("\"sku\":\"COFFEE\""), "the DTO serialized, got body {body:?}");
+
+    // The `#[web_filter]` around-advice ran on that request: probe the filter's counter
+    // endpoint and assert it advanced. This is the END-TO-END proof the filter is actually
+    // collected as `dyn WebFilter` and invoked — the bare-TCP-connect probe never could.
+    let (status, body) = http_get(port, "/_filter_count").await;
+    assert!(status.contains("200"), "the probe route is 200, got status line {status:?}");
+    let count: i64 = body.trim().parse().expect("the filter count is a number");
+    assert!(
+        count >= 2,
+        "the access-log WebFilter ran on every request (>=2: the COFFEE GET + this probe), \
+         got {count}"
+    );
 }
