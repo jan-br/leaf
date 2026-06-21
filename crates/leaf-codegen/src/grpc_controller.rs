@@ -220,22 +220,36 @@ fn emit_grpc_route_bean(
 }
 
 /// The CALL-SHAPE dispatch expression: wrap the typed user method with the framing/codec
-/// adapter selected by the method's gRPC shape (unary/server/client/bidi). Stage 4 lowers
-/// UNARY here; 4.3 fills the streaming arms. The shape is read from the Stage-3 descriptor
-/// seam (the `.shape` field of the const the compiler folds), never from the textual type of
-/// the parameter/return.
+/// adapter selected by the method's gRPC shape (unary/server/client/bidi). The macro reads
+/// the shape from the Stage-3 descriptor seam (a `const` the macro NAMES, never a type
+/// check): the emitted `match` lets the COMPILER pick the wrapper from the const shape, so
+/// the macro inspects NO type. All four arms are present; the const-folded `match` keeps one.
 fn shape_dispatch(descriptor_path: &TokenStream, method_ident: &syn::Ident) -> TokenStream {
-    // The typed invocation: `__controller.get(__msg).await` — referenced by method name, on
-    // the injected controller Ref. The wrapper supplies `__msg` (the decoded T) and consumes
-    // the method's returned future.
+    // The typed invocation, referenced by method name on the injected controller Ref. The
+    // wrapper supplies `__msg` (T for unary/server-stream, Streaming<T> for client-stream/bidi)
+    // and consumes the method's returned future. ONE invocation form serves all four shapes —
+    // the wrapper differs, not the call.
     let invoke = quote! { __controller.#method_ident(__msg).await };
-    // UNARY: the `call_unary` wrapper de-frames + decodes the single request `T`, calls the
-    // typed method, encodes the single `U`, frames it + the grpc-status trailers. Selected by
-    // the descriptor-seam shape (4.3 makes this a four-arm `match` on `#descriptor_path.shape`),
-    // NOT a type check.
-    let _ = descriptor_path;
+    // The shape is the descriptor const's `.shape` field (the `MethodDescriptor` const the
+    // macro names, never a type check): the emitted `match` lets the COMPILER pick the wrapper
+    // from the const shape, so the macro inspects NO type. All four arms are present; the
+    // const-folded `match` keeps one. The wrapper closures are monomorphized per generated
+    // method so each sees the concrete `T`/`U`.
     quote! {
-        ::leaf_grpc::call_unary(__req, __codec, |__msg| async move { #invoke }).await
+        match #descriptor_path.shape {
+            ::leaf_grpc::CallShape::Unary => {
+                ::leaf_grpc::call_unary(__req, __codec, |__msg| async move { #invoke }).await
+            }
+            ::leaf_grpc::CallShape::ServerStream => {
+                ::leaf_grpc::call_server_stream(__req, __codec, |__msg| async move { #invoke }).await
+            }
+            ::leaf_grpc::CallShape::ClientStream => {
+                ::leaf_grpc::call_client_stream(__req, __codec, |__msg| async move { #invoke }).await
+            }
+            ::leaf_grpc::CallShape::Bidi => {
+                ::leaf_grpc::call_bidi(__req, __codec, |__msg| async move { #invoke }).await
+            }
+        }
     }
 }
 
@@ -404,5 +418,62 @@ mod tests {
         );
         // The controller method is invoked inside the wrapper (by NAME, on the injected Ref).
         assert!(s.contains(".get(") && s.contains(".await"), "invokes the controller method: {s}");
+    }
+
+    #[test]
+    fn a_server_stream_rpc_wraps_through_call_server_stream() {
+        // Server-stream: `async fn list(&self, req: ListReq) -> Result<Streaming<Product>, Status>`.
+        // The shape is read from the Stage-3 descriptor seam (a const the macro names), so the
+        // codegen wraps through `call_server_stream` — never inferred from the `Streaming<U>`
+        // RETURN type (no type-name detection).
+        let item = impl_item(
+            r#"impl catalog::Catalog for CatalogController {
+                async fn list(&self, req: ListReq) -> Result<Streaming<Product>, Status> { todo!() }
+            }"#,
+        );
+        let ts = expand_grpc_controller_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("::leaf_grpc::call_server_stream("),
+            "a server-stream method wraps through call_server_stream: {s}"
+        );
+        assert!(s.contains(".list(") && s.contains(".await"), "invokes the controller method: {s}");
+    }
+
+    #[test]
+    fn a_client_stream_rpc_wraps_through_call_client_stream() {
+        // Client-stream: `async fn upload(&self, reqs: Streaming<Chunk>) -> Result<Summary, Status>`.
+        // The wrapper de-frames the inbound stream into a `Streaming<T>` and hands it to the
+        // method; the shape is read from the descriptor seam, never from the `Streaming<T>` PARAM type.
+        let item = impl_item(
+            r#"impl catalog::Catalog for CatalogController {
+                async fn upload(&self, reqs: Streaming<Chunk>) -> Result<Summary, Status> { todo!() }
+            }"#,
+        );
+        let ts = expand_grpc_controller_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("::leaf_grpc::call_client_stream("),
+            "a client-stream method wraps through call_client_stream: {s}"
+        );
+    }
+
+    #[test]
+    fn a_bidi_rpc_wraps_through_call_bidi() {
+        // Bidi: `async fn chat(&self, reqs: Streaming<Msg>) -> Result<Streaming<Msg>, Status>`.
+        let item = impl_item(
+            r#"impl catalog::Catalog for CatalogController {
+                async fn chat(&self, reqs: Streaming<Msg>) -> Result<Streaming<Msg>, Status> { todo!() }
+            }"#,
+        );
+        let ts = expand_grpc_controller_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("::leaf_grpc::call_bidi("),
+            "a bidi method wraps through call_bidi: {s}"
+        );
     }
 }
