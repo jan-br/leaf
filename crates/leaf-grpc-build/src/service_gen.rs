@@ -191,6 +191,43 @@ pub fn render_service(svc: &ServiceSpec) -> String {
     out
 }
 
+/// Map a `prost_build::Service` to a [`ServiceSpec`]. The call shape comes ONLY from
+/// each method's `client_streaming`/`server_streaming` flags (the FileDescriptorSet) —
+/// never from a textual type name. `input_type`/`output_type` are prost's already-
+/// resolved Rust paths, emitted verbatim.
+#[must_use]
+pub fn spec_from_service(svc: &::prost_build::Service) -> ServiceSpec {
+    ServiceSpec {
+        name: svc.name.clone(),
+        package: svc.package.clone(),
+        methods: svc
+            .methods
+            .iter()
+            .map(|m| MethodSpec {
+                name: m.proto_name.clone(),
+                fn_name: m.name.clone(),
+                input: m.input_type.clone(),
+                output: m.output_type.clone(),
+                shape: CallShape::from_flags(m.client_streaming, m.server_streaming),
+            })
+            .collect(),
+    }
+}
+
+/// The leaf `prost_build::ServiceGenerator`: for each gRPC service prost-build
+/// encounters, append the rendered leaf server trait + path/descriptor module to the
+/// output buffer (beside the message structs prost emits).
+#[derive(Default)]
+pub struct LeafServiceGenerator;
+
+impl ::prost_build::ServiceGenerator for LeafServiceGenerator {
+    fn generate(&mut self, service: ::prost_build::Service, buf: &mut String) {
+        buf.push('\n');
+        buf.push_str(&render_service(&spec_from_service(&service)));
+        buf.push('\n');
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +373,48 @@ mod tests {
         assert!(flat.contains(r#"pubconstCHAT_PATH:&str="/echo.v1.Echo/Chat""#), "path const: {flat}");
         assert!(flat.contains("GET_DESCRIPTOR:::leaf_grpc::MethodDescriptor"), "descriptor: {flat}");
         assert!(flat.contains("shape:::leaf_grpc::CallShape::Bidi"), "bidi descriptor: {flat}");
+    }
+
+    fn pb_method(name: &str, cs: bool, ss: bool) -> ::prost_build::Method {
+        ::prost_build::Method {
+            name: name.to_ascii_lowercase(),
+            proto_name: name.to_string(),
+            comments: ::prost_build::Comments {
+                leading_detached: vec![],
+                leading: vec![],
+                trailing: vec![],
+            },
+            input_type: format!("super::{name}Req"),
+            output_type: format!("super::{name}Resp"),
+            input_proto_type: format!(".echo.v1.{name}Req"),
+            output_proto_type: format!(".echo.v1.{name}Resp"),
+            options: ::prost_types::MethodOptions::default(),
+            client_streaming: cs,
+            server_streaming: ss,
+        }
+    }
+
+    #[test]
+    fn maps_a_prost_service_to_a_spec_using_only_streaming_flags() {
+        let svc = ::prost_build::Service {
+            name: "Echo".into(),
+            proto_name: "Echo".into(),
+            package: "echo.v1".into(),
+            comments: ::prost_build::Comments {
+                leading_detached: vec![],
+                leading: vec![],
+                trailing: vec![],
+            },
+            methods: vec![pb_method("Get", false, false), pb_method("Chat", true, true)],
+            options: ::prost_types::ServiceOptions::default(),
+        };
+        let spec = spec_from_service(&svc);
+        assert_eq!(spec.name, "Echo");
+        assert_eq!(spec.package, "echo.v1");
+        assert_eq!(spec.methods[0].shape, CallShape::Unary);
+        assert_eq!(spec.methods[0].fn_name, "get");
+        assert_eq!(spec.methods[0].input, "super::GetReq");
+        assert_eq!(spec.methods[1].shape, CallShape::Bidi);
+        assert_eq!(spec.methods[1].name, "Chat");
     }
 }
