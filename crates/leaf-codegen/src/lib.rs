@@ -60,6 +60,7 @@ pub mod config_impl;
 pub mod constfold;
 pub mod descriptor;
 pub mod forcelink;
+pub mod grpc_controller;
 pub mod holder;
 pub mod listener;
 pub mod parsers;
