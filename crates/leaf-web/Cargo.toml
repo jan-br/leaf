@@ -20,6 +20,12 @@ leaf-macros.workspace = true
 http.workspace = true
 # The body carrier — a cheaply-cloneable byte buffer at the request/response edge.
 bytes.workspace = true
+# The `Stream` trait + combinators (`StreamExt::next`) the streaming `Body::Stream`
+# carries and `Body::collect` drains. `futures` is the SAME backend-free streaming
+# standard `leaf_core::BoxStream` is built on (the streaming analogue of `BoxFuture`) —
+# NOT an HTTP server (hyper/tower/axum stay in leaf-web-hyper); it is the value-layer
+# stream vocabulary, exactly like `bytes`/`http` are the byte/HTTP value vocabularies.
+futures.workspace = true
 # The object-safety boundary for `HttpMessageConverter`: it lets a converter be a
 # `dyn` bean (serialize `&dyn erased_serde::Serialize`, yield a `dyn Deserializer`)
 # with no generic method on the trait object. NOT a serde adoption into the abstraction
@@ -51,8 +57,6 @@ serde_urlencoded.workspace = true
 testing = []
 
 [dev-dependencies]
-# A minimal `block_on` to drive the async filter chain in unit tests — no runtime.
-futures.workspace = true
 # The DI-assembly proof (`tests/dispatch_through_mock.rs`): leaf-boot's cold-pass
 # `App::from_slices` lifts the test's macro-emitted `#[component]`/`#[bean]` seeds,
 # freezes an engine, and the test resolves `Vec<Ref<dyn Route>>`/`WebFilter`/

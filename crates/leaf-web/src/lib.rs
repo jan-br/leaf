@@ -66,6 +66,7 @@
 #![warn(missing_docs)]
 
 pub mod advice;
+pub mod body;
 pub mod content;
 pub mod embedded;
 pub mod extract;
@@ -99,6 +100,7 @@ leaf_core::declare_source!("leaf-web");
 pub use http;
 
 pub use advice::ControlAdvice;
+pub use body::{Body, Frame};
 pub use content::HttpMessageConverter;
 pub use extract::{
     ExtractCtx, Extension, FromRequest, FromRequestParts, Header, Json, Path, Query,
