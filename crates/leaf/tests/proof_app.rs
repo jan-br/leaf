@@ -24,9 +24,9 @@ use leaf::prelude::*;
 
 // ─────────────────────────── the user's app beans ───────────────────────────
 //
-// These back the base-path boot proof, which is gated off under the `web` capability
-// (the bundle's blocking `WebServerRunner` makes `run()` not return — see the test's cfg),
-// so the beans themselves are `not(feature = "web")`-gated to stay dead-code-clean there.
+// These back the base-path boot proof, gated off under the `web` capability so the beans
+// stay dead-code-clean there (the web blessed-path boot proof lives in
+// `tests/web_umbrella.rs`); they are `not(feature = "web")`-gated to that end.
 
 /// A `@Component` repository constructed via `Repository::new()` (the
 /// no-injected-collaborator `register_component!` form) — the dependency target.
@@ -66,12 +66,11 @@ struct AppProps {
 
 // ─────────────────────────────── the milestone ───────────────────────────────
 
-// This base-path proof boots to Ready and expects `run()` to RETURN so it can assert +
-// shut down. With the `web` capability on, the bundle's `WebServerRunner` fires and BLOCKS
-// on the embedded-server accept loop (the Spring `WebServer` model — `run()` does not
-// return), so this non-web boot proof is gated off under `web`; the web blessed-path boot
-// proof lives in `tests/web_umbrella.rs` (it runs the blocking serve on a dedicated thread
-// + probes the socket). The non-boot force-link/manifest seam test below stays unconditional.
+// This base-path proof boots to Ready, asserts the graph/config/availability, then shuts
+// down. It is gated to `not(feature = "web")` purely so the base-path beans above stay
+// dead-code-clean under the web capability; the web blessed-path boot + serve + drain proof
+// lives in `tests/web_umbrella.rs`. The non-boot force-link/manifest seam test below stays
+// unconditional.
 #[cfg(not(feature = "web"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_umbrella_runs_a_real_app_from_the_prelude_alone() {

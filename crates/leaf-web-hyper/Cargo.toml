@@ -23,7 +23,10 @@ leaf-macros.workspace = true
 # adapters + the protocol-negotiating connection builder), http-body-util to
 # collect/emit a full body, bytes for the body carrier.
 hyper = { workspace = true, features = ["server", "http1"] }
-hyper-util = { workspace = true, features = ["server", "server-auto", "tokio", "http1"] }
+# `server-graceful` adds hyper-util's `GracefulShutdown` connection tracker — the drain
+# half of the embedded-server lifecycle: it signals every watched connection to finish and
+# awaits them (bounded by the grace budget) when the shutdown signal fires.
+hyper-util = { workspace = true, features = ["server", "server-auto", "server-graceful", "tokio", "http1"] }
 http-body-util.workspace = true
 bytes.workspace = true
 # The neutral HTTP value vocabulary (StatusCode for the bare-500 fallback). The leaf
@@ -31,9 +34,10 @@ bytes.workspace = true
 # for the fallback path.
 http.workspace = true
 # The raw tokio runtime primitives the backend binds/accepts on: the TcpListener + the
-# per-connection task spawn run on the leaf-tokio executor's ambient runtime. (leaf-tokio
-# owns the FACILITY; the transport edge needs the bare net/rt API here.)
-tokio = { workspace = true, features = ["rt", "net"] }
+# per-connection task spawn run on the leaf-tokio executor's ambient runtime, plus `time`
+# for the grace-bounded `tokio::time::timeout` around the graceful drain. (leaf-tokio owns
+# the FACILITY; the transport edge needs the bare net/rt/time API here.)
+tokio = { workspace = true, features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 # The integration test (`tests/serves_http.rs`) boots a real `HyperServer` on an
@@ -43,12 +47,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 reqwest = { workspace = true, default-features = false }
 futures.workspace = true
 http.workspace = true
-# The Task-12 auto-config proof (`tests/auto_config_server.rs`) boots a REAL leaf app:
+# The auto-config proof (`tests/auto_config_server.rs`) boots a REAL leaf app IN-PROCESS:
 # leaf-boot's run pipeline auto-collects the `#[auto_config]` FALLBACK `dyn WebServer`
-# (this crate) + the leaf-web `WebServerRunner` + a `#[rest_controller]`, and the runner
-# assembles the `Dispatcher` from the container + serves — proving the endpoint responds
-# over real HTTP. leaf-tokio supplies the run-pipeline spawner; leaf-serde's JSON
-# converter serializes the controller return; leaf-macros writes the controller.
+# (this crate) + the leaf-web `EmbeddedWebServer` `#[keep_alive]` + a `#[rest_controller]`,
+# spawns the keep-alive's `serve` onto the lifecycle machinery, and the endpoint responds
+# over real HTTP — plus the lifecycle proofs (AcceptingTraffic-while-serving, a plain
+# `#[runner]` not starved, clean drain). leaf-tokio supplies the run-pipeline spawner +
+# drain-sleeper; leaf-serde's JSON converter serializes the controller return.
 leaf-boot.workspace = true
 leaf-tokio.workspace = true
 leaf-serde.workspace = true

@@ -50,8 +50,9 @@ leaf-tx.workspace = true
 # The default-runtime entry driver (`leaf::run_main`, the `#[leaf::main]` body)
 # builds the multi-thread tokio runtime the binary owns + drives the run pipeline on
 # it — so the umbrella names tokio directly (the executor the bootstrap bridge wires
-# leaf-tokio's facility onto). Only the runtime builder is used here.
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+# leaf-tokio's facility onto). `time` backs the reactive drain-sleeper the bootstrap
+# wires (`tokio::time::sleep`) so the graceful-drain join is grace-bounded in production.
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 
 # The optional starters, dep-hidden behind the capability features above.
 leaf-starter-redis = { workspace = true, optional = true }

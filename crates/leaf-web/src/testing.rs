@@ -50,16 +50,26 @@ impl MockServer {
 }
 
 impl WebServer for MockServer {
-    /// "Serve" is a no-op for the in-memory backend: there is no socket to bind. It
-    /// captures (ignores) the dispatcher/props and returns immediately, so a test can
-    /// exercise the [`WebServer`] contract; real request driving goes through
-    /// [`handle`](MockServer::handle).
-    fn serve<'a>(
-        &'a self,
+    /// "Serve" is socket-free for the in-memory backend, but it still honours the
+    /// [`KeepAlive`](leaf_core::KeepAlive) lifecycle contract the embedded server drives:
+    /// latch readiness via [`ctx.on_ready`](leaf_core::LifecycleCtx::on_ready) ("I am now
+    /// serving"), PARK on [`ctx.shutdown`](leaf_core::LifecycleCtx) until shutdown is
+    /// requested, then resolve `Ok` (a mock has no real socket to drain). This mirrors a
+    /// real backend's bind → ready → park → drain shape with no transport; real request
+    /// driving still goes through [`handle`](MockServer::handle).
+    fn serve(
+        &self,
         _dispatcher: Arc<Dispatcher>,
-        _props: &'a ServerProperties,
-    ) -> BoxFuture<'a, Result<(), LeafError>> {
-        Box::pin(async { Ok(()) })
+        _props: Arc<ServerProperties>,
+        ctx: leaf_core::LifecycleCtx,
+    ) -> BoxFuture<'static, Result<(), LeafError>> {
+        Box::pin(async move {
+            // We are "serving" the instant this future runs (no socket to bind), so latch
+            // readiness immediately, then park on the reactive shutdown signal.
+            (ctx.on_ready)();
+            ctx.shutdown.quiesce().await;
+            Ok(())
+        })
     }
 }
 

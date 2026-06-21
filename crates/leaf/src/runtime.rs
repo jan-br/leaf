@@ -76,6 +76,13 @@ pub fn bootstrap(name: &'static str) -> Application {
         // KeepAlive, so the signal is observed only by a programmatic shutdown — no
         // behavior change.
         .with_shutdown_trigger(Arc::new(leaf_tokio::TokioShutdownTrigger::new()))
+        // The reactive drain-sleeper: a tokio-timer `sleep(d)` future the teardown drain
+        // races the started KeepAlive (the embedded web server) handles against, so the
+        // graceful-drain join is BOUNDED by the `ShutdownSettings.grace` budget in
+        // production — a too-slow straggler is aborted past the budget instead of hanging
+        // teardown. Without it the join would drain unbounded. NEVER a busy-poll (parks on
+        // the tokio timer wheel).
+        .with_drain_sleeper(|d| Box::pin(::tokio::time::sleep(d)))
         // Feed the LIVE anti-DCE self-check the force-linked participating set the
         // enabled capability features know (`leaf::expected_manifest()`): each
         // capability crate `declare_source!`s its SourceTag, so a force-linked-but-

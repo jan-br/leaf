@@ -48,6 +48,14 @@ use crate::validate::{ConfigBean, ConfigPairing, ValidationInputs};
 type PlanResolver = Arc<dyn Fn(leaf_core::BeanId) -> LifecyclePlan + Send + Sync>;
 type InjectionResolver = Arc<dyn Fn(leaf_core::BeanId) -> InjectionPlan + Send + Sync>;
 
+/// The runtime-supplied reactive deadline-sleep the teardown drain races the KeepAlive +
+/// detached-task handles against (a `sleep(d)` future). A closure (NOT a new trait dep) so
+/// leaf-boot stays runtime-agnostic: the tokio bootstrap wires `tokio::time::sleep`; an
+/// absent sleeper => an UNBOUNDED clean drain (the grace budget is honored as an upper
+/// bound only when a sleeper backs it). The future parks on a timer — NEVER a busy-poll.
+type DrainSleeper =
+    Arc<dyn Fn(std::time::Duration) -> leaf_core::BoxFuture<'static, ()> + Send + Sync>;
+
 /// A macro-emitted runner UPCAST thunk: downcast a resolved [`ErasedBean`] (the
 /// origin-agnostic `Arc<dyn Any>` the registry's `dyn Runner` candidate view yields,
 /// whose declared upcast is the identity re-erase) to the concrete runner type and
@@ -294,6 +302,7 @@ pub struct Application {
     inj_of: InjectionResolver,
     spawner: Option<Arc<dyn Spawner>>,
     shutdown_trigger: Option<Arc<dyn leaf_core::ShutdownTrigger>>,
+    drain_sleeper: Option<DrainSleeper>,
     scheduler: Option<Arc<dyn SchedulerCore>>,
     cron_factory: Option<CronTriggerFactory>,
     analyzers: Vec<Box<dyn FailureAnalyzer>>,
@@ -330,6 +339,7 @@ impl Application {
             inj_of: Arc::new(|_| InjectionPlan::EMPTY),
             spawner: None,
             shutdown_trigger: None,
+            drain_sleeper: None,
             scheduler: None,
             cron_factory: None,
             analyzers: Vec::new(),
@@ -518,6 +528,21 @@ impl Application {
     #[must_use]
     pub fn with_shutdown_trigger(mut self, trigger: Arc<dyn leaf_core::ShutdownTrigger>) -> Self {
         self.shutdown_trigger = Some(trigger);
+        self
+    }
+
+    /// The runtime-supplied reactive deadline-sleep the teardown drain races the started
+    /// [`KeepAlive`](leaf_core::KeepAlive) handles (and the detached async-event tasks)
+    /// against — threaded into the [`RunUnit`] so the grace-bounded graceful-drain join is
+    /// ACTIVE in production. The tokio bootstrap wires `tokio::time::sleep`; with NO sleeper
+    /// the join is an UNBOUNDED clean drain (the grace budget is an upper bound only when a
+    /// sleeper backs it). The future parks on a timer — NEVER a busy-poll.
+    #[must_use]
+    pub fn with_drain_sleeper(
+        mut self,
+        sleeper: impl Fn(std::time::Duration) -> leaf_core::BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        self.drain_sleeper = Some(Arc::new(sleeper));
         self
     }
 
@@ -910,6 +935,12 @@ impl Application {
 
         if let Some(spawner) = self.spawner.as_ref() {
             unit = unit.with_spawner(Arc::clone(spawner));
+        }
+        // Thread the reactive drain-sleeper so the grace-bounded KeepAlive + detached-task
+        // join is ACTIVE in production (a `RunUnit` with no sleeper drains unbounded).
+        if let Some(sleeper) = self.drain_sleeper.as_ref() {
+            let sleeper = Arc::clone(sleeper);
+            unit = unit.with_drain_sleeper(move |d| sleeper(d));
         }
         if let Some(scheduler) = self.scheduler.as_ref() {
             unit = unit.with_scheduler(Arc::clone(scheduler));

@@ -26,7 +26,7 @@
 //! `#[conditional]` guard with its `GUARD_PAIRINGS` and `CONDITIONS` anchors — all keyed on
 //! the ONE contributed contract (`module_path!()::web_server`). The holder is a managed
 //! `#[component]` (the `&self` receiver the `#[bean]` method reads — singleton-correct), and
-//! the [`WebServerRunner`](leaf_web::WebServerRunner) injects the resolved
+//! the [`EmbeddedWebServer`](leaf_web::EmbeddedWebServer) injects the resolved
 //! `Ref<dyn WebServer>` and serves on it.
 
 use leaf_core::{CondExpr, ContractId, Descriptor, ProviderSeed};

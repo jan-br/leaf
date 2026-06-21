@@ -628,6 +628,40 @@ pub fn expand_web_filter_struct(
     descriptor::emit(&input)
 }
 
+/// Lower a `#[keep_alive] struct EmbeddedServer { .. }` to its `#[component]`-equivalent
+/// bean registration PLUS the `dyn ::leaf_core::KeepAlive` `provides[]` view (so leaf-boot
+/// collects this bean by the `dyn KeepAlive` contract and SPAWNS its long-running
+/// `start(ctx)` onto the lifecycle machinery). Structurally a plain `#[component]` whose
+/// ONLY extra is that one declared view — the SAME `provides`-a-view shape `#[runner]`
+/// (`dyn Runner`) and `#[web_filter]` (`dyn WebFilter`) use. The user supplies the
+/// behaviour separately as `impl ::leaf_core::KeepAlive for EmbeddedServer`.
+///
+/// # Errors
+/// [`EmitError`] (→ `compile_error!`) on a generic struct (the stereotype shared rule) or
+/// a malformed field/attr.
+pub fn expand_keep_alive_struct(
+    item: &ItemStruct,
+    attr: TokenStream,
+) -> Result<TokenStream, EmitError> {
+    let args = stereotype::parse_args(attr)?;
+    let mut input = stereotype::struct_input(
+        item,
+        Stereotype::Component,
+        args.name,
+        args.role,
+        args.scope,
+        args.constructor,
+    )?;
+    // Declare the KeepAlive upcast view so leaf-boot collects this bean by the
+    // `dyn ::leaf_core::KeepAlive` contract (the one place a keep-alive differs from a
+    // plain component) — the SAME provides[] machinery `#[runner]`/`#[web_filter]` use.
+    // It is a leaf-CORE view (not leaf-web): the lifecycle trait lives in leaf-core, so
+    // the embedded server publishes it through `::leaf_core::` directly (an absolute path
+    // resolvable from any crate, including the umbrella facade).
+    input.provides.push(ServiceView { dyn_ty: parse_type("dyn ::leaf_core::KeepAlive")? });
+    descriptor::emit(&input)
+}
+
 /// Lower a `#[control_advice] impl Errors { #[exception_handler] fn .. }` block to ONE
 /// generated `impl ::leaf_web::ControlAdvice for Errors` whose `handle` delegates to the
 /// `#[exception_handler]` method(s) — tried in declaration order, first `Some` wins.
@@ -1258,5 +1292,56 @@ mod tests {
         let attr: TokenStream = syn::parse_str(r#"name = "accessLog""#).expect("tokens");
         let s = flat(&expand_web_filter_struct(&struct_item("struct AccessLog;"), attr).expect("emits"));
         assert!(s.contains(r#"Some("accessLog")"#), "an explicit name flows through: {s}");
+    }
+
+    // ── #[keep_alive] STRUCT stereotype (Stage 2) ──
+
+    #[test]
+    fn a_keep_alive_struct_provides_the_dyn_keep_alive_view() {
+        // `#[keep_alive] struct EmbeddedServer;` is a `#[component]`-equivalent bean that
+        // ALSO `provides` the `dyn ::leaf_core::KeepAlive` view (so leaf-boot collects it
+        // by that contract and spawns its long-running `start`) — the SAME `provides`-a-view
+        // shape `#[runner]`/`#[web_filter]` use. The view is leaf-CORE, not leaf-web.
+        let ts = expand_keep_alive_struct(&struct_item("struct EmbeddedServer;"), TokenStream::new())
+            .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        // It rides the COMPONENTS channel (a plain `#[component]`-equivalent bean), NOT the
+        // RUNNER_PAIRINGS channel — the embedded server is OFF the runner stream by design.
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "the keep-alive bean is a COMPONENTS row: {s}"
+        );
+        assert!(
+            !s.contains("RUNNER_PAIRINGS"),
+            "a #[keep_alive] bean is NOT a #[runner] — it must not emit a runner pairing: {s}"
+        );
+        // It declares the `dyn ::leaf_core::KeepAlive` provides[] view.
+        assert!(
+            s.contains("::core::any::TypeId::of::<dyn::leaf_core::KeepAlive>()"),
+            "the keep-alive bean must declare the `dyn ::leaf_core::KeepAlive` view: {s}"
+        );
+    }
+
+    #[test]
+    fn a_keep_alive_struct_field_injects_its_collaborators() {
+        // `#[keep_alive]` is structurally a `#[component]`: its fields are injection points
+        // routed through `Injectable` (trait dispatch), exactly like the embedded server's
+        // injected backend/routes/filters/advice/props.
+        let ts = expand_keep_alive_struct(
+            &struct_item("struct EmbeddedServer { server: leaf_core::Ref<Backend> }"),
+            TokenStream::new(),
+        )
+        .expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        assert!(
+            s.contains("<leaf_core::Ref<Backend>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "a `#[keep_alive]` field is field-injected via the Injectable trait: {s}"
+        );
+        assert!(
+            s.contains("::core::any::TypeId::of::<dyn::leaf_core::KeepAlive>()"),
+            "and still provides the `dyn KeepAlive` view: {s}"
+        );
     }
 }

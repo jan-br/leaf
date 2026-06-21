@@ -25,7 +25,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use leaf_core::{Cause, ErrorKind, LeafError};
+use hyper_util::server::graceful::GracefulShutdown;
+use leaf_core::{Cause, ErrorKind, LeafError, LifecycleCtx};
 use leaf_web::server::{Dispatcher, ServerProperties, WebServer};
 use leaf_web::{Request, Response};
 use tokio::net::TcpListener;
@@ -34,9 +35,9 @@ use tokio::net::TcpListener;
 ///
 /// Stateless (a unit type): the routing table, filters, and advice live in the
 /// [`Dispatcher`] handed to [`serve`](HyperServer::serve), which the container
-/// assembles by collection + by-trait injection (the `WebServerRunner`, Task 12).
+/// assembles by collection + by-trait injection (the `EmbeddedWebServer` keep-alive bean).
 /// Construct with [`HyperServer::new`]; resolve it as the FALLBACK `dyn WebServer`
-/// auto-config bean in production (Task 12).
+/// auto-config bean in production.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HyperServer;
 
@@ -49,48 +50,90 @@ impl HyperServer {
     }
 }
 
-#[leaf_macros::async_impl]
 impl WebServer for HyperServer {
-    /// Bind per `props` and serve requests through `dispatcher` until the task is
-    /// dropped/aborted (it runs the accept loop forever; shutdown is the runtime
-    /// tearing the task down).
-    async fn serve(
+    /// Bind per `props`, latch readiness via [`ctx.on_ready`](LifecycleCtx) once the socket
+    /// is accepting, then run a SELECT-driven accept loop that breaks on
+    /// [`ctx.shutdown`](LifecycleCtx) and DRAINS the in-flight connections (bounded by
+    /// [`ctx.grace`](LifecycleCtx)) via [`GracefulShutdown`].
+    ///
+    /// The returned future is `'static`: it owns the dispatcher, the `Arc<ServerProperties>`,
+    /// and the `ctx`, borrowing nothing of `&self` (a `HyperServer` is a stateless `Copy`
+    /// unit). `tokio::select!`/`tokio::time` are fine HERE — this IS the backend.
+    fn serve(
         &self,
         dispatcher: Arc<Dispatcher>,
-        props: &ServerProperties,
-    ) -> Result<(), LeafError> {
-        let addr = format!("{}:{}", props.host, props.port);
-        let listener = TcpListener::bind(&addr).await.map_err(|e| bind_error(&addr, &e))?;
+        props: Arc<ServerProperties>,
+        ctx: LifecycleCtx,
+    ) -> leaf_core::BoxFuture<'static, Result<(), LeafError>> {
+        Box::pin(async move {
+            let addr = format!("{}:{}", props.host, props.port);
+            let listener = TcpListener::bind(&addr).await.map_err(|e| bind_error(&addr, &e))?;
 
-        // The request-body cap (bytes) copied out of `props` so each `'static` connection
-        // task owns it — the edge enforces it BEFORE the whole body is buffered.
-        let max_body = props.max_request_body_bytes;
+            // The socket is bound and about to accept: LATCH READINESS now (this is what
+            // flips availability to AcceptingTraffic WHILE we serve, not merely when spawned).
+            (ctx.on_ready)();
 
-        loop {
-            // Accept the next connection. An accept error is transient (per-connection,
-            // e.g. a fd limit) — log-and-continue would need a logger; here we surface
-            // it as a serve-level error only if the listener itself is broken.
-            let (stream, _peer) = listener.accept().await.map_err(|e| accept_error(&e))?;
-            let io = TokioIo::new(stream);
+            // The request-body cap (bytes) copied out of `props` so each `'static` connection
+            // task owns it — the edge enforces it BEFORE the whole body is buffered.
+            let max_body = props.max_request_body_bytes;
 
-            // Each connection gets its own clone of the shared dispatcher (an Arc bump)
-            // so the spawned service closure is `'static`.
-            let conn_dispatcher = Arc::clone(&dispatcher);
-            tokio::spawn(async move {
-                let service = service_fn(move |hyper_req: hyper::Request<Incoming>| {
-                    // Clone again per request so each request future owns its handle.
-                    let req_dispatcher = Arc::clone(&conn_dispatcher);
-                    async move { serve_one(req_dispatcher, hyper_req, max_body).await }
-                });
+            // Track every in-flight connection so the drain can wait them out gracefully.
+            let graceful = GracefulShutdown::new();
 
-                // hyper-util's auto builder negotiates HTTP/1 (and HTTP/2 if enabled) on
-                // the leaf-tokio executor; a connection error is per-connection and does
-                // not bring the server down.
-                let _ = ConnBuilder::new(TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await;
-            });
-        }
+            loop {
+                tokio::select! {
+                    // A new connection arrived: serve it, tracked by the graceful watcher.
+                    accepted = listener.accept() => {
+                        let (stream, _peer) = match accepted {
+                            Ok(conn) => conn,
+                            // A transient per-connection accept error (e.g. an fd limit):
+                            // skip it and keep serving rather than tearing the server down.
+                            Err(_e) => continue,
+                        };
+                        let io = TokioIo::new(stream);
+
+                        // Each connection gets its own clone of the shared dispatcher (an Arc
+                        // bump) so the spawned service closure is `'static`.
+                        let conn_dispatcher = Arc::clone(&dispatcher);
+                        let service = service_fn(move |hyper_req: hyper::Request<Incoming>| {
+                            // Clone again per request so each request future owns its handle.
+                            let req_dispatcher = Arc::clone(&conn_dispatcher);
+                            async move { serve_one(req_dispatcher, hyper_req, max_body).await }
+                        });
+
+                        // hyper-util's auto builder negotiates HTTP/1 (and HTTP/2 if enabled)
+                        // on the leaf-tokio executor; WATCH the connection so the graceful
+                        // drain can signal + await it. `serve_connection` borrows the builder,
+                        // so bind it to a local; `into_owned()` then detaches the connection
+                        // from that borrow so the spawned task is `'static`.
+                        let builder = ConnBuilder::new(TokioExecutor::new());
+                        let conn = builder.serve_connection(io, service);
+                        let watched = graceful.watch(conn.into_owned());
+                        tokio::spawn(async move {
+                            // A connection error is per-connection and does not bring the
+                            // server down.
+                            let _ = watched.await;
+                        });
+                    }
+                    // Shutdown requested: stop accepting and break to the drain. Dropping the
+                    // listener here refuses any NEW connection that arrives during the drain.
+                    () = ctx.shutdown.quiesce() => break,
+                }
+            }
+
+            // Stop accepting (refuse new connections), then DRAIN the in-flight ones:
+            // `graceful.shutdown()` signals every watched connection to finish and awaits
+            // them, BOUNDED by `ctx.grace` (a too-slow straggler is aborted past the budget;
+            // an unbounded grace drains cleanly).
+            drop(listener);
+            match ctx.grace {
+                Some(d) => {
+                    let _ = tokio::time::timeout(d, graceful.shutdown()).await;
+                }
+                None => graceful.shutdown().await,
+            }
+            Ok(())
+        })
     }
 }
 
@@ -172,14 +215,10 @@ fn to_hyper_response(leaf_resp: Response) -> hyper::Response<Full<Bytes>> {
         })
 }
 
-/// The transport-edge bind failure (e.g. the port is in use) as a [`LeafError`].
+/// The transport-edge bind failure (e.g. the port is in use) as a [`LeafError`]. A bind
+/// failure is the ONE fatal serve-level fault (the address is unusable); a per-connection
+/// accept error, by contrast, is transient and skipped in the loop (we keep serving).
 fn bind_error(addr: &str, err: &std::io::Error) -> LeafError {
     LeafError::new(ErrorKind::ConstructionFailed)
         .caused_by(Cause::plain("binding the web server", format!("{addr}: {err}")))
-}
-
-/// A fatal accept-loop failure (the listener itself is broken) as a [`LeafError`].
-fn accept_error(err: &std::io::Error) -> LeafError {
-    LeafError::new(ErrorKind::ConstructionFailed)
-        .caused_by(Cause::plain("accepting a web connection", err.to_string()))
 }

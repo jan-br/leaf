@@ -67,12 +67,12 @@
 
 pub mod advice;
 pub mod content;
+pub mod embedded;
 pub mod extract;
 pub mod filter;
 pub mod handler;
 pub mod request;
 pub mod response;
-pub mod runner;
 pub mod server;
 
 // The in-memory `MockServer` backend (the Stage-1 pluggability proof). A TEST harness,
@@ -107,9 +107,9 @@ pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{
     Handler, PathParams, Route, RouteMatch, RouteOutcome, RouteReport, RouteTable,
 };
+pub use embedded::EmbeddedWebServer;
 pub use request::Request;
 pub use response::{IntoResponse, IntoResponseWith, Response, ResponseEntity};
-pub use runner::WebServerRunner;
 pub use server::{Dispatcher, ServerProperties, WebServer};
 
 #[cfg(any(test, feature = "testing"))]

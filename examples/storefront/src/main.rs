@@ -9,7 +9,8 @@
 //! Like a Spring `main`, this does NOTHING but hand off to the framework — all work runs
 //! in beans. The demo (place an order, print a summary) lives in `platform::StartupRunner`
 //! (leaf's `Runner` = Spring's `ApplicationRunner`), which fires in the readiness window.
-//! With `web`, the auto-configured `WebServerRunner` then serves the REST endpoints.
+//! With `web`, the auto-configured `EmbeddedWebServer` `#[keep_alive]` then serves the REST
+//! endpoints on a spawned lifecycle task while `#[leaf::main]` parks until shutdown.
 
 // Link the storefront library's bean rows into this binary: a binary-only crate's
 // `linkme` rows would not otherwise reach a sibling integration test's link graph, so the
@@ -19,9 +20,10 @@ use storefront as _;
 
 /// `#[leaf::main]` bootstraps + runs the app to Ready (the graph wires, config binds,
 /// auto-configs participate, the runners fire). With the `web` feature the
-/// `WebServerRunner` then blocks serving the REST endpoints; without it, the app drains a
-/// clean shutdown after the startup runner. The body is empty: the application's behaviour
-/// lives in its beans, not in `main`.
+/// `EmbeddedWebServer` `#[keep_alive]` serves the REST endpoints on a spawned lifecycle
+/// task and `run_main` PARKS until shutdown; without it, `park_until_shutdown` is an
+/// immediate no-op and the app drains a clean shutdown after the startup runner. The body
+/// is empty: the application's behaviour lives in its beans, not in `main`.
 #[leaf::main]
 async fn main() -> Result<(), leaf::LeafError> {
     Ok(())

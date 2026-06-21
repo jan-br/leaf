@@ -16,7 +16,7 @@
 //! — an `#[auto_config]` `FALLBACK` row gated by `OnMissingBean(dyn WebServer)`, so simply
 //! linking this crate makes an app serve, while a different backend (or a user `WebServer`)
 //! supersedes it by providing the same `dyn ::leaf_web::WebServer` view. The leaf-web
-//! [`WebServerRunner`](leaf_web::WebServerRunner) injects whichever server won and serves.
+//! [`EmbeddedWebServer`](leaf_web::EmbeddedWebServer) injects whichever server won and serves.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

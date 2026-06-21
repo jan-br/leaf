@@ -6,9 +6,10 @@
 //! from the container and serves.
 //!
 //! This boots the WHOLE storefront app (the same `leaf::bootstrap` entry `#[leaf::main]`
-//! drives) on a dedicated OS thread — the `WebServerRunner` BLOCKS on `serve` (the Spring
-//! `WebServer` model), so `run()` never returns; we probe the live socket from the test
-//! thread with a real `reqwest` HTTP client.
+//! drives) IN-PROCESS on the test's tokio runtime — the embedded server is now a
+//! `#[keep_alive]` that SERVES on a spawned lifecycle task, so `run()` RETURNS once Ready;
+//! we hold the live `RunningApp`, probe the socket with a real `reqwest` HTTP client, then
+//! trigger a graceful shutdown and assert clean teardown.
 //!
 //! It proves, over real HTTP:
 //!   1. `GET /products/COFFEE` → 200 JSON `{sku,name,price_cents}` resolved via
@@ -46,8 +47,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Poll a raw TCP connect until the embedded server is accepting connections (the runner
-/// binds asynchronously inside the boot task).
+/// Poll a raw TCP connect until the embedded server is accepting connections (the keep-alive
+/// binds asynchronously on its spawned lifecycle task).
 async fn wait_until_up(port: u16) {
     for _ in 0..400 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
@@ -58,32 +59,25 @@ async fn wait_until_up(port: u16) {
     panic!("the storefront web server never came up");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_storefront_serves_its_domain_over_real_http() {
     let port = free_port();
 
-    // Boot the whole storefront on a dedicated OS thread with its own runtime: the
-    // `WebServerRunner` blocks on `serve`, so `run()` does not return; we probe the live
-    // socket from the test thread. The umbrella's `web`-gated force-link pins the bundle.
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("build the boot runtime");
-        rt.block_on(async move {
-            let _running = leaf::bootstrap("storefront")
-                .run(
-                    leaf::RunInputs::new()
-                        .with_args([
-                            format!("--leaf.web.server.port={port}"),
-                            "--app.name=storefront".to_string(),
-                        ])
-                        .into(),
-                    leaf::boot::RunOverlay::none(),
-                )
-                .await;
-        });
-    });
+    // Boot the whole storefront IN-PROCESS on the test's runtime: the embedded server is a
+    // `#[keep_alive]` that serves on a spawned task, so `run()` returns once Ready and we
+    // hold the live app. The umbrella's `web`-gated force-link pins the bundle.
+    let running = leaf::bootstrap("storefront")
+        .run(
+            leaf::RunInputs::new()
+                .with_args([
+                    format!("--leaf.web.server.port={port}"),
+                    "--app.name=storefront".to_string(),
+                ])
+                .into(),
+            leaf::boot::RunOverlay::none(),
+        )
+        .await
+        .expect("the storefront boots to Ready");
 
     wait_until_up(port).await;
 
@@ -137,4 +131,13 @@ async fn the_storefront_serves_its_domain_over_real_http() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let count: i64 = resp.text().await.expect("count body").trim().parse().expect("a number");
     assert!(count >= 3, "the access-log filter ran on every request (>=3 so far), got {count}");
+
+    // Trigger graceful shutdown (fires the run unit's shutdown signal → the embedded server
+    // keep-alive drains) and assert clean teardown to Closed.
+    let report = running.shutdown().await;
+    assert_eq!(
+        report.run_state,
+        leaf::core::RunState::Closed,
+        "the storefront drained + tore down cleanly"
+    );
 }

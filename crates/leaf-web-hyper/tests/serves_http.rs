@@ -56,11 +56,13 @@ impl Route for FakeRoute {
     }
 }
 
-/// `Ping` → 200 "pong"; `Boom` → an `Err`; `Echo` → echoes the request body.
+/// `Ping` → 200 "pong"; `Boom` → an `Err`; `Echo` → echoes the request body; `Slow(d)`
+/// sleeps `d` before answering 200 "slow" (the in-flight-drain straggler).
 enum FakeHandler {
     Ping,
     Boom,
     Echo,
+    Slow(std::time::Duration),
 }
 
 impl Handler for FakeHandler {
@@ -73,6 +75,10 @@ impl Handler for FakeHandler {
                 }
                 FakeHandler::Echo => {
                     Ok(Response::ok().with_body(Bytes::copy_from_slice(req.body_bytes())))
+                }
+                FakeHandler::Slow(d) => {
+                    tokio::time::sleep(*d).await;
+                    Ok(Response::ok().with_body(Bytes::from_static(b"slow")))
                 }
             }
         })
@@ -129,17 +135,24 @@ async fn hyper_server_serves_real_http_through_the_dispatcher() {
 
     let dispatcher = Arc::new(Dispatcher::new(routes, filters, advice));
 
-    // Bind the server on a free ephemeral port; serve in a background task (serve runs
-    // until shutdown, so it must not block the test).
+    // Bind the server on a free ephemeral port; serve in a background task driven by the
+    // KeepAlive lifecycle ctx (bind → latch ready → park on shutdown → drain). serve runs
+    // until the shutdown signal fires, so it must not block the test.
     let port = free_port();
-    let props = ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() };
+    let props = Arc::new(ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() });
     let server = Arc::new(HyperServer::new());
 
+    let (signal, trigger) = leaf_core::shutdown_channel();
+    let ctx = leaf_core::LifecycleCtx {
+        shutdown: signal,
+        on_ready: Box::new(|| {}),
+        grace: None,
+    };
     let serve_server = server.clone();
     let serve_dispatcher = dispatcher.clone();
     let serve_props = props.clone();
     let serving = tokio::spawn(async move {
-        serve_server.serve(serve_dispatcher, &serve_props).await
+        serve_server.serve(serve_dispatcher, serve_props, ctx).await
     });
 
     // Wait for the listener to come up before the client connects. The probe is a raw
@@ -176,8 +189,11 @@ async fn hyper_server_serves_real_http_through_the_dispatcher() {
     let seen = log.lock().expect("log").clone();
     assert_eq!(seen, vec!["/ping", "/boom", "/echo", "/nope"]);
 
-    // Tear the background server task down (it serves until shutdown otherwise).
-    serving.abort();
+    // Trigger graceful shutdown and assert clean teardown: the serve future breaks its
+    // accept loop, drains the (now-idle) connections, and resolves Ok.
+    trigger.fire();
+    let outcome = serving.await.expect("serve task joins");
+    assert!(outcome.is_ok(), "the server drained and stopped cleanly: {outcome:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -193,18 +209,24 @@ async fn oversize_request_body_is_413_within_limit_succeeds() {
     // A deliberately tiny cap so the test never allocates megabytes.
     let limit = 16usize;
     let port = free_port();
-    let props = ServerProperties {
+    let props = Arc::new(ServerProperties {
         host: "127.0.0.1".to_string(),
         port,
         max_request_body_bytes: limit,
-    };
+    });
     let server = Arc::new(HyperServer::new());
 
+    let (signal, trigger) = leaf_core::shutdown_channel();
+    let ctx = leaf_core::LifecycleCtx {
+        shutdown: signal,
+        on_ready: Box::new(|| {}),
+        grace: None,
+    };
     let serve_server = server.clone();
     let serve_dispatcher = dispatcher.clone();
     let serve_props = props.clone();
     let serving =
-        tokio::spawn(async move { serve_server.serve(serve_dispatcher, &serve_props).await });
+        tokio::spawn(async move { serve_server.serve(serve_dispatcher, serve_props, ctx).await });
 
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
@@ -222,7 +244,127 @@ async fn oversize_request_body_is_413_within_limit_succeeds() {
     let resp = client.post(format!("{base}/echo")).body(big).send().await.expect("big POST");
     assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 
-    serving.abort();
+    trigger.fire();
+    assert!(serving.await.expect("serve task joins").is_ok(), "clean drain after the 413 edge");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_in_flight_request_drains_while_a_new_connection_is_refused() {
+    // GRACEFUL DRAIN: a request already in flight when shutdown fires must COMPLETE (the
+    // graceful tracker waits it out), while a NEW connection arriving after the signal is
+    // refused (the accept loop has broken + the listener is dropped). An UNBOUNDED grace
+    // (None) drains the straggler cleanly.
+    let routes: Vec<Arc<dyn Route>> = vec![Arc::new(FakeRoute {
+        method: Method::GET,
+        path: "/slow",
+        handler: FakeHandler::Slow(std::time::Duration::from_millis(400)),
+    })];
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![]));
+
+    let port = free_port();
+    let props = Arc::new(ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() });
+    let server = Arc::new(HyperServer::new());
+
+    let (signal, trigger) = leaf_core::shutdown_channel();
+    let ctx = leaf_core::LifecycleCtx {
+        shutdown: signal,
+        on_ready: Box::new(|| {}),
+        grace: None, // unbounded: the in-flight straggler drains fully.
+    };
+    let serve_server = server.clone();
+    let serve_dispatcher = dispatcher.clone();
+    let serve_props = props.clone();
+    let serving =
+        tokio::spawn(async move { serve_server.serve(serve_dispatcher, serve_props, ctx).await });
+
+    let base = format!("http://127.0.0.1:{port}");
+    wait_until_up(port).await;
+
+    // Fire the slow request on its own task; give it a moment to actually reach the handler
+    // (so it is genuinely IN FLIGHT) before we trigger shutdown.
+    let in_flight = {
+        let url = format!("{base}/slow");
+        tokio::spawn(async move { reqwest::Client::new().get(url).send().await?.text().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Trigger shutdown WHILE the slow request is mid-flight.
+    trigger.fire();
+
+    // A NEW connection after the signal is refused (the listener is dropped on drain). Give
+    // the accept loop a beat to break first.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let refused =
+        tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+    assert!(refused.is_err(), "a new connection after shutdown is refused");
+
+    // The in-flight request COMPLETES (drained), not aborted.
+    let body = in_flight.await.expect("in-flight task joins").expect("in-flight request completes");
+    assert_eq!(body, "slow", "the in-flight request was drained to completion");
+
+    // The serve future resolves cleanly once the straggler drained.
+    assert!(serving.await.expect("serve joins").is_ok(), "clean drain");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_too_slow_straggler_is_aborted_past_the_grace_budget() {
+    // GRACE-BOUNDED DRAIN: with a finite `ctx.grace`, an in-flight request slower than the
+    // budget is ABORTED when the budget elapses (the `tokio::time::timeout` around the
+    // graceful shutdown fires), so teardown never hangs. The serve future still resolves Ok
+    // (a bounded drain that timed out is not a serve fault — it is the budget doing its job).
+    let routes: Vec<Arc<dyn Route>> = vec![Arc::new(FakeRoute {
+        method: Method::GET,
+        path: "/slow",
+        // Far slower than the grace budget below.
+        handler: FakeHandler::Slow(std::time::Duration::from_secs(10)),
+    })];
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![]));
+
+    let port = free_port();
+    let props = Arc::new(ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() });
+    let server = Arc::new(HyperServer::new());
+
+    let (signal, trigger) = leaf_core::shutdown_channel();
+    let ctx = leaf_core::LifecycleCtx {
+        shutdown: signal,
+        on_ready: Box::new(|| {}),
+        grace: Some(std::time::Duration::from_millis(150)), // bounded: abort the straggler.
+    };
+    let serve_server = server.clone();
+    let serve_dispatcher = dispatcher.clone();
+    let serve_props = props.clone();
+    let serving =
+        tokio::spawn(async move { serve_server.serve(serve_dispatcher, serve_props, ctx).await });
+
+    let base = format!("http://127.0.0.1:{port}");
+    wait_until_up(port).await;
+
+    let in_flight = {
+        let url = format!("{base}/slow");
+        tokio::spawn(async move { reqwest::Client::new().get(url).send().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    // Fire shutdown; the straggler (10s) far exceeds the 150ms budget, so the drain must
+    // give up well before the handler would finish.
+    let fired_at = std::time::Instant::now();
+    trigger.fire();
+
+    // The serve future resolves within (well under) the 10s handler — the grace budget
+    // aborted the drain. Bound the join generously to avoid flakiness on a loaded CI box.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), serving)
+        .await
+        .expect("serve resolves within the grace bound, NOT the 10s handler")
+        .expect("serve joins");
+    assert!(outcome.is_ok(), "a grace-bounded abort is not a serve fault: {outcome:?}");
+    assert!(
+        fired_at.elapsed() < std::time::Duration::from_secs(3),
+        "the straggler was aborted past the grace budget, not waited out"
+    );
+
+    // The aborted in-flight request never gets its full response (the connection was torn
+    // down past the budget) — it errors rather than returning "slow".
+    let _ = in_flight.await;
 }
 
 /// Poll a raw TCP connect until the server is accepting connections (the bind happens

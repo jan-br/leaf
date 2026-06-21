@@ -152,8 +152,8 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Poll a raw TCP connect until the embedded server is accepting connections (the runner
-/// binds asynchronously inside the boot task).
+/// Poll a raw TCP connect until the embedded server is accepting connections (the keep-alive
+/// binds asynchronously on its spawned lifecycle task).
 async fn wait_until_up(port: u16) -> bool {
     for _ in 0..400 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
@@ -194,40 +194,32 @@ async fn http_get(port: u16, path: &str) -> (String, String) {
 ///   (b) registers the `#[component]` filter + the `#[control_advice]`,
 ///   (c) wires the leaf-serde JSON converter (the `dyn HttpMessageConverter` the route
 ///       field-injects) + the leaf-web-hyper FALLBACK `dyn WebServer`,
-///   (d) fires the leaf-web `WebServerRunner`, which assembles the `Dispatcher` from the
-///       container + serves on the bound port —
+///   (d) collects the leaf-web `EmbeddedWebServer` `#[keep_alive]`, which assembles the
+///       `Dispatcher` from the container + serves on the bound port from a spawned task —
 /// with NO hand-wiring. The whole point: the macro-emitted `::leaf_web::` paths resolved
 /// through the umbrella facade alias, and the umbrella `web` feature pulled the real
 /// bundle (not the old placeholder).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_umbrella_web_stack_boots_and_serves_through_the_facade() {
     let port = free_port();
 
-    // Boot the WHOLE app on a DEDICATED OS thread with its own runtime: the
-    // `WebServerRunner` BLOCKS on `serve` (the Spring `WebServer` model), so
-    // `Application::run()` does not return; we run it on its own thread and probe the
-    // live socket from the test thread. The umbrella's own `web`-gated force-link pins
-    // the bundle rlibs onto the link graph (no `force_link!()` needed in a lib test).
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("build the boot runtime");
-        rt.block_on(async move {
-            let _running = leaf::bootstrap("web-umbrella")
-                .run(
-                    leaf::RunInputs::new()
-                        .with_args([format!("--leaf.web.server.port={port}")])
-                        .into(),
-                    leaf::boot::RunOverlay::none(),
-                )
-                .await;
-        });
-    });
+    // Boot the WHOLE app IN-PROCESS on the test's runtime: the embedded server is a
+    // `#[keep_alive]` that serves on a spawned lifecycle task, so `Application::run()`
+    // RETURNS once Ready and we hold the live app. The umbrella's own `web`-gated
+    // force-link pins the bundle rlibs onto the link graph (no `force_link!()` in a lib test).
+    let running = leaf::bootstrap("web-umbrella")
+        .run(
+            leaf::RunInputs::new()
+                .with_args([format!("--leaf.web.server.port={port}")])
+                .into(),
+            leaf::boot::RunOverlay::none(),
+        )
+        .await
+        .expect("the umbrella web app boots to Ready");
 
     assert!(
         wait_until_up(port).await,
-        "the umbrella-only web app bound the port — the bundle force-linked + the runner \
+        "the umbrella-only web app bound the port — the bundle force-linked + the keep-alive \
          assembled the dispatcher + the FALLBACK hyper backend served"
     );
 
@@ -248,5 +240,14 @@ async fn the_umbrella_web_stack_boots_and_serves_through_the_facade() {
         count >= 2,
         "the access-log WebFilter ran on every request (>=2: the COFFEE GET + this probe), \
          got {count}"
+    );
+
+    // Trigger graceful shutdown (fires the run unit's shutdown signal → the embedded server
+    // keep-alive drains) and assert clean teardown to Closed.
+    let report = running.shutdown().await;
+    assert_eq!(
+        report.run_state,
+        leaf::core::RunState::Closed,
+        "the umbrella web app drained + tore down cleanly"
     );
 }

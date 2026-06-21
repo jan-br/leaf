@@ -1416,6 +1416,35 @@ pub fn web_filter(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[keep_alive]` — a long-running `leaf_core::KeepAlive` lifecycle bean (Spring's
+/// `SmartLifecycle` analogue; the embedded web server is the canonical impl). Structurally
+/// a `#[component]` that ALSO declares it is injectable as `dyn ::leaf_core::KeepAlive` (the
+/// `provides[]` upcast leaf-boot collects + SPAWNS the lifecycle stream from) — the SAME
+/// `provides`-a-view shape `#[runner]` (`dyn Runner`) and `#[web_filter]` (`dyn WebFilter`)
+/// use. It is deliberately NOT a `#[runner]`: a keep-alive runs on the lifecycle machinery
+/// (bind → latch readiness → park on shutdown → drain), so it can never starve the runner
+/// stream. The user supplies the behaviour separately:
+///
+/// ```ignore
+/// #[keep_alive] struct EmbeddedServer { /* injected fields */ }
+/// impl leaf_core::KeepAlive for EmbeddedServer {
+///     fn start(&self, ctx: leaf_core::LifecycleCtx) -> BoxFuture<'static, Result<(), LeafError>> { .. }
+/// }
+/// ```
+///
+/// A generic keep-alive hard-errors with the `register_component!(Concrete)` hint.
+#[proc_macro_attribute]
+pub fn keep_alive(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as ItemStruct);
+    match leaf_codegen::web_controller::expand_keep_alive_struct(&parsed, attr.into()) {
+        Ok(rows) => quote! { #parsed #rows }.into(),
+        Err(err) => {
+            let error = compile_error(&err);
+            quote! { #parsed #error }.into()
+        }
+    }
+}
+
 /// `#[failure_analyzer]` — register a `leaf_core::FailureAnalyzer` impl into the
 /// frozen `FAILURE_ANALYZERS` slice (the error-model SPI reused — never a second
 /// analyzer trait). The user writes the `impl ::leaf_core::FailureAnalyzer for Ty`;

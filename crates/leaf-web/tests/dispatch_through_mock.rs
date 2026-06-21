@@ -264,14 +264,28 @@ fn the_web_layer_assembles_from_the_container_and_serves_with_no_hyper() {
 #[test]
 fn the_mock_server_is_a_real_web_server_bean_implementation() {
     // The MockServer implements the leaf `WebServer` trait — the SAME trait the hyper
-    // backend (Stage 3) implements — so a `dyn WebServer` can be either. This is the
-    // pluggability claim: serving runs to completion on the in-memory backend with no
-    // socket (its `serve` returns immediately after capturing the dispatcher).
+    // backend implements — so a `dyn WebServer` can be either. This is the pluggability
+    // claim: serving honours the KeepAlive lifecycle (latch readiness via `ctx.on_ready`,
+    // park on `ctx.shutdown`, drain) with no socket. We pre-fire the shutdown signal so the
+    // park resolves at once, then assert `serve` ran the full ready→park→drain shape.
+    use std::sync::atomic::{AtomicBool, Ordering};
     let dispatcher = Arc::new(assemble_dispatcher());
     let server = MockServer::new(dispatcher.clone());
     let as_dyn: &dyn leaf_web::WebServer = &server;
-    let props = leaf_web::ServerProperties::default();
-    block(as_dyn.serve(dispatcher, &props)).expect("the mock server 'serves' without a socket");
+    let props = Arc::new(leaf_web::ServerProperties::default());
+
+    let (signal, trigger) = leaf_core::shutdown_channel();
+    trigger.fire(); // already-fired ⇒ the serve future's `quiesce()` returns immediately.
+    let ready = Arc::new(AtomicBool::new(false));
+    let ready_flag = ready.clone();
+    let ctx = leaf_core::LifecycleCtx {
+        shutdown: signal,
+        on_ready: Box::new(move || ready_flag.store(true, Ordering::SeqCst)),
+        grace: None,
+    };
+    block(as_dyn.serve(dispatcher, props, ctx))
+        .expect("the mock server 'serves' (ready → park → drain) without a socket");
+    assert!(ready.load(Ordering::SeqCst), "serve latched readiness via ctx.on_ready");
 
     // And direct dispatch still works after a serve (the dispatcher is shared, not
     // consumed).

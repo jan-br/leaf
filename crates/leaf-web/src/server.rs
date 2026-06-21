@@ -14,8 +14,8 @@
 //! response.
 //!
 //! The dispatcher is assembled from the container: the routes, filters, and advice
-//! are `Vec<Ref<dyn _>>` resolved by collection + by-trait injection (Task 7 / the
-//! `WebServerRunner` in Stage 3) — no central registry.
+//! are `Vec<Ref<dyn _>>` resolved by collection + by-trait injection (the
+//! [`EmbeddedWebServer`](crate::EmbeddedWebServer) keep-alive bean) — no central registry.
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ use crate::{Request, Response};
 /// A `#[config_properties(prefix = "leaf.web.server")]` bean: the run pipeline binds
 /// `leaf.web.server.host` / `leaf.web.server.port` from the environment (CLI args / env /
 /// config files) purely from the macro-emitted bind thunk, auto-registers it (so it is
-/// resolvable as `Ref<ServerProperties>`), and the [`WebServerRunner`](crate::WebServerRunner)
+/// resolvable as `Ref<ServerProperties>`), and the [`EmbeddedWebServer`](crate::EmbeddedWebServer)
 /// injects it and hands it to [`WebServer::serve`]. The abstraction crate owns its shape;
 /// the unset default is `127.0.0.1:8080`.
 #[leaf_macros::config_properties(prefix = "leaf.web.server")]
@@ -70,26 +70,39 @@ impl Default for ServerProperties {
 /// abstraction is transport-agnostic.
 ///
 /// `serve` is dyn-dispatched and async → a [`BoxFuture`] at the `dyn` seam. It
-/// takes the shared [`Dispatcher`] (the request engine) plus the bound
-/// [`ServerProperties`]; it binds, accepts connections, and drives each request
-/// through `dispatcher.dispatch(..)`.
+/// takes the shared [`Dispatcher`] (the request engine), the OWNED
+/// [`ServerProperties`], and the [`LifecycleCtx`](leaf_core::LifecycleCtx) the
+/// embedded-server [`KeepAlive`](leaf_core::KeepAlive) hands it: it binds, calls
+/// [`ctx.on_ready`](leaf_core::LifecycleCtx::on_ready) once it is serving, accepts
+/// connections through `dispatcher.dispatch(..)`, parks on
+/// [`ctx.shutdown`](leaf_core::LifecycleCtx), then DRAINS (bounded by
+/// [`ctx.grace`](leaf_core::LifecycleCtx)) and resolves.
+///
+/// The signature is `'static` (owned `Arc<ServerProperties>` + a `'static` future,
+/// borrowing NOTHING of `&self` across an await) so the embedded-server
+/// [`KeepAlive::start`](leaf_core::KeepAlive::start) can spawn it. A backend clones
+/// what it needs out of `&self` before its `async move`. NOTHING here names a backend
+/// library — `serve` is the backend-free seam; the [`LifecycleCtx`](leaf_core::LifecycleCtx)
+/// it takes is a leaf-CORE type (the runtime-neutral shutdown signal), not a runtime.
 pub trait WebServer: Send + Sync {
-    /// Bind per `props` and serve requests through `dispatcher` until shutdown.
+    /// Bind per `props`, serve requests through `dispatcher`, latch readiness via
+    /// `ctx.on_ready`, then drain on `ctx.shutdown` (bounded by `ctx.grace`).
     ///
     /// # Errors
     ///
     /// Returns a [`LeafError`] if binding/serving fails at the transport edge
     /// (e.g. the port is in use).
-    fn serve<'a>(
-        &'a self,
+    fn serve(
+        &self,
         dispatcher: Arc<Dispatcher>,
-        props: &'a ServerProperties,
-    ) -> BoxFuture<'a, Result<(), LeafError>>;
+        props: Arc<ServerProperties>,
+        ctx: leaf_core::LifecycleCtx,
+    ) -> BoxFuture<'static, Result<(), LeafError>>;
 }
 
 // The by-trait-injection seam for the pluggable server (emitted once, beside the trait —
 // orphan-rule-OK, `dyn WebServer` is local). It makes `Ref<dyn WebServer>` injectable, so
-// the `WebServerRunner` resolves whichever `dyn WebServer` bean won (the FALLBACK hyper
+// the `EmbeddedWebServer` resolves whichever `dyn WebServer` bean won (the FALLBACK hyper
 // auto-config, or a user-provided backend that supersedes it via OnMissingBean) — the
 // same path `Ref<dyn CacheManager>` / `Ref<dyn TransactionManager>` use.
 leaf_core::impl_resolve_view!(dyn WebServer);

@@ -15,8 +15,9 @@
 //! This bundle is the leaf-web HTTP stack the web spec defines:
 //!
 //! - [`leaf_web`] — the backend-free web ABSTRACTIONS (`Request`/`Response`/
-//!   `WebServer`/`Handler`/`Route`/`WebFilter`/`HttpMessageConverter`/`ControlAdvice`
-//!   + the `WebServerRunner` that self-assembles the dispatcher from the container).
+//!   `WebServer`/`Handler`/`Route`/`WebFilter`/`HttpMessageConverter`/`ControlAdvice` +
+//!   the `EmbeddedWebServer` `#[keep_alive]` that self-assembles the dispatcher from the
+//!   container + serves on the lifecycle machinery).
 //! - [`leaf_web_hyper`] — the hyper BACKEND: its `#[auto_config]` FALLBACK
 //!   `dyn WebServer` bean (`OnMissingBean(dyn WebServer)`), so merely pulling the
 //!   bundle makes an app serve, while a user backend supersedes it.
