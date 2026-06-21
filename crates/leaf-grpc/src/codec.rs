@@ -24,6 +24,13 @@ pub trait GrpcCodec: Send + Sync {
 /// The prost-backed [`GrpcCodec`] — leaf-grpc's `JsonConverter` analogue. The ONLY
 /// place `prost` is named (the message codec is confined here exactly as `serde_json`
 /// is confined to leaf-serde's converter). Stateless.
+///
+/// Registered as a managed `#[component]` singleton (a no-collaborator ZST bean) so the
+/// `#[grpc_controller]` per-method `GrpcRoute` beans can field-inject `Ref<ProstCodec>` —
+/// the CONCRETE codec, since [`GrpcCodec`] is not object-safe (its methods are generic over
+/// `M: prost::Message`). The dogfooded registration replaces a hand-rolled provider, exactly
+/// like `GrpcDispatchConfig`.
+#[leaf_macros::component]
 #[derive(Clone, Copy, Default)]
 pub struct ProstCodec;
 
