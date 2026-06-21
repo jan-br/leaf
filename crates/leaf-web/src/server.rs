@@ -107,6 +107,37 @@ pub trait WebServer: Send + Sync {
 // same path `Ref<dyn CacheManager>` / `Ref<dyn TransactionManager>` use.
 leaf_core::impl_resolve_view!(dyn WebServer);
 
+/// The ABSTRACT protocol-dispatch seam (the design's §1): a second `Handler` family that
+/// runs on the SHARED [`WebServer`]/[`Dispatcher`], selected by `content-type`. A request
+/// whose `content-type` no HTTP [`Route`](crate::Route) claims is delegated to the first
+/// `ProtocolDispatch` whose [`handles`](ProtocolDispatch::handles) returns `true`.
+///
+/// This is how leaf-web routes to gRPC WITHOUT naming `leaf-grpc`: the gRPC family is ONE
+/// `dyn ProtocolDispatch` impl contributed BY `leaf-grpc` (matching `application/grpc*`),
+/// so the dep arrow stays `leaf-grpc → leaf-web`, never the reverse. WebSocket etc. plug in
+/// the same way. Selection is by the runtime `content-type` HEADER VALUE — never a Rust
+/// type's spelled name.
+pub trait ProtocolDispatch: Send + Sync {
+    /// Whether this protocol claims a request with the given `content-type` (e.g. gRPC
+    /// claims any value starting `application/grpc`). `None` = no `content-type` header.
+    fn handles(&self, content_type: Option<&str>) -> bool;
+
+    /// Dispatch a claimed request to a [`Response`] (whose [`Body`](crate::Body) may be a
+    /// frame stream with trailers — gRPC renders `grpc-status` as trailers, never an `Err`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`LeafError`] only for a protocol-level failure the [`ControlAdvice`] chain
+    /// should map; a gRPC protocol renders application status as trailers, not `Err`.
+    fn dispatch<'a>(&'a self, req: Request) -> BoxFuture<'a, Result<Response, LeafError>>;
+}
+
+// The by-trait-injection seam (emitted once, beside the trait — orphan-rule-OK,
+// `dyn ProtocolDispatch` is local). It makes `Ref<dyn ProtocolDispatch>` injectable and
+// `Vec<Ref<dyn ProtocolDispatch>>` collectible through the SAME path `dyn Route`/`dyn
+// WebFilter` use — the gRPC family is collected exactly like the HTTP route/filter families.
+leaf_core::impl_resolve_view!(dyn ProtocolDispatch);
+
 /// The protocol-agnostic request engine: it owns the container-collected routes,
 /// filters, and advice, and turns a leaf [`Request`] into a [`Response`].
 ///
@@ -125,6 +156,9 @@ pub struct Dispatcher {
     /// The container-collected advice, ALREADY sorted by [`ControlAdvice::order`]
     /// (stable). Consulted first-match-wins on a handler/filter `Err`.
     advice: Vec<Arc<dyn ControlAdvice>>,
+    /// The container-collected protocol families (gRPC etc.), checked by `content-type`
+    /// BEFORE the HTTP route family. Empty in a pure-HTTP app.
+    protocols: Vec<Arc<dyn ProtocolDispatch>>,
 }
 
 impl Dispatcher {
@@ -138,12 +172,13 @@ impl Dispatcher {
         routes: Vec<Arc<dyn Route>>,
         filters: Vec<Arc<dyn WebFilter>>,
         advice: Vec<Arc<dyn ControlAdvice>>,
+        protocols: Vec<Arc<dyn ProtocolDispatch>>,
     ) -> Self {
         let mut filters = filters;
         filters.sort_by_key(|f| f.order());
         let mut advice = advice;
         advice.sort_by_key(|a| a.order());
-        Dispatcher { routes, filters, advice }
+        Dispatcher { routes, filters, advice, protocols }
     }
 
     /// Handle one request, ALWAYS yielding a [`Response`].
@@ -153,10 +188,41 @@ impl Dispatcher {
     /// handler), maps it via the ordered advice chain, falling back to the default
     /// mapping when no advice claims it. An unmatched route is itself a
     /// [`LeafError`] (mapped to `404` by the default mapping).
-    pub async fn dispatch(&self, req: Request) -> Response {
-        // Build the routing table over the owned routes (borrow for this call) and
-        // the terminal that matches + invokes. Both are locals living across the
-        // single `.await` below — no borrow escapes `dispatch`.
+    pub async fn dispatch(&self, mut req: Request) -> Response {
+        // 1. PROTOCOL BRANCH: if a ProtocolDispatch claims this request's content-type,
+        //    delegate the WHOLE request (the frame stream INTACT — gRPC reads it directly).
+        //    Selection is by the runtime content-type header value, never a Rust type name.
+        let content_type = req.header(http::header::CONTENT_TYPE.as_str()).map(str::to_owned);
+        if let Some(proto) = self
+            .protocols
+            .iter()
+            .find(|p| p.handles(content_type.as_deref()))
+        {
+            // Capture the parts the advice path needs BEFORE the request moves into dispatch
+            // (Request is no longer Clone — its Body may be a one-shot stream).
+            let parts = req.parts_clone();
+            return match proto.dispatch(req).await {
+                Ok(resp) => resp,
+                Err(err) => self.map_error(&err, &parts),
+            };
+        }
+
+        // 2. HTTP PATH: COLLECT a streamed body to Full BEFORE the route family runs, so
+        //    every extractor / body_bytes() call sees buffered bytes (REST stays ergonomic).
+        if req.body_is_stream() {
+            let body = req.take_body();
+            match body.collect(usize::MAX).await {
+                Ok(collected) => req.set_body(crate::body::Body::Full(collected)),
+                Err(err) => {
+                    let parts = req.parts_clone();
+                    return self.map_error(&err, &parts);
+                }
+            }
+        }
+
+        // 3. Build the routing table over the owned routes (borrow for this call) and
+        //    the terminal that matches + invokes. Both are locals living across the
+        //    single `.await` below — no borrow escapes `dispatch`.
         let route_refs: Vec<&dyn Route> = self.routes.iter().map(AsRef::as_ref).collect();
         let table = RouteTable::build(&route_refs);
         let terminal = RouteTerminal { table: &table };
@@ -165,12 +231,12 @@ impl Dispatcher {
         let filter_refs: Vec<&dyn WebFilter> = self.filters.iter().map(AsRef::as_ref).collect();
         let chain = FilterChain::new(&filter_refs, &terminal);
 
-        // We need the original request to feed the advice chain on error, but the
-        // chain consumes `req`. Clone the lightweight request for the error path.
-        let req_for_advice = req.clone();
+        // The advice path needs the request PARTS (Request is not Clone); snapshot them
+        // before the chain consumes `req`.
+        let parts = req.parts_clone();
         match chain.run(req).await {
             Ok(resp) => resp,
-            Err(err) => self.map_error(&err, &req_for_advice),
+            Err(err) => self.map_error(&err, &parts),
         }
     }
 
@@ -287,16 +353,18 @@ mod tests {
         }
     }
 
-    /// A handler that either succeeds with a fixed body or fails with a fixed kind.
+    /// A handler that either succeeds with a fixed body, echoes the (collected) request
+    /// body, or fails with a fixed kind.
     enum FakeHandler {
         Ok(&'static str),
         Err(ErrorKind),
+        Echo,
     }
 
     impl Handler for FakeHandler {
         fn handle<'a>(
             &'a self,
-            _req: &'a Request,
+            req: &'a Request,
         ) -> BoxFuture<'a, Result<Response, LeafError>> {
             Box::pin(async move {
                 match self {
@@ -304,6 +372,9 @@ mod tests {
                         Ok(Response::ok().with_body(Bytes::from_static(body.as_bytes())))
                     }
                     FakeHandler::Err(kind) => Err(LeafError::new(*kind)),
+                    FakeHandler::Echo => {
+                        Ok(Response::ok().with_body(Bytes::copy_from_slice(req.body_bytes())))
+                    }
                 }
             })
         }
@@ -356,7 +427,7 @@ mod tests {
         let filter: Arc<dyn WebFilter> =
             Arc::new(LogFilter { tag: "log", log: log.clone() });
 
-        let dispatcher = Dispatcher::new(vec![route], vec![filter], vec![]);
+        let dispatcher = Dispatcher::new(vec![route], vec![filter], vec![], vec![]);
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/ok")));
 
         assert_eq!(resp.status(), StatusCode::OK);
@@ -380,7 +451,7 @@ mod tests {
             order: 0,
         });
 
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![advice]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![advice], vec![]);
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/boom")));
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -400,7 +471,7 @@ mod tests {
             order: 0,
         });
 
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![advice]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![advice], vec![]);
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/boom")));
 
         // No advice claimed it → the built-in default maps non-NoSuchBean → 500.
@@ -411,7 +482,7 @@ mod tests {
     fn unmatched_route_is_the_default_404() {
         let route: Arc<dyn Route> =
             Arc::new(FakeRoute { method: Method::GET, path: "/ok", handler: FakeHandler::Ok("hi") });
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![]);
 
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/nope")));
         // An unmatched route is a NoSuchBean LeafError → default mapping → 404.
@@ -437,7 +508,7 @@ mod tests {
             status: StatusCode::NOT_FOUND,
             order: 1,
         });
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![late, early]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![late, early], vec![]);
 
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/boom")));
         // early (order 1) wins → its 404, not late's 502.
@@ -455,7 +526,7 @@ mod tests {
         // (which stays reserved for a genuinely unmatched path / NoSuchBean).
         let route: Arc<dyn Route> =
             Arc::new(FakeRoute { method: Method::GET, path: "/x", handler: FakeHandler::Ok("ok") });
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![]);
 
         let resp = futures::executor::block_on(dispatcher.dispatch(req(Method::POST, "/x")));
 
@@ -523,7 +594,7 @@ mod tests {
             path: "/bad",
             handler: FakeHandler::Err(ErrorKind::ConvertError),
         });
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![]);
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/bad")));
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -536,8 +607,96 @@ mod tests {
             path: "/invalid",
             handler: FakeHandler::Err(ErrorKind::ValidationError),
         });
-        let dispatcher = Dispatcher::new(vec![route], vec![], vec![]);
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![]);
         let resp = futures::executor::block_on(dispatcher.dispatch(get("/invalid")));
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── ProtocolDispatch: the abstract protocol-routing seam (gRPC plugs in here) ──
+
+    /// A fake protocol-dispatch that CLAIMS one content-type and answers a fixed status,
+    /// so the dispatcher test can prove the branch without naming leaf-grpc.
+    struct FakeProtocol {
+        claims: &'static str,
+        status: StatusCode,
+    }
+
+    impl crate::server::ProtocolDispatch for FakeProtocol {
+        fn handles(&self, content_type: Option<&str>) -> bool {
+            content_type.is_some_and(|ct| ct.starts_with(self.claims))
+        }
+        fn dispatch<'a>(&'a self, _req: Request) -> BoxFuture<'a, Result<Response, LeafError>> {
+            Box::pin(async move { Ok(Response::new(self.status)) })
+        }
+    }
+
+    #[test]
+    fn protocol_dispatch_handles_matches_by_content_type_prefix() {
+        let p = FakeProtocol { claims: "application/grpc", status: StatusCode::OK };
+        assert!(p.handles(Some("application/grpc")));
+        assert!(p.handles(Some("application/grpc+proto")));
+        assert!(!p.handles(Some("application/json")));
+        assert!(!p.handles(None));
+    }
+
+    fn grpc_req(path: &str) -> Request {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/grpc"));
+        Request::new(Method::POST, path.parse().expect("uri"), headers, Bytes::new())
+    }
+
+    #[test]
+    fn a_grpc_content_type_is_delegated_to_the_protocol_dispatch() {
+        // GET /ok is a registered HTTP route, but THIS request is application/grpc, so the
+        // protocol family must claim it (proving the content-type branch, not the route).
+        let route: Arc<dyn Route> =
+            Arc::new(FakeRoute { method: Method::POST, path: "/ok", handler: FakeHandler::Ok("http") });
+        let proto: Arc<dyn ProtocolDispatch> =
+            Arc::new(FakeProtocol { claims: "application/grpc", status: StatusCode::ACCEPTED });
+
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![proto]);
+        let resp = futures::executor::block_on(dispatcher.dispatch(grpc_req("/ok")));
+
+        // 202 ACCEPTED comes from the protocol family, NOT the route's 200 "http".
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn a_non_grpc_content_type_stays_on_the_http_route_family() {
+        // A plain request (no application/grpc content-type) runs the HTTP route family even
+        // when a ProtocolDispatch is present — the protocol must DECLINE it.
+        let route: Arc<dyn Route> =
+            Arc::new(FakeRoute { method: Method::GET, path: "/ok", handler: FakeHandler::Ok("http") });
+        let proto: Arc<dyn ProtocolDispatch> =
+            Arc::new(FakeProtocol { claims: "application/grpc", status: StatusCode::ACCEPTED });
+
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![proto]);
+        let resp = futures::executor::block_on(dispatcher.dispatch(get("/ok")));
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body_bytes(), b"http".as_slice());
+    }
+
+    #[test]
+    fn a_streamed_http_body_is_collected_before_the_route_handler() {
+        use crate::body::{Body, Frame};
+        // An HTTP request arriving with a STREAM body (no grpc content-type) must be
+        // collected to Full before the route handler runs, so the Echo handler sees the
+        // buffered bytes via body_bytes() — proving collect-before-handler keeps REST
+        // ergonomic.
+        let route: Arc<dyn Route> =
+            Arc::new(FakeRoute { method: Method::POST, path: "/echo", handler: FakeHandler::Echo });
+        let dispatcher = Dispatcher::new(vec![route], vec![], vec![], vec![]);
+
+        let frames = futures::stream::iter(vec![
+            Ok(Frame::Data(Bytes::from_static(b"strea"))),
+            Ok(Frame::Data(Bytes::from_static(b"med"))),
+        ]);
+        let mut req = Request::new(Method::POST, "/echo".parse().expect("uri"), http::HeaderMap::new(), Bytes::new());
+        req.set_body(Body::Stream(Box::pin(frames)));
+
+        let resp = futures::executor::block_on(dispatcher.dispatch(req));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body_bytes(), b"streamed".as_slice());
     }
 }

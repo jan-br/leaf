@@ -249,11 +249,13 @@ impl<T: serde::de::DeserializeOwned> Query<T> {
 }
 
 impl FromRequest for Request {
-    /// The whole request, cloned — the `&Request` extractor (a controller method
-    /// that wants raw access). [`Request`] is a cheap clone (the body is
-    /// [`Bytes`](bytes::Bytes)).
+    /// The whole request, copied — the `&Request` extractor (a controller method that wants
+    /// raw access). [`Request`] is not `Clone` (its [`Body`](crate::Body) may be a one-shot
+    /// stream), so this copies the request's parts plus its BUFFERED body bytes via
+    /// [`buffered_clone`](Request::buffered_clone). The body is always `Full` here: the
+    /// [`Dispatcher`](crate::Dispatcher) collects a streamed HTTP body before any handler runs.
     fn from_request(req: &Request) -> Result<Self, LeafError> {
-        Ok(req.clone())
+        Ok(req.buffered_clone())
     }
 }
 

@@ -172,7 +172,7 @@ fn assemble_dispatcher() -> Dispatcher {
         block(<Vec<Ref<dyn Route>> as Injectable>::inject(&cx)).expect("routes resolve");
     assert_eq!(routes.len(), 5, "all generated #[rest_controller] route beans were collected");
 
-    Dispatcher::new(routes.into_iter().map(Ref::into_arc).collect(), vec![], vec![])
+    Dispatcher::new(routes.into_iter().map(Ref::into_arc).collect(), vec![], vec![], vec![])
 }
 
 fn request(method: Method, path: &str) -> Request {

@@ -8,28 +8,37 @@ use std::sync::Arc;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Uri};
 
+use crate::body::Body;
+
 /// An inbound HTTP request, in leaf's backend-free vocabulary.
 ///
 /// The backend (`leaf-web-hyper` / a mock) builds one of these at the edge: it
 /// wraps the neutral `http` value types ([`Method`]/[`Uri`]/[`HeaderMap`]) plus a
-/// [`Bytes`] body it has already collected. `path_params` start empty and are
-/// filled by the route matcher (Task 2) once a pattern like `/products/{sku}`
-/// captures a concrete segment.
-#[derive(Clone, Debug)]
+/// [`Body`] (a buffered [`Body::Full`] or a streamed [`Body::Stream`]).
+/// `path_params` start empty and are filled by the route matcher (Task 2) once a
+/// pattern like `/products/{sku}` captures a concrete segment.
+// `Request` is intentionally NOT `Clone`/`Debug`: its `Body` may be a one-shot frame
+// stream (a `BoxStream` is neither). The advice error path clones the request's PARTS
+// (method/uri/headers/path_params) it needs instead of the whole request.
 pub struct Request {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     /// `(name, value)` captures filled by the matcher; empty until then.
     path_params: Vec<(String, String)>,
-    body: Bytes,
+    /// The request body — buffered ([`Body::Full`]) or streamed ([`Body::Stream`]). The
+    /// [`Dispatcher`](crate::Dispatcher) collects a streamed HTTP body to Full BEFORE a
+    /// route handler runs, so every extractor / [`body_bytes`](Request::body_bytes) call
+    /// sees buffered bytes; a gRPC handler reads the stream directly.
+    body: Body,
     /// Type-keyed per-request attributes (Spring's `ServletRequest` attributes /
     /// `http::Extensions`). A [`WebFilter`](crate::WebFilter) attaches a TYPED value
     /// (e.g. a security filter's authenticated `Principal`) here, and a downstream
     /// handler reads it back through the `Extension<T>` extractor. Stored as
-    /// `Arc<dyn Any + Send + Sync>` (not `Box`) so [`Request`] stays `Clone` — the
-    /// dispatcher clones the request for the error path, and `Box<dyn Any>` is not
-    /// `Clone`. This is a PURE leaf abstraction over std [`Any`]; it names no backend.
+    /// `Arc<dyn Any + Send + Sync>` (not `Box`) so the request's PARTS stay cheaply
+    /// cloneable — the dispatcher snapshots the parts (via [`parts_clone`](Request::parts_clone))
+    /// for the error path, and `Box<dyn Any>` is not `Clone`. This is a PURE leaf
+    /// abstraction over std [`Any`]; it names no backend.
     extensions: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
 }
 
@@ -40,7 +49,14 @@ impl Request {
     /// captures the concrete path segments.
     #[must_use]
     pub fn new(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Self {
-        Request { method, uri, headers, path_params: Vec::new(), body, extensions: HashMap::new() }
+        Request {
+            method,
+            uri,
+            headers,
+            path_params: Vec::new(),
+            body: Body::Full(body),
+            extensions: HashMap::new(),
+        }
     }
 
     /// The request [`Method`] (`GET`/`POST`/…).
@@ -81,10 +97,78 @@ impl Request {
         &self.headers
     }
 
-    /// The request body as a byte slice.
+    /// The request body as a byte slice — the buffered bytes of a [`Body::Full`].
+    ///
+    /// A [`Body::Stream`] reports empty here (it is consumed frame-by-frame, not buffered):
+    /// HTTP handlers only ever see a body the [`Dispatcher`](crate::Dispatcher) already
+    /// collected to Full, and gRPC handlers read [`into_body`](Request::into_body) directly.
     #[must_use]
     pub fn body_bytes(&self) -> &[u8] {
-        &self.body
+        match &self.body {
+            Body::Full(bytes) => bytes,
+            Body::Stream(_) => &[],
+        }
+    }
+
+    /// Take the [`Body`] out of the request (a gRPC handler consumes the frame stream this
+    /// way; the dispatcher takes it to collect a streamed HTTP body before a handler).
+    #[must_use]
+    pub fn into_body(self) -> Body {
+        self.body
+    }
+
+    /// Replace the body (the backend edge installs a [`Body::Stream`]; the dispatcher swaps
+    /// in the collected [`Body::Full`] before an HTTP handler runs).
+    pub fn set_body(&mut self, body: Body) {
+        self.body = body;
+    }
+
+    /// Whether the body is the streaming variant (the dispatcher collects it before an
+    /// HTTP handler runs).
+    #[must_use]
+    pub fn body_is_stream(&self) -> bool {
+        self.body.is_stream()
+    }
+
+    /// Take the body OUT, leaving an empty Full body in its place (the dispatcher collects
+    /// the taken stream, then installs the collected Full via [`set_body`](Request::set_body)).
+    #[must_use]
+    pub fn take_body(&mut self) -> Body {
+        std::mem::replace(&mut self.body, Body::Full(Bytes::new()))
+    }
+
+    /// A body-less copy of the request's PARTS (method/uri/headers/path_params + extensions)
+    /// — what the advice error path consumes (`Request` is not `Clone` because its body may
+    /// be a one-shot stream, but the parts ARE cheaply cloneable).
+    #[must_use]
+    pub fn parts_clone(&self) -> Request {
+        Request {
+            method: self.method.clone(),
+            uri: self.uri.clone(),
+            headers: self.headers.clone(),
+            path_params: self.path_params.clone(),
+            body: Body::Full(Bytes::new()),
+            extensions: self.extensions.clone(),
+        }
+    }
+
+    /// A copy of the request carrying the request's PARTS plus its BUFFERED body bytes — the
+    /// `&Request` extractor's source. By the time an HTTP handler runs, the
+    /// [`Dispatcher`](crate::Dispatcher) has already collected a streamed body to
+    /// [`Body::Full`], so this preserves the body (a still-streaming body, which a handler
+    /// never sees, is copied as the empty buffered bytes [`body_bytes`](Request::body_bytes)
+    /// reports). `Request` is not `Clone` (its `Body` may be a one-shot stream), so this is
+    /// the explicit buffered-copy the whole-request extractor uses.
+    #[must_use]
+    pub fn buffered_clone(&self) -> Request {
+        Request {
+            method: self.method.clone(),
+            uri: self.uri.clone(),
+            headers: self.headers.clone(),
+            path_params: self.path_params.clone(),
+            body: Body::Full(Bytes::copy_from_slice(self.body_bytes())),
+            extensions: self.extensions.clone(),
+        }
     }
 
     /// A captured path parameter by name (e.g. `sku` from `/products/{sku}`),
@@ -193,12 +277,43 @@ mod tests {
     }
 
     #[test]
-    fn request_stays_clone_with_extensions() {
-        // The dispatcher clones the request for the advice error path, so `Request: Clone`
-        // must be preserved even with the extensions map (Arc-backed, hence cloneable).
+    fn parts_clone_carries_extensions_without_a_body() {
+        // The dispatcher snapshots the request's PARTS for the advice error path (Request is
+        // no longer Clone — its Body may be a one-shot stream). The Arc-backed extensions
+        // survive the parts copy.
         let mut req = Request::new(Method::GET, "/x".parse().expect("uri"), HeaderMap::new(), Bytes::new());
         req.insert_extension(Principal { user: "alice".to_string() });
-        let cloned = req.clone();
-        assert_eq!(cloned.extension::<Principal>(), Some(&Principal { user: "alice".to_string() }));
+        let parts = req.parts_clone();
+        assert_eq!(parts.extension::<Principal>(), Some(&Principal { user: "alice".to_string() }));
+    }
+
+    #[test]
+    fn new_wraps_bytes_as_a_full_body_and_into_body_yields_it() {
+        use crate::body::Body;
+        let req = Request::new(
+            Method::POST,
+            "/x".parse().expect("uri"),
+            HeaderMap::new(),
+            Bytes::from_static(b"payload"),
+        );
+        // body_bytes() still reads the Full variant, unchanged.
+        assert_eq!(req.body_bytes(), b"payload".as_slice());
+        // into_body() hands out the Body; it is the Full variant.
+        match req.into_body() {
+            Body::Full(b) => assert_eq!(b, Bytes::from_static(b"payload")),
+            Body::Stream(_) => panic!("Request::new must wrap Bytes as Body::Full"),
+        }
+    }
+
+    #[test]
+    fn body_bytes_is_empty_for_a_stream_body() {
+        use crate::body::{Body, Frame};
+        let stream = futures::stream::iter(vec![Ok(Frame::Data(Bytes::from_static(b"abc")))]);
+        let mut req = Request::new(Method::POST, "/x".parse().expect("uri"), HeaderMap::new(), Bytes::new());
+        req.set_body(Body::Stream(Box::pin(stream)));
+        // A streamed body has nothing buffered yet, so body_bytes() reports empty (the
+        // dispatcher collects a streamed HTTP body BEFORE a handler sees it; gRPC reads the
+        // stream directly). It must NOT panic.
+        assert_eq!(req.body_bytes(), b"".as_slice());
     }
 }

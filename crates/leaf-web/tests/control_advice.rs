@@ -133,6 +133,7 @@ fn assemble_dispatcher() -> Dispatcher {
         routes.into_iter().map(Ref::into_arc).collect(),
         vec![],
         advice.into_iter().map(Ref::into_arc).collect(),
+        vec![],
     )
 }
 

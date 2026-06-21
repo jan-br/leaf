@@ -256,10 +256,14 @@ mod tests {
         let filters: Vec<&dyn WebFilter> = vec![&logger];
         let terminal = ErrTerminal;
 
+        // `Response` is intentionally not `Debug` (its `Body` may be a one-shot stream), so
+        // pull the `Err` out via `.err()` rather than `.expect_err` (which would need the
+        // `Ok` type to be `Debug`).
         let err = block_on(
             FilterChain::new(&filters, &terminal).run(request_with(false)),
         )
-        .expect_err("terminal error propagates out");
+        .err()
+        .expect("terminal error propagates out");
         assert_eq!(err.kind, ErrorKind::ConstructionFailed);
         assert_eq!(*log.lock().expect("log"), vec!["log"]);
     }

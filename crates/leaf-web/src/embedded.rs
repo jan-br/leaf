@@ -37,7 +37,7 @@ use leaf_core::{BoxFuture, KeepAlive, LeafError, LifecycleCtx, Ref};
 use crate::advice::ControlAdvice;
 use crate::filter::WebFilter;
 use crate::handler::Route;
-use crate::server::{Dispatcher, ServerProperties, WebServer};
+use crate::server::{Dispatcher, ProtocolDispatch, ServerProperties, WebServer};
 
 /// The `#[keep_alive]` bean that builds the [`Dispatcher`] from the container and serves it on
 /// the injected [`WebServer`] backend for the life of the process.
@@ -59,6 +59,9 @@ pub struct EmbeddedWebServer {
     filters: Vec<Ref<dyn WebFilter>>,
     /// Every control-advice any crate contributed — the error→response chain.
     advice: Vec<Ref<dyn ControlAdvice>>,
+    /// Every protocol family any crate contributed (gRPC etc.) — checked by content-type
+    /// before the HTTP route family. Collection + by-trait injection, like routes/filters.
+    protocols: Vec<Ref<dyn ProtocolDispatch>>,
     /// The bound `leaf.web.server.*` address the backend binds to.
     props: Ref<ServerProperties>,
 }
@@ -79,6 +82,7 @@ impl KeepAlive for EmbeddedWebServer {
             self.routes.iter().map(|r| Ref::clone(r).into_arc()).collect(),
             self.filters.iter().map(|f| Ref::clone(f).into_arc()).collect(),
             self.advice.iter().map(|a| Ref::clone(a).into_arc()).collect(),
+            self.protocols.iter().map(|p| Ref::clone(p).into_arc()).collect(),
         ));
         // Clone the backend handle + the bound address into OWNED Arcs so the serve future
         // is `'static` (it must outlive this `&self` borrow — leaf-boot spawns it).

@@ -74,7 +74,7 @@ fn get(path: &str) -> Request {
 fn a_filter_attaches_a_typed_extension_a_handler_reads_end_to_end() {
     let route: Arc<dyn Route> = Arc::new(WhoAmIRoute);
     let filter: Arc<dyn WebFilter> = Arc::new(AuthFilter);
-    let dispatcher = Dispatcher::new(vec![route], vec![filter], vec![]);
+    let dispatcher = Dispatcher::new(vec![route], vec![filter], vec![], vec![]);
     let server = MockServer::new(Arc::new(dispatcher));
 
     let resp = block(server.handle(get("/whoami")));

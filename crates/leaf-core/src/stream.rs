@@ -13,9 +13,14 @@ use futures::Stream;
 
 /// The one boxed-stream shape returned at a streaming `dyn` seam in leaf.
 ///
-/// `Send + 'a` mirrors [`BoxFuture`](crate::BoxFuture): a streaming body rides the
-/// executor across threads, so the stream it wraps must be `Send`.
-pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
+/// `Send + Sync + 'a`: a streaming body rides the executor across threads (`Send`, like
+/// [`BoxFuture`](crate::BoxFuture)), AND — unlike a `BoxFuture`, which is always `.await`ed
+/// by value — it lives INSIDE the shared request/response value (`leaf_web::Body`) that an
+/// HTTP handler holds BY REFERENCE across an `.await` (the handler's `Send` future captures
+/// `&Request`). For that to be sound the value, hence the stream it carries, must be `Sync`.
+/// Every concrete stream leaf builds at this seam (`futures::stream::iter`/`unfold` over
+/// `Send + Sync` frames) satisfies it.
+pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
 
 #[cfg(test)]
 mod tests {

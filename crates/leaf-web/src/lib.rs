@@ -112,7 +112,7 @@ pub use handler::{
 pub use embedded::EmbeddedWebServer;
 pub use request::Request;
 pub use response::{IntoResponse, IntoResponseWith, Response, ResponseEntity};
-pub use server::{Dispatcher, ServerProperties, WebServer};
+pub use server::{Dispatcher, ProtocolDispatch, ServerProperties, WebServer};
 
 #[cfg(any(test, feature = "testing"))]
 pub use testing::MockServer;

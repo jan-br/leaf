@@ -4,24 +4,27 @@
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, StatusCode};
-use leaf_core::LeafError;
+use leaf_core::{BoxStream, LeafError};
 
+use crate::body::{Body, Frame};
 use crate::content::HttpMessageConverter;
 
 /// An outbound HTTP response in leaf's backend-free vocabulary: a status, a
-/// header map, and a [`Bytes`] body the backend writes at the edge.
-#[derive(Clone, Debug)]
+/// header map, and a [`Body`] (a buffered [`Body::Full`] or a streamed
+/// [`Body::Stream`]) the backend writes at the edge.
+// `Response` is intentionally NOT `Clone`/`Debug`: its `Body` may be a one-shot frame
+// stream. The error/advice paths build a fresh `Response`, never clone one.
 pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 }
 
 impl Response {
     /// A response with the given status, no headers, and an empty body.
     #[must_use]
     pub fn new(status: StatusCode) -> Self {
-        Response { status, headers: HeaderMap::new(), body: Bytes::new() }
+        Response { status, headers: HeaderMap::new(), body: Body::Full(Bytes::new()) }
     }
 
     /// A `200 OK` response with no headers and an empty body.
@@ -42,10 +45,14 @@ impl Response {
         &self.headers
     }
 
-    /// The response body as a byte slice.
+    /// The response body as a byte slice — the buffered bytes of a [`Body::Full`]; empty
+    /// for a [`Body::Stream`] (written frame-by-frame at the edge).
     #[must_use]
     pub fn body_bytes(&self) -> &[u8] {
-        &self.body
+        match &self.body {
+            Body::Full(bytes) => bytes,
+            Body::Stream(_) => &[],
+        }
     }
 
     /// Replace the status (builder style).
@@ -55,11 +62,31 @@ impl Response {
         self
     }
 
-    /// Replace the body (builder style).
+    /// Replace the body with a buffered blob (builder style). Accepts anything that is
+    /// `Into<Bytes>` (`Bytes`/`Vec<u8>`/`&[u8]`/`String`); produces a [`Body::Full`].
     #[must_use]
-    pub fn with_body(mut self, body: Bytes) -> Self {
-        self.body = body;
+    pub fn with_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.body = Body::Full(body.into());
         self
+    }
+
+    /// Replace the body with a STREAM of [`Frame`]s (builder style) — the streaming
+    /// response path (gRPC data frames + a terminating trailers frame, SSE, etc.). The
+    /// backend writes these frames at the edge; nothing is buffered.
+    #[must_use]
+    pub fn with_body_stream(
+        mut self,
+        stream: BoxStream<'static, Result<Frame, LeafError>>,
+    ) -> Self {
+        self.body = Body::Stream(stream);
+        self
+    }
+
+    /// Take the [`Body`] out of the response (the backend edge consumes this to write the
+    /// Full bytes or stream the frames).
+    #[must_use]
+    pub fn into_body(self) -> Body {
+        self.body
     }
 
     /// Append a header (builder style).
@@ -282,7 +309,7 @@ mod tests {
     #[test]
     fn into_response_for_response_is_identity() {
         let resp = Response::new(StatusCode::CREATED).with_body(Bytes::from_static(b"x"));
-        let out = resp.clone().into_response();
+        let out = resp.into_response();
         assert_eq!(out.status(), StatusCode::CREATED);
         assert_eq!(out.body_bytes(), b"x".as_slice());
     }
@@ -374,6 +401,30 @@ mod tests {
             Some("application/test"),
             "the converter's content-type is still set on a ResponseEntity body",
         );
+    }
+
+    #[test]
+    fn with_body_accepts_anything_into_bytes_and_is_full() {
+        use crate::body::Body;
+        // A &'static [u8], a Vec<u8>, and Bytes all satisfy `impl Into<Bytes>`.
+        let resp = Response::ok().with_body(b"hello".as_slice());
+        assert_eq!(resp.body_bytes(), b"hello".as_slice());
+        match resp.into_body() {
+            Body::Full(b) => assert_eq!(b, Bytes::from_static(b"hello")),
+            Body::Stream(_) => panic!("with_body must produce Body::Full"),
+        }
+    }
+
+    #[test]
+    fn with_body_stream_is_a_stream_with_empty_body_bytes() {
+        use crate::body::{Body, Frame};
+        let frames = futures::stream::iter(vec![
+            Ok(Frame::Data(Bytes::from_static(b"chunk"))),
+        ]);
+        let resp = Response::ok().with_body_stream(Box::pin(frames));
+        // A streamed response reports empty buffered bytes (it is written frame-by-frame).
+        assert_eq!(resp.body_bytes(), b"".as_slice());
+        assert!(matches!(resp.into_body(), Body::Stream(_)));
     }
 
     #[test]

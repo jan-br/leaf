@@ -111,7 +111,7 @@ mod tests {
     #[test]
     fn mock_server_handle_drives_a_request_through_the_dispatcher() {
         let route: Arc<dyn Route> = Arc::new(PingRoute);
-        let dispatcher = Arc::new(Dispatcher::new(vec![route], vec![], vec![]));
+        let dispatcher = Arc::new(Dispatcher::new(vec![route], vec![], vec![], vec![]));
         let server = MockServer::new(dispatcher);
 
         let resp = futures::executor::block_on(server.handle(get("/ping")));
