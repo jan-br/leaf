@@ -1,0 +1,27 @@
+[package]
+name = "leaf-grpc-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# leaf-grpc-build is the BUILD-HELPER crate — an app's `build.rs` calls
+# `leaf_grpc_build::compile(&["proto/x.proto"], &["proto"])`. It names NO leaf-* crate
+# (it emits TOKENS that reference `leaf_grpc::…` paths resolved in the APP's compile,
+# not here), and NO hyper/h2: only the sanctioned build-time codec deps.
+[dependencies]
+# protox: pure-Rust .proto -> FileDescriptorSet (no `protoc` binary).
+protox.workspace = true
+# prost-build: the message-struct generator + the ServiceGenerator seam we hook.
+prost-build.workspace = true
+# prost-types: the FileDescriptorSet / ServiceDescriptorProto value vocabulary.
+prost-types.workspace = true
+
+# NOTE (deviation from plan): current Cargo rejects a crate naming ITSELF as a
+# build-dependency (`cyclic package dependency`), so `build.rs` cannot reach this
+# crate's own `compile` via a path self-dep. Instead `build.rs` reuses the codegen by
+# `include!`-ing the codec pipeline + `src/service_gen.rs` directly and depends on the
+# same build-time codec deps the library does — see `build.rs` (added in Task 3.8).
+[build-dependencies]
+protox.workspace = true
+prost-build.workspace = true
+prost-types.workspace = true

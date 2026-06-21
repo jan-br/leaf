@@ -39,6 +39,7 @@ leaf-starter-web = { path = "crates/leaf-starter-web", version = "0.1.0" }
 leaf-web = { path = "crates/leaf-web", version = "0.1.0" }
 leaf-web-hyper = { path = "crates/leaf-web-hyper", version = "0.1.0" }
 leaf-grpc = { path = "crates/leaf-grpc", version = "0.1.0" }
+leaf-grpc-build = { path = "crates/leaf-grpc-build", version = "0.1.0" }
 leaf = { path = "crates/leaf", version = "0.1.0" }
 
 # External deps (pinned centrally — the internal BOM also covers third-party versions)
@@ -61,6 +62,16 @@ bytes = "1"
 # leaf-serde's JsonConverter. A pure codec, NOT a transport backend: it names no
 # hyper/tower/h2, so it is the sanctioned gRPC-message dep (the design's §9).
 prost = "0.13"
+
+# Build-time gRPC codegen (leaf-grpc-build ONLY): protox parses .proto -> a
+# FileDescriptorSet with NO `protoc` system binary (pure Rust); prost-build emits the
+# message structs; prost-types carries the FileDescriptorSet value. These are the
+# sanctioned build-time codec deps, confined to leaf-grpc-build exactly as
+# serde_json/protox names a WIRE FORMAT, never an HTTP server (hyper stays in
+# leaf-web-hyper). prost (the runtime codec) lives in leaf-grpc, not here.
+protox = "0.7"
+prost-build = "0.13"
+prost-types = "0.13"
 
 # The HTTP-server BACKEND deps — pinned here but used ONLY by `leaf-web-hyper`, the
 # single crate allowed to name hyper/tower/axum (every other crate stays backend-free).
