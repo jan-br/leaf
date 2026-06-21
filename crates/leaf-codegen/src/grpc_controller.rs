@@ -52,7 +52,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, Type};
+use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Type};
 
 use crate::descriptor::{self, BeanInput, Dependency, EmitError, FieldShape, Scope, ServiceView, Slice};
 use crate::stereotype::Stereotype;
@@ -343,14 +343,43 @@ fn parse_type(s: &str) -> Result<Type, EmitError> {
     })
 }
 
-/// The dual-form consistency guard: filled in Task 4.4.
-fn grpc_controller_kind_guard(_self_ty: &Type) -> TokenStream {
-    TokenStream::new()
+/// Emit the controller STRUCT's `::leaf_grpc::GrpcControllerKind` marker — the gRPC twin of
+/// `::leaf_web::ControllerKind`. Emitted ALONGSIDE the stereotype rows on the controller
+/// struct so the matching RPC impl can assert the struct really is a `#[grpc_controller]`
+/// (see [`grpc_controller_kind_guard`]).
+pub fn emit_grpc_controller_kind(item: &ItemStruct) -> TokenStream {
+    let ident = &item.ident;
+    let (impl_g, ty_g, where_c) = item.generics.split_for_impl();
+    quote! {
+        #[automatically_derived]
+        #[doc(hidden)]
+        impl #impl_g ::leaf_grpc::GrpcControllerKind for #ident #ty_g #where_c {
+            const IS_GRPC_CONTROLLER: bool = true;
+        }
+    }
+}
+
+/// The compile-time guard an RPC impl emits: assert the controller struct carries the
+/// `GrpcControllerKind` marker (the struct stereotype emits it), turning a `#[grpc_controller]
+/// impl` on a non-`#[grpc_controller]` struct into a clear `compile_error`. Keyed on the
+/// trait/const — never a spelled type name. See [`emit_grpc_controller_kind`].
+fn grpc_controller_kind_guard(self_ty: &Type) -> TokenStream {
+    quote! {
+        const _: () = {
+            ::core::assert!(
+                <#self_ty as ::leaf_grpc::GrpcControllerKind>::IS_GRPC_CONTROLLER,
+                "gRPC controller stereotype mismatch: this `impl` block lowers RPC methods but \
+                 its controller struct is not a `#[grpc_controller]`. Put `#[grpc_controller]` \
+                 on BOTH the struct AND the `impl ServiceTrait for Controller` block."
+            );
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stereotype;
 
     fn impl_item(src: &str) -> ItemImpl {
         syn::parse_str(src).expect("a valid impl block")
@@ -474,6 +503,59 @@ mod tests {
         assert!(
             s.contains("::leaf_grpc::call_bidi("),
             "a bidi method wraps through call_bidi: {s}"
+        );
+    }
+
+    fn struct_item(src: &str) -> ItemStruct {
+        syn::parse_str(src).expect("a valid struct item")
+    }
+
+    #[test]
+    fn a_grpc_controller_struct_is_a_component_and_emits_the_kind_marker() {
+        // The struct form: `#[grpc_controller] struct CatalogController { .. }` is a
+        // `#[component]`-equivalent bean (field injection of collaborators) that ALSO emits
+        // the `GrpcControllerKind` marker the impl-form guard asserts.
+        let rows = stereotype::emit_struct(
+            &struct_item("struct CatalogController { repo: ::leaf_core::Ref<Repo> }"),
+            Stereotype::Component,
+            TokenStream::new(),
+        )
+        .expect("emits");
+        let kind = emit_grpc_controller_kind(&struct_item("struct CatalogController;"));
+        let ts = quote! { #rows #kind };
+        syn::parse2::<syn::File>(ts.clone()).expect("valid items");
+        let s = flat(&ts);
+        // It rides the COMPONENTS channel (a plain `#[component]`-equivalent bean).
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::COMPONENTS)]"),
+            "the controller bean is a COMPONENTS row: {s}"
+        );
+        // The collaborator is field-injected through the Injectable trait (no hand-rolled ctor).
+        assert!(
+            s.contains("<::leaf_core::Ref<Repo>as::leaf_core::Injectable>::inject(__cx).await?"),
+            "the controller's collaborator is field-injected: {s}"
+        );
+        // The dual-form marker is emitted.
+        assert!(
+            s.contains("impl::leaf_grpc::GrpcControllerKindforCatalogController"),
+            "the struct emits the GrpcControllerKind marker: {s}"
+        );
+    }
+
+    #[test]
+    fn a_grpc_controller_impl_emits_the_kind_mismatch_guard() {
+        // Every RPC impl appends a compile-time guard asserting the controller struct carries
+        // the `GrpcControllerKind` marker — so a `#[grpc_controller] impl` on a struct never
+        // annotated `#[grpc_controller]` (which lacks the marker) is a hard compile error.
+        let item = impl_item(
+            r#"impl catalog::Catalog for CatalogController {
+                async fn get(&self, req: ProductReq) -> Result<Product, Status> { todo!() }
+            }"#,
+        );
+        let s = flat(&expand_grpc_controller_impl(&item).expect("emits"));
+        assert!(
+            s.contains("<CatalogControlleras::leaf_grpc::GrpcControllerKind>::IS_GRPC_CONTROLLER"),
+            "the impl asserts the struct carries the GrpcControllerKind marker: {s}"
         );
     }
 }
