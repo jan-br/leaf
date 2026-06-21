@@ -62,6 +62,9 @@ bytes = "1"
 hyper = { version = "1", default-features = false }
 hyper-util = { version = "0.1", default-features = false }
 http-body-util = "0.1"
+# The http-body 1.x trait itself (Body/Frame) — the backend reads hyper `Incoming`
+# frames (data + trailers) for the inbound stream and IMPLEMENTS a streaming out-body.
+http-body = "1"
 # A real HTTP client for the backend's integration test (dev-dependency only): GETs/
 # POSTs a booted `HyperServer` on an ephemeral port. default-features off = no TLS
 # stack (no system OpenSSL): the test only exercises plaintext HTTP/1 on localhost.

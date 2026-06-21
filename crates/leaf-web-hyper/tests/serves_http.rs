@@ -133,7 +133,7 @@ async fn hyper_server_serves_real_http_through_the_dispatcher() {
     let filters: Vec<Arc<dyn WebFilter>> = vec![Arc::new(LogFilter { log: log.clone() })];
     let advice: Vec<Arc<dyn ControlAdvice>> = vec![Arc::new(TeapotAdvice)];
 
-    let dispatcher = Arc::new(Dispatcher::new(routes, filters, advice));
+    let dispatcher = Arc::new(Dispatcher::new(routes, filters, advice, vec![]));
 
     // Bind the server on a free ephemeral port; serve in a background task driven by the
     // KeepAlive lifecycle ctx (bind → latch ready → park on shutdown → drain). serve runs
@@ -204,7 +204,7 @@ async fn oversize_request_body_is_413_within_limit_succeeds() {
     // wholesale; a body WITHIN the cap still round-trips through the dispatcher.
     let routes: Vec<Arc<dyn Route>> =
         vec![Arc::new(FakeRoute { method: Method::POST, path: "/echo", handler: FakeHandler::Echo })];
-    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![]));
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![], vec![]));
 
     // A deliberately tiny cap so the test never allocates megabytes.
     let limit = 16usize;
@@ -259,7 +259,7 @@ async fn an_in_flight_request_drains_while_a_new_connection_is_refused() {
         path: "/slow",
         handler: FakeHandler::Slow(std::time::Duration::from_millis(400)),
     })];
-    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![]));
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![], vec![]));
 
     let port = free_port();
     let props = Arc::new(ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() });
@@ -318,7 +318,7 @@ async fn a_too_slow_straggler_is_aborted_past_the_grace_budget() {
         // Far slower than the grace budget below.
         handler: FakeHandler::Slow(std::time::Duration::from_secs(10)),
     })];
-    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![]));
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![], vec![]));
 
     let port = free_port();
     let props = Arc::new(ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() });
@@ -385,6 +385,45 @@ async fn a_too_slow_straggler_is_aborted_past_the_grace_budget() {
         fired_at.elapsed() < std::time::Duration::from_secs(5),
         "the connection was cut shortly past the grace budget, not waited out for 10s"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http2_prior_knowledge_request_round_trips_through_the_streaming_edge() {
+    // Enabling http2 + mapping Incoming to a streaming Body must not regress HTTP: an
+    // HTTP/2 (prior-knowledge) POST /echo round-trips its body, proving the auto-builder
+    // negotiates h2 AND the inbound stream collects to Full before the route handler.
+    let routes: Vec<Arc<dyn Route>> =
+        vec![Arc::new(FakeRoute { method: Method::POST, path: "/echo", handler: FakeHandler::Echo })];
+    let dispatcher = Arc::new(Dispatcher::new(routes, vec![], vec![], vec![]));
+
+    let port = free_port();
+    let props = Arc::new(ServerProperties { host: "127.0.0.1".to_string(), port, ..Default::default() });
+    let server = Arc::new(HyperServer::new());
+
+    let (signal, trigger) = leaf_core::shutdown_channel();
+    let ctx = leaf_core::LifecycleCtx { shutdown: signal, on_ready: Box::new(|| {}), grace: None };
+    let serve_server = server.clone();
+    let serve_dispatcher = dispatcher.clone();
+    let serve_props = props.clone();
+    let serving =
+        tokio::spawn(async move { serve_server.serve(serve_dispatcher, serve_props, ctx).await });
+
+    let base = format!("http://127.0.0.1:{port}");
+    wait_until_up(port).await;
+
+    // Force HTTP/2 with prior knowledge (cleartext h2c, no upgrade dance) — the auto
+    // builder must accept it now that http2 is enabled.
+    let client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("h2 client");
+    let resp = client.post(format!("{base}/echo")).body("over-h2").send().await.expect("h2 POST");
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.text().await.expect("h2 echo body"), "over-h2");
+
+    trigger.fire();
+    assert!(serving.await.expect("serve joins").is_ok(), "clean drain after the h2 round-trip");
 }
 
 /// Poll a raw TCP connect until the server is accepting connections (the bind happens

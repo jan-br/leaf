@@ -22,12 +22,18 @@ leaf-macros.workspace = true
 # The hyper 1.x HTTP/1 server + hyper-util's auto/Tokio glue (the executor + IO
 # adapters + the protocol-negotiating connection builder), http-body-util to
 # collect/emit a full body, bytes for the body carrier.
-hyper = { workspace = true, features = ["server", "http1"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
 # `server-graceful` adds hyper-util's `GracefulShutdown` connection tracker — the drain
 # half of the embedded-server lifecycle: it signals every watched connection to finish and
 # awaits them (bounded by the grace budget) when the shutdown signal fires.
-hyper-util = { workspace = true, features = ["server", "server-auto", "server-graceful", "tokio", "http1"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "server-graceful", "tokio", "http1", "http2"] }
 http-body-util.workspace = true
+# The http-body 1.x trait — read hyper `Incoming` frames (data + trailers) for the
+# inbound stream and IMPLEMENT a streaming body for the outbound frame stream. Pure HTTP
+# value layer (not a server), the sanctioned place to name it: this IS the backend edge.
+http-body.workspace = true
+# `futures` builds the `leaf_core::BoxStream` the leaf `Body::Stream` carries at this edge.
+futures.workspace = true
 bytes.workspace = true
 # The neutral HTTP value vocabulary (StatusCode for the bare-500 fallback). The leaf
 # `Request`/`Response` already carry `http` Method/Uri/HeaderMap; this names it directly
@@ -44,8 +50,9 @@ tokio = { workspace = true, features = ["rt", "net", "time"] }
 # ephemeral port and drives real HTTP through it with a reqwest client, asserting
 # routing + a filter + advice end to end.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
-reqwest = { workspace = true, default-features = false }
-futures.workspace = true
+# `http2` enables the client's `http2_prior_knowledge()` for the h2 edge round-trip test
+# (still no TLS — plaintext h2c on localhost).
+reqwest = { workspace = true, default-features = false, features = ["http2"] }
 http.workspace = true
 # The auto-config proof (`tests/auto_config_server.rs`) boots a REAL leaf app IN-PROCESS:
 # leaf-boot's run pipeline auto-collects the `#[auto_config]` FALLBACK `dyn WebServer`
