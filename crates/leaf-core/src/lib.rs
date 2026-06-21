@@ -104,10 +104,12 @@ pub mod proxy;
 pub mod return_shape;
 pub mod registry;
 pub mod relaxed;
+pub mod stream;
 
 // ── curated re-exports: the flat bedrock surface macros and crates pin to ──
 
 pub use future::BoxFuture;
+pub use stream::BoxStream;
 
 pub use handle::{downcast_owned, downcast_ref, Bean, ErasedBean, Published, Ref};
 
