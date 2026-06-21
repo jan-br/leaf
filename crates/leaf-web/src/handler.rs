@@ -38,6 +38,23 @@ pub trait Route: Send + Sync {
     fn handler(&self) -> &dyn Handler;
 }
 
+/// The `@ResponseBody` policy a controller stereotype declares — a compile-time marker
+/// the controller codegen emits on the controller STRUCT and asserts in the controller
+/// IMPL. Because Rust splits a struct from its `impl` block, `#[controller]` /
+/// `#[rest_controller]` are dual-form (the stereotype is written on both); this marker is
+/// what makes the two halves agree. The struct emits
+/// `impl ControllerKind for C { const RESPONSE_BODY = <policy>; }` and the request-mapping
+/// impl emits `assert!(<C as ControllerKind>::RESPONSE_BODY == <its own policy>)`, so a
+/// `#[rest_controller] struct` + `#[controller] impl` mismatch (or a `#[get]` impl on a
+/// struct that was never annotated as a controller) is a hard COMPILE ERROR rather than a
+/// silent policy disagreement. Users never name this; only the macro emits it.
+pub trait ControllerKind {
+    /// `true` for `#[rest_controller]` (the handler return is serialized via the injected
+    /// [`HttpMessageConverter`](crate::HttpMessageConverter)); `false` for `#[controller]`
+    /// (the return is an [`IntoResponse`](crate::IntoResponse)).
+    const RESPONSE_BODY: bool;
+}
+
 // Make `dyn Route` an injectable VIEW (the by-trait-injection seam, emitted ONCE —
 // orphan-rule-OK since `dyn Route` is local to this crate). A controller-macro bean
 // (Stage 2) publishes the `dyn Route` view; the server collects EVERY provider as

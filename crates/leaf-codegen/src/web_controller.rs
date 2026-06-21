@@ -84,7 +84,46 @@ pub fn expand_controller_impl(
         let Some(mapped) = mapping_of(func)? else { continue };
         rows.extend(emit_route_bean(&self_ty, &controller_ident, &mapped, response_body)?);
     }
+    // The dual-form mismatch guard: this request-mapping impl's @ResponseBody policy
+    // (`response_body`) MUST equal the one the controller STRUCT's stereotype declared via
+    // its `ControllerKind` marker. So `#[rest_controller] struct` + `#[controller] impl`
+    // (or the reverse) is a hard compile error rather than a silent policy disagreement,
+    // and a request-mapping impl on a struct never annotated as a controller fails the
+    // `ControllerKind` bound. Keyed on the trait/const — never a spelled type name.
+    rows.extend(controller_kind_guard(&self_ty, response_body));
     Ok(rows)
+}
+
+/// Emit the controller STRUCT's `::leaf_web::ControllerKind` marker carrying its
+/// `@ResponseBody` policy (`#[rest_controller]` → `true`, `#[controller]` → `false`).
+/// Emitted ALONGSIDE the stereotype rows on the controller struct so the matching
+/// request-mapping impl can assert agreement (see `controller_kind_guard`).
+pub fn emit_controller_kind(item: &ItemStruct, response_body: bool) -> TokenStream {
+    let ident = &item.ident;
+    let (impl_g, ty_g, where_c) = item.generics.split_for_impl();
+    quote! {
+        #[automatically_derived]
+        #[doc(hidden)]
+        impl #impl_g ::leaf_web::ControllerKind for #ident #ty_g #where_c {
+            const RESPONSE_BODY: bool = #response_body;
+        }
+    }
+}
+
+/// The compile-time guard a request-mapping impl emits: assert the controller struct's
+/// declared `@ResponseBody` policy equals this impl's, turning a struct/impl stereotype
+/// mismatch into a clear `compile_error`. See [`emit_controller_kind`].
+fn controller_kind_guard(self_ty: &Type, response_body: bool) -> TokenStream {
+    quote! {
+        const _: () = {
+            ::core::assert!(
+                <#self_ty as ::leaf_web::ControllerKind>::RESPONSE_BODY == #response_body,
+                "controller stereotype mismatch: this `impl` block and the controller struct \
+                 declare different @ResponseBody policies. Use the SAME stereotype on both — \
+                 `#[rest_controller]` on the struct AND the impl, or `#[controller]` on both."
+            );
+        };
+    }
 }
 
 /// Emit ONE generated `Route` bean for a mapped method: the `#[doc(hidden)]` route
@@ -1342,6 +1381,51 @@ mod tests {
         assert!(
             s.contains("::core::any::TypeId::of::<dyn::leaf_core::KeepAlive>()"),
             "and still provides the `dyn KeepAlive` view: {s}"
+        );
+    }
+
+    #[test]
+    fn emit_controller_kind_declares_the_struct_response_body_policy() {
+        // The controller STRUCT emits a `ControllerKind` marker carrying its @ResponseBody
+        // policy, so the matching request-mapping impl can assert agreement.
+        let rest = flat(&emit_controller_kind(&struct_item("struct Api;"), true));
+        assert!(
+            rest.contains("impl::leaf_web::ControllerKindforApi"),
+            "a #[rest_controller] struct impls ControllerKind: {rest}"
+        );
+        assert!(
+            rest.contains("constRESPONSE_BODY:bool=true"),
+            "a #[rest_controller] struct declares RESPONSE_BODY = true: {rest}"
+        );
+        let plain = flat(&emit_controller_kind(&struct_item("struct Api;"), false));
+        assert!(
+            plain.contains("constRESPONSE_BODY:bool=false"),
+            "a #[controller] struct declares RESPONSE_BODY = false: {plain}"
+        );
+    }
+
+    #[test]
+    fn a_controller_impl_emits_the_controller_kind_mismatch_guard() {
+        // Every request-mapping impl appends a compile-time guard asserting the controller
+        // struct's declared @ResponseBody policy equals THIS impl's — so a
+        // `#[rest_controller] struct` + `#[controller] impl` mismatch (or a `#[get]` impl on
+        // a struct never annotated as a controller, which fails the `ControllerKind` bound)
+        // is a hard compile error, not a silent policy disagreement.
+        let item = impl_item(
+            r#"impl Api {
+                #[get("/x")]
+                async fn x(&self) -> Result<Dto, LeafError> { todo!() }
+            }"#,
+        );
+        let rest = flat(&expand_controller_impl(&item, true).expect("emits"));
+        assert!(
+            rest.contains("<Apias::leaf_web::ControllerKind>::RESPONSE_BODY==true"),
+            "a #[rest_controller] impl asserts the struct policy is `true`: {rest}"
+        );
+        let plain = flat(&expand_controller_impl(&item, false).expect("emits"));
+        assert!(
+            plain.contains("<Apias::leaf_web::ControllerKind>::RESPONSE_BODY==false"),
+            "a #[controller] impl asserts the struct policy is `false`: {plain}"
         );
     }
 }

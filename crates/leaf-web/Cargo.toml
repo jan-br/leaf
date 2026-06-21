@@ -74,3 +74,7 @@ leaf-serde.workspace = true
 # `Json<T>` extraction's data model is `serde` the trait via the injected converter; the
 # concrete format lives in `leaf-serde`).
 serde_json = { workspace = true }
+# The compile-fail proof (`tests/ui.rs`): a `#[rest_controller] struct` + `#[controller] impl`
+# stereotype mismatch must be a HARD compile error via the `ControllerKind` guard, not a silent
+# @ResponseBody policy disagreement. trybuild compiles the `tests/ui/*.rs` cases and diffs stderr.
+trybuild = { workspace = true }

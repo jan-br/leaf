@@ -177,7 +177,16 @@ fn expand_controller(
         }
         Item::Struct(item_struct) => {
             match stereotype::emit_struct(&item_struct, stereotype, attr.into()) {
-                Ok(rows) => quote! { #item_struct #rows }.into(),
+                // Emit the `ControllerKind` marker carrying this stereotype's @ResponseBody
+                // policy ALONGSIDE the bean rows, so the matching request-mapping impl can
+                // assert struct/impl agreement (the dual-form mismatch guard).
+                Ok(rows) => {
+                    let kind = leaf_codegen::web_controller::emit_controller_kind(
+                        &item_struct,
+                        response_body,
+                    );
+                    quote! { #item_struct #rows #kind }.into()
+                }
                 Err(err) => {
                     let error = compile_error(&err);
                     quote! { #item_struct #error }.into()

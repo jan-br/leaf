@@ -31,7 +31,7 @@ use leaf_core::{ErrorKind, Injectable, LeafError, Ref, ResolveCtx};
 // `#[get]`/`#[post]` need NOT be imported: the outer `#[rest_controller]` impl macro
 // expands first and STRIPS the inner mapping attrs (lowering them to `Route` beans), so
 // they are never resolved as attribute macros in their own right.
-use leaf_macros::rest_controller;
+use leaf_macros::{controller, rest_controller};
 use leaf_web::testing::MockServer;
 use leaf_web::{Dispatcher, Header, Json, Path, Request, ResponseEntity, Route};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,11 @@ struct NewProduct {
     name: String,
     price_cents: u32,
 }
+
+/// A plain `#[controller]` (no impl) — the NEGATIVE half of the marker-closure proof: it
+/// carries `Controller` + `Component` but NOT the `@ResponseBody` `RestController` marker.
+#[controller]
+struct PlainCtl;
 
 /// The catalog controller bean (a unit struct — no injected collaborators needed for
 /// the proof; a real one would field-inject `Ref<CatalogService>`).
@@ -189,6 +194,39 @@ fn request_with_header(method: Method, path: &str, name: &'static str, value: &'
 }
 
 // ──────────────────────────────────── the proof ──────────────────────────────────
+
+fn descriptor_named(name: &str) -> leaf_core::Descriptor {
+    *leaf_core::COMPONENTS
+        .iter()
+        .find(|d| d.declared_name == Some(name))
+        .unwrap_or_else(|| panic!("`{name}` must roundtrip through COMPONENTS"))
+}
+
+fn has_marker(d: &leaf_core::Descriptor, path: &str) -> bool {
+    d.meta.markers.contains(&leaf_core::MarkerId::of(path))
+}
+
+#[test]
+fn the_controller_stereotypes_carry_their_marker_closure_at_runtime() {
+    // The web stereotypes' transitive marker closure, proven at RUNTIME via COMPONENTS in
+    // the layer that actually has leaf-web. `#[rest_controller]` = `@Controller +
+    // @ResponseBody`: its flattened `meta.markers` carries RestController AND Controller AND
+    // (transitively) Component — the two-hop closure Spring's `@RestController` maps to.
+    let api = descriptor_named("catalog");
+    assert!(has_marker(&api, "leaf::RestController"), "rest_controller carries RestController");
+    assert!(has_marker(&api, "leaf::Controller"), "rest_controller carries Controller");
+    assert!(has_marker(&api, "leaf::Component"), "rest_controller transitively carries Component");
+
+    // The plain `#[controller]` carries Controller + Component but NOT the @ResponseBody
+    // RestController marker.
+    let plain = descriptor_named("plainCtl");
+    assert!(has_marker(&plain, "leaf::Controller"));
+    assert!(has_marker(&plain, "leaf::Component"));
+    assert!(
+        !has_marker(&plain, "leaf::RestController"),
+        "a plain #[controller] must not carry the RestController marker"
+    );
+}
 
 #[test]
 fn a_rest_controller_get_serializes_its_dto_via_the_injected_converter() {

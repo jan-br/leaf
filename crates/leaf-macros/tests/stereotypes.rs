@@ -8,23 +8,22 @@
 //! `linkme` dep; the rows reach `COMPONENTS` through leaf-core's `pub use linkme;`
 //! via `#[::leaf_core::linkme::distributed_slice(...)]` + `#[linkme(crate = ...)]`.
 
-use leaf_macros::{
-    bean, configuration, controller, register_component, repository, rest_controller, service,
-};
+use leaf_macros::{bean, configuration, register_component, repository, service};
 
-// ── @service / @repository / @controller / @configuration stereotypes ──
+// ── @service / @repository / @configuration stereotypes ──
+//
+// The web-targeting @controller / @rest_controller stereotypes are tested in
+// `leaf-web/tests/controller_routes.rs` instead: their struct form now emits the
+// `::leaf_web::ControllerKind` dual-form guard marker, so they can only be expanded where
+// leaf-web (which this proc-macro crate does NOT depend on) is in scope — the same reason
+// every other web macro (`#[web_filter]` / `#[keep_alive]` / `#[control_advice]`) is
+// exercised from leaf-web, not here.
 
 #[service]
 struct UserService;
 
 #[repository]
 struct UserRepo;
-
-#[controller]
-struct UserController;
-
-#[rest_controller]
-struct ApiController;
 
 #[configuration]
 struct AppConfig;
@@ -48,7 +47,6 @@ fn each_stereotype_emits_its_marker_and_transitively_component() {
     for (name, marker) in [
         ("userService", "leaf::Service"),
         ("userRepo", "leaf::Repository"),
-        ("userController", "leaf::Controller"),
         ("appConfig", "leaf::Configuration"),
     ] {
         let d = descriptor_named(name);
@@ -60,27 +58,6 @@ fn each_stereotype_emits_its_marker_and_transitively_component() {
         // The stereotype axis does not change Role (orthogonal); all are Application.
         assert_eq!(d.role, leaf_core::Role::Application);
     }
-}
-
-#[test]
-fn rest_controller_emits_the_two_hop_marker_closure() {
-    // `#[rest_controller]` is the @ResponseBody specialization of @controller: its
-    // flattened meta.markers carries RestController AND Controller AND (transitively)
-    // Component — the two-hop closure Spring's `@RestController = @Controller +
-    // @ResponseBody` maps to. The plain `#[controller]` above carries Controller +
-    // Component but NOT RestController.
-    let api = descriptor_named("apiController");
-    assert!(has_marker(&api, "leaf::RestController"), "rest_controller carries RestController");
-    assert!(has_marker(&api, "leaf::Controller"), "rest_controller carries Controller");
-    assert!(has_marker(&api, "leaf::Component"), "rest_controller transitively carries Component");
-
-    // The plain #[controller] does NOT pick up the @ResponseBody RestController marker.
-    let plain = descriptor_named("userController");
-    assert!(has_marker(&plain, "leaf::Controller"));
-    assert!(
-        !has_marker(&plain, "leaf::RestController"),
-        "a plain #[controller] must not carry the RestController marker"
-    );
 }
 
 // ── @bean factory function ──

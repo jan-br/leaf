@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: controller stereotype mismatch: this `impl` block and the controller struct declare different @ResponseBody policies. Use the SAME stereotype on both — `#[rest_controller]` on the struct AND the impl, or `#[controller]` on both.
+  --> tests/ui/controller_stereotype_mismatch_is_a_hard_error.rs:14:1
+   |
+14 | #[controller]
+   | ^^^^^^^^^^^^^ evaluation of `_` failed here

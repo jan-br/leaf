@@ -105,7 +105,7 @@ pub use extract::{
 };
 pub use filter::{FilterChain, Next, Terminal, WebFilter};
 pub use handler::{
-    Handler, PathParams, Route, RouteMatch, RouteOutcome, RouteReport, RouteTable,
+    ControllerKind, Handler, PathParams, Route, RouteMatch, RouteOutcome, RouteReport, RouteTable,
 };
 pub use embedded::EmbeddedWebServer;
 pub use request::Request;
