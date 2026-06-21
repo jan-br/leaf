@@ -25,3 +25,8 @@ prost-types.workspace = true
 protox.workspace = true
 prost-build.workspace = true
 prost-types.workspace = true
+
+[dev-dependencies]
+# Parse-check the rendered service source in unit tests (no compiler-link needed) —
+# the descriptor.rs `syn::parse_str::<File>` discipline.
+syn = { workspace = true }

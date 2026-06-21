@@ -926,6 +926,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "protox",
+ "syn",
 ]
 
 [[package]]

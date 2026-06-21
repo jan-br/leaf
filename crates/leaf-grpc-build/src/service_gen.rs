@@ -34,8 +34,6 @@ impl CallShape {
 /// The leaf request type for a call shape: `T` (unary/server-stream) wraps to
 /// `leaf_grpc::Streaming<T>` for the client-streaming side. `input`/`output` are the
 /// prost-resolved message type paths (emitted VERBATIM).
-// (Task 3.3: consumed by `render_service` in Task 3.5 — `allow` removed there.)
-#[allow(dead_code)]
 fn request_ty(input: &str, shape: CallShape) -> String {
     match shape {
         CallShape::Unary | CallShape::ServerStream => input.to_string(),
@@ -47,7 +45,6 @@ fn request_ty(input: &str, shape: CallShape) -> String {
 
 /// The leaf response type for a call shape: `Result<U, Status>` (unary/client-stream)
 /// or `Result<Streaming<U>, Status>` (server-stream/bidi).
-#[allow(dead_code)]
 fn response_ty(output: &str, shape: CallShape) -> String {
     let inner = match shape {
         CallShape::Unary | CallShape::ClientStream => output.to_string(),
@@ -59,7 +56,6 @@ fn response_ty(output: &str, shape: CallShape) -> String {
 }
 
 /// The full `async fn` signature line for one RPC (no body/semicolon).
-#[allow(dead_code)]
 fn method_signature(name: &str, input: &str, output: &str, shape: CallShape) -> String {
     format!(
         "async fn {name}(&self, req: {req}) -> {resp}",
@@ -103,7 +99,6 @@ fn shape_const_path(shape: CallShape) -> &'static str {
 }
 
 /// The `pub const <METHOD>_PATH: &str = "/pkg.Service/Method";` line.
-#[allow(dead_code)]
 fn path_const(service: &str, package: &str, method: &str, _svc_alias: &str) -> String {
     let path = grpc_path(package, service, method);
     let ident = const_ident(method);
@@ -113,7 +108,6 @@ fn path_const(service: &str, package: &str, method: &str, _svc_alias: &str) -> S
 /// The `#[doc(hidden)]` const `leaf_grpc::MethodDescriptor` the `#[grpc_controller]`
 /// macro reads: the canonical path + the call shape. Named
 /// `<METHOD>_DESCRIPTOR` beside its `<METHOD>_PATH`.
-#[allow(dead_code)]
 fn method_descriptor(method: &str, package: &str, service: &str, shape: CallShape) -> String {
     let path = grpc_path(package, service, method);
     let ident = const_ident(method);
@@ -122,6 +116,79 @@ fn method_descriptor(method: &str, package: &str, service: &str, shape: CallShap
         "#[doc(hidden)] pub const {ident}_DESCRIPTOR: ::leaf_grpc::MethodDescriptor = \
          ::leaf_grpc::MethodDescriptor {{ path: {path:?}, shape: {shape_path} }};"
     )
+}
+
+/// A single RPC, shape-classified and with its prost-resolved message paths — the
+/// compiler-independent input the assembler renders (Task 3.6 builds these from a real
+/// `prost_build::Service`).
+#[derive(Clone, Debug)]
+pub struct MethodSpec {
+    /// The proto method name (`Get`) — drives the path + const idents.
+    pub name: String,
+    /// The Rust trait-method ident (`get`) — prost's snake_case fn name.
+    pub fn_name: String,
+    /// The prost-resolved request message path (emitted verbatim, e.g. `super::Ping`).
+    pub input: String,
+    /// The prost-resolved response message path.
+    pub output: String,
+    /// The call shape (from the streaming flags).
+    pub shape: CallShape,
+}
+
+/// One gRPC service: its name/package + its methods.
+#[derive(Clone, Debug)]
+pub struct ServiceSpec {
+    /// The proto service name (`Echo`) — the trait ident + path component.
+    pub name: String,
+    /// The proto package (`echo.v1`) — the path prefix (may be empty).
+    pub package: String,
+    /// The RPC methods.
+    pub methods: Vec<MethodSpec>,
+}
+
+/// Snake-case the service name for its containing module (`Echo` -> `echo`,
+/// `EchoService` -> `echo_service`). Pure case mechanics over the proto's OWN name.
+fn module_ident(service: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in service.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i != 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Render one service to Rust source: the `Send + Sync` server trait with one async
+/// method per RPC, plus a `pub mod <service_snake>` holding the `<M>_PATH` constants
+/// and the `#[doc(hidden)] <M>_DESCRIPTOR`s.
+#[must_use]
+pub fn render_service(svc: &ServiceSpec) -> String {
+    let mut out = String::new();
+
+    // ── the server trait (async-fn-in-trait so a `#[grpc_controller]` impl is plain) ──
+    out.push_str(&format!("pub trait {}: Send + Sync {{\n", svc.name));
+    for m in &svc.methods {
+        out.push_str("    ");
+        out.push_str(&method_signature(&m.fn_name, &m.input, &m.output, m.shape));
+        out.push_str(";\n");
+    }
+    out.push_str("}\n\n");
+
+    // ── the per-service module of path constants + method descriptors ──
+    let module = module_ident(&svc.name);
+    out.push_str(&format!("pub mod {module} {{\n"));
+    for m in &svc.methods {
+        out.push_str("    ");
+        out.push_str(&path_const(&svc.name, &svc.package, &m.name, &svc.name));
+        out.push('\n');
+        out.push_str("    ");
+        out.push_str(&method_descriptor(&m.name, &svc.package, &svc.name, m.shape));
+        out.push('\n');
+    }
+    out.push_str("}\n");
+
+    out
 }
 
 #[cfg(test)]
@@ -221,5 +288,53 @@ mod tests {
             d.split_whitespace().collect::<String>().contains("shape:::leaf_grpc::CallShape::Bidi"),
             "got: {d}"
         );
+    }
+
+    fn echo_spec() -> ServiceSpec {
+        ServiceSpec {
+            name: "Echo".into(),
+            package: "echo.v1".into(),
+            methods: vec![
+                MethodSpec {
+                    name: "Get".into(),
+                    fn_name: "get".into(),
+                    input: "super::Ping".into(),
+                    output: "super::Pong".into(),
+                    shape: CallShape::Unary,
+                },
+                MethodSpec {
+                    name: "Chat".into(),
+                    fn_name: "chat".into(),
+                    input: "super::Msg".into(),
+                    output: "super::Msg".into(),
+                    shape: CallShape::Bidi,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn renders_a_compilable_service_module() {
+        let src = render_service(&echo_spec());
+        // The whole rendered service must PARSE as a Rust item sequence (the
+        // descriptor.rs discipline: emit data that parses without a compiler-link).
+        syn::parse_str::<syn::File>(&src).expect("the rendered service is valid Rust items");
+    }
+
+    #[test]
+    fn service_trait_is_send_sync_with_one_method_per_rpc() {
+        let flat = render_service(&echo_spec()).split_whitespace().collect::<String>();
+        assert!(flat.contains("pubtraitEcho:Send+Sync"), "trait is Send+Sync: {flat}");
+        assert!(flat.contains("asyncfnget(&self,req:super::Ping)"), "unary method: {flat}");
+        assert!(flat.contains("asyncfnchat(&self,req:::leaf_grpc::Streaming<super::Msg>)"), "bidi method: {flat}");
+    }
+
+    #[test]
+    fn service_module_holds_paths_and_descriptors_per_method() {
+        let flat = render_service(&echo_spec()).split_whitespace().collect::<String>();
+        assert!(flat.contains(r#"pubconstGET_PATH:&str="/echo.v1.Echo/Get""#), "path const: {flat}");
+        assert!(flat.contains(r#"pubconstCHAT_PATH:&str="/echo.v1.Echo/Chat""#), "path const: {flat}");
+        assert!(flat.contains("GET_DESCRIPTOR:::leaf_grpc::MethodDescriptor"), "descriptor: {flat}");
+        assert!(flat.contains("shape:::leaf_grpc::CallShape::Bidi"), "bidi descriptor: {flat}");
     }
 }
