@@ -27,10 +27,13 @@ http.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
-# A minimal block_on to drive the async framing/dispatch units with no runtime.
+# A minimal block_on to drive the async framing/dispatch units + the DI-assembly proof
+# with no runtime (the same `futures::executor::block_on` leaf-web's assembly test uses).
 futures.workspace = true
-# The DI-assembly proof: leaf-boot lifts the macro-emitted #[bean]/#[auto_config]
-# seeds so a test can resolve Vec<Ref<dyn GrpcRoute>> / dyn ProtocolDispatch /
-# dyn GrpcStatusMapper by collection + by-trait injection (the same path the
-# EmbeddedWebServer uses). Dev-only: production deps stay leaf-core/leaf-web/prost.
+# The DI-assembly proof: leaf-boot lifts the macro-emitted #[bean] rows (App::from_slices)
+# and runs the #[auto_config] FALLBACK ladder (run_autoconfig) so a test can resolve
+# Vec<Ref<dyn GrpcRoute>> / dyn ProtocolDispatch / dyn GrpcStatusMapper by collection +
+# by-trait injection — the LAZY freeze→Engine→Injectable path leaf-web's
+# tests/dispatch_through_mock.rs uses (no eager validate, no transport). Dev-only:
+# production deps stay leaf-core/leaf-web/prost.
 leaf-boot.workspace = true
