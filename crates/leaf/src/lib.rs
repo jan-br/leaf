@@ -146,6 +146,13 @@ pub use leaf_macros::main;
 #[doc(no_inline)]
 pub use leaf_macros::async_impl;
 
+/// `#[grpc_controller]` — the gRPC controller-family stereotype (present iff the `grpc`
+/// capability feature is enabled). Re-exported so the canonical `#[grpc_controller]`
+/// spelling resolves; the prelude also brings it into scope under the `grpc`-gated glob.
+#[cfg(feature = "grpc")]
+#[doc(no_inline)]
+pub use leaf_macros::grpc_controller;
+
 /// The default async runtime (`tokio`), re-exported so an umbrella-only app can build
 /// the executor it owns (`leaf::tokio::runtime::Builder`) or drive a `block_on` test
 /// without naming `tokio` as a direct dependency — the umbrella provides the runtime.

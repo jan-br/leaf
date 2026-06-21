@@ -101,3 +101,12 @@ pub use leaf_starter_web::leaf_web::{
     http, ControlAdvice, Extension, FromRequest, Header, IntoResponse, IntoResponseWith, Json, Next,
     Path, Query, Request, Response, ResponseEntity, WebFilter,
 };
+
+// The gRPC controller-family stereotype (Stage 4), brought into scope flat behind the
+// `grpc` capability feature — the gRPC twin of the `web`-gated `rest_controller`/`web_filter`
+// exports. The macro emits ABSOLUTE `::leaf_grpc::` paths that resolve through the umbrella's
+// `grpc`-gated re-exports + the `extern crate leaf as leaf_grpc;` facade alias. Present iff
+// the `grpc` feature pulled the bundle in.
+#[cfg(feature = "grpc")]
+#[doc(no_inline)]
+pub use leaf_macros::grpc_controller;

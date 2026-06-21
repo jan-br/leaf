@@ -26,6 +26,10 @@ default = []
 redis = ["dep:leaf-starter-redis"]
 # `web` — the STACK starter (the curated additive web bundle).
 web = ["dep:leaf-starter-web"]
+# The gRPC capability (sub-project B). Stage 6 wires `dep:leaf-starter-grpc` (which pulls
+# leaf-grpc + enables `http2` on the backend); this bare feature lets the `#[grpc_controller]`
+# macro export gate behind it from Stage 4 onward.
+grpc = []
 
 [dependencies]
 # THE BASE (always pulled): the kernel ABI, the thin macros, the bootstrap/run
