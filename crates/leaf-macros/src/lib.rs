@@ -204,6 +204,65 @@ fn expand_controller(
     }
 }
 
+/// `#[grpc_controller]` — the gRPC controller-family stereotype (the inbound-RPC handler
+/// family, alongside `#[controller]`/`#[rest_controller]`). TWO forms, EXACTLY like
+/// `#[rest_controller]`:
+///
+/// - on a STRUCT: the controller BEAN — structurally a `#[component]` (so the controller is
+///   registered + resolvable, its collaborators field-injected) that ALSO emits the
+///   `::leaf_grpc::GrpcControllerKind` marker (the dual-form consistency anchor).
+/// - on an inherent IMPL of the Stage-3 server trait (`#[grpc_controller] impl
+///   catalog::Catalog for CatalogController { async fn get(&self, req: ProductReq) ->
+///   Result<Product, Status> {..} }`): the per-RPC ITERATOR. The macro DESUGARS each native
+///   `async fn` (no separate `#[async_impl]`) and re-emits the trait impl, PLUS lowers each
+///   RPC method to a `#[doc(hidden)]` `GrpcRoute` bean (the second `Handler` family) that
+///   provides `dyn ::leaf_grpc::GrpcRoute`, field-injects `Ref<Controller>` + the codec, and
+///   wraps the typed method with framing/codec for its call shape (read from the Stage-3
+///   descriptor seam — NO type-name detection).
+#[proc_macro_attribute]
+pub fn grpc_controller(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let parsed = parse_macro_input!(item as Item);
+    match parsed {
+        Item::Impl(item_impl) => {
+            // Re-emit the trait impl with async desugared (native async, in-macro — the SAME
+            // BoxFuture desugar `#[async_impl]` performs), then append the lowered GrpcRoute
+            // rows. The RPC methods are plain `async fn`s, so there is nothing to STRIP.
+            let desugared = leaf_codegen::async_impl::expand(&item_impl);
+            match leaf_codegen::grpc_controller::expand_grpc_controller_impl(&item_impl) {
+                Ok(rows) => quote! { #desugared #rows }.into(),
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #desugared #error }.into()
+                }
+            }
+        }
+        Item::Struct(item_struct) => {
+            // The struct form uses `Stereotype::Component` (a gRPC controller carries no
+            // @ResponseBody axis — the marker is `GrpcControllerKind`, not a component-marker
+            // variant), so no `stereotype.rs` change is needed and the no-type-name-detection
+            // rule holds (the marker is emitted, not inferred).
+            match stereotype::emit_struct(&item_struct, Stereotype::Component, attr.into()) {
+                Ok(rows) => {
+                    let kind = leaf_codegen::grpc_controller::emit_grpc_controller_kind(&item_struct);
+                    quote! { #item_struct #rows #kind }.into()
+                }
+                Err(err) => {
+                    let error = compile_error(&err);
+                    quote! { #item_struct #error }.into()
+                }
+            }
+        }
+        other => quote! {
+            #other
+            ::core::compile_error!(
+                "#[grpc_controller] applies to a `struct` (the controller bean) or an \
+                 `impl ServiceTrait for Controller` block (its RPC methods)"
+            );
+        }
+        .into(),
+    }
+}
+
 // ═══════════════════ the request-mapping method attributes ═══════════════════
 //
 // These are the request-mapping annotations on a controller method: a method on a
