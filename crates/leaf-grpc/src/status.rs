@@ -43,6 +43,51 @@ pub enum Code {
     Unauthenticated = 16,
 }
 
+/// A gRPC status carried out of a handler: a [`Code`] + a human message, rendered
+/// at the edge as the `grpc-status` / `grpc-message` trailers. The error currency
+/// of the gRPC layer (handlers return `Result<_, Status>`; the
+/// [`GrpcStatusMapper`](crate::GrpcStatusMapper) SPI maps a
+/// [`LeafError`](leaf_core::LeafError) into one).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// The grpc-status code.
+    pub code: Code,
+    /// The grpc-message (a human-readable diagnostic; may be empty).
+    pub message: String,
+}
+
+impl Status {
+    /// A status with an explicit [`Code`] and message.
+    #[must_use]
+    pub fn new(code: Code, message: impl Into<String>) -> Self {
+        Status { code, message: message.into() }
+    }
+
+    /// A [`Code::NotFound`] status — a requested entity was not found.
+    #[must_use]
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Status::new(Code::NotFound, message)
+    }
+
+    /// A [`Code::InvalidArgument`] status — the caller passed an invalid argument.
+    #[must_use]
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        Status::new(Code::InvalidArgument, message)
+    }
+
+    /// A [`Code::Internal`] status — an internal invariant was broken.
+    #[must_use]
+    pub fn internal(message: impl Into<String>) -> Self {
+        Status::new(Code::Internal, message)
+    }
+
+    /// A [`Code::Unimplemented`] status — the RPC is not implemented/supported.
+    #[must_use]
+    pub fn unimplemented(message: impl Into<String>) -> Self {
+        Status::new(Code::Unimplemented, message)
+    }
+}
+
 #[cfg(test)]
 mod code_tests {
     use super::*;
@@ -68,5 +113,28 @@ mod code_tests {
         assert_eq!(Code::Unavailable as i32, 14);
         assert_eq!(Code::DataLoss as i32, 15);
         assert_eq!(Code::Unauthenticated as i32, 16);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn status_new_carries_code_and_message() {
+        let s = Status::new(Code::NotFound, "no such product");
+        assert_eq!(s.code, Code::NotFound);
+        assert_eq!(s.message, "no such product");
+    }
+
+    #[test]
+    fn named_helpers_select_the_right_code() {
+        // The ergonomic ctors used by handlers and the default mapper.
+        assert_eq!(Status::not_found("x").code, Code::NotFound);
+        assert_eq!(Status::invalid_argument("x").code, Code::InvalidArgument);
+        assert_eq!(Status::internal("x").code, Code::Internal);
+        assert_eq!(Status::unimplemented("x").code, Code::Unimplemented);
+        // The message is carried through verbatim.
+        assert_eq!(Status::internal("boom").message, "boom");
     }
 }

@@ -32,4 +32,4 @@ leaf_core::declare_source!("leaf-grpc");
 //   pub use handler::{GrpcHandler, GrpcRoute};
 //   pub use mapper::{DefaultGrpcStatusMapper, GrpcStatusMapper};
 //   pub use streaming::Streaming;
-pub use status::Code;
+pub use status::{Code, Status};
