@@ -69,6 +69,13 @@ pub fn bootstrap(name: &'static str) -> Application {
         .with_name(name)
         .with_spawner(spawner)
         .with_scheduler(scheduler)
+        // The shutdown trigger: leaf-tokio listens for SIGINT/SIGTERM and fires the
+        // run unit's shutdown signal ONCE, so a started KeepAlive (the embedded web
+        // server, Stage 2) quiesces gracefully. This is the FIRST consumer of the
+        // previously-dormant `ShutdownTrigger::arm` seam. A non-web app has no
+        // KeepAlive, so the signal is observed only by a programmatic shutdown — no
+        // behavior change.
+        .with_shutdown_trigger(Arc::new(leaf_tokio::TokioShutdownTrigger::new()))
         // Feed the LIVE anti-DCE self-check the force-linked participating set the
         // enabled capability features know (`leaf::expected_manifest()`): each
         // capability crate `declare_source!`s its SourceTag, so a force-linked-but-
@@ -190,6 +197,12 @@ where
 
         // The user's `async fn main` body, over the live RunningApp.
         let outcome = body(&running).await;
+
+        // PARK until shutdown is requested (SIGTERM/SIGINT or a programmatic fire):
+        // for a web app this keeps the process serving its embedded-server KeepAlive
+        // until a signal arrives. For a non-web app (keep_alive_count == 0) this
+        // returns IMMEDIATELY — identical timing to before, a pure no-op.
+        running.park_until_shutdown().await;
 
         // Drain the teardown ledger LIFO regardless of the body's outcome (a clean
         // shutdown is part of the proof), then surface the body's result.

@@ -51,18 +51,19 @@
 //! [`TeardownLedger`](leaf_core::TeardownLedger) LIFO → [`ShutdownReport`];
 //! (6) `RunState=Closed`.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
 
 use leaf_core::{
-    cmp_chain, AdvisorDescriptor, AvailabilityHandle, BeanId, BoxFuture, ChainKey, CloseReason,
-    Closed, Context, Cx, CxDecorator, DetachedTaskRegistry, DispatchErrorMode, DispatchInterceptor,
-    Engine, Env, EnvBuilder, ErrorKind, InjectionPlan, LeafError, LifecyclePlan, ListenerDescriptor,
-    LivenessState, Multiplicity, OrderKey, ReadinessState, Refreshed, Registry, RegistryBuilder,
-    ResolveCtx, Role, RoleTier, RunState, RunStateReceiver, RunStateSender, SchedulerCore,
-    ShutdownSettings, Spawner, Started, StartupFailed, TeardownOutcome,
+    cmp_chain, shutdown_channel, AdvisorDescriptor, AvailabilityHandle, BeanId, BoxFuture, ChainKey,
+    CloseReason, Closed, Context, Cx, CxDecorator, DetachedTaskRegistry, DispatchErrorMode,
+    DispatchInterceptor, Engine, Env, EnvBuilder, ErrorKind, InjectionPlan, LeafError,
+    LifecyclePlan, ListenerDescriptor, LivenessState, Multiplicity, OrderKey, ReadinessState,
+    Refreshed, Registry, RegistryBuilder, ResolveCtx, Role, RoleTier, RunState, RunStateReceiver,
+    RunStateSender, SchedulerCore, ShutdownSignal, ShutdownTriggerHandle, ShutdownSettings, Spawner,
+    SpawnHandle, Started, StartupFailed, TeardownOutcome,
 };
 
 use crate::events::EventPublisher;
@@ -199,6 +200,21 @@ pub struct RunUnit {
     generation: AtomicU32,
     /// The CAS close-once flag (teardown is valid at most once, from `Running`).
     closing: AtomicBool,
+    /// The backend-free shutdown signal handed to every started
+    /// [`KeepAlive`](leaf_core::KeepAlive) (the subscribing half of the handshake).
+    shutdown_signal: ShutdownSignal,
+    /// The paired sender leaf-boot ARMs onto the [`ShutdownTrigger`](leaf_core::ShutdownTrigger)
+    /// (SIGINT/SIGTERM) AND fires from a programmatic teardown, so a started
+    /// `KeepAlive` quiesces either way through the SAME signal.
+    shutdown_trigger_handle: ShutdownTriggerHandle,
+    /// The count of started [`KeepAlive`](leaf_core::KeepAlive) components — the
+    /// DETERMINISTIC park gate (`0` ⇒ a non-web app returns immediately, no
+    /// type-name detection).
+    keep_alive_count: AtomicUsize,
+    /// The spawned [`KeepAlive`](leaf_core::KeepAlive) handles, joined (bounded by
+    /// the grace budget) BEFORE the detached-task drain at teardown. Reuses the SAME
+    /// reactive race+abort drain primitive as the detached async-event tasks.
+    keepalive_handles: Arc<DetachedTaskRegistry>,
 }
 
 impl RunUnit {
@@ -221,6 +237,7 @@ impl RunUnit {
     #[must_use]
     pub fn over_engine(engine: Engine, env: Env) -> Self {
         let (tx, rx) = leaf_core::run_state_channel();
+        let (shutdown_signal, shutdown_trigger_handle) = shutdown_channel();
         RunUnit {
             engine: Some(engine),
             env,
@@ -248,6 +265,10 @@ impl RunUnit {
             shutdown_settings: ShutdownSettings::default(),
             generation: AtomicU32::new(0),
             closing: AtomicBool::new(false),
+            shutdown_signal,
+            shutdown_trigger_handle,
+            keep_alive_count: AtomicUsize::new(0),
+            keepalive_handles: Arc::new(DetachedTaskRegistry::new()),
         }
     }
 
@@ -411,6 +432,13 @@ impl RunUnit {
         self
     }
 
+    /// The shutdown drain budgets (`[C1/C7]`) — the `grace` budget bounds the
+    /// KeepAlive join at teardown and is handed to each started component.
+    #[must_use]
+    pub fn shutdown_settings(&self) -> ShutdownSettings {
+        self.shutdown_settings
+    }
+
     /// The live [`Context`] façade (the BeanFactory surface). Panics if called
     /// before [`refresh`](RunUnit::refresh).
     #[must_use]
@@ -435,6 +463,36 @@ impl RunUnit {
     #[must_use]
     pub fn watch_run_state(&self) -> RunStateReceiver {
         self.run_state_tx.subscribe()
+    }
+
+    /// The backend-free [`ShutdownSignal`](leaf_core::ShutdownSignal) handed to every
+    /// started [`KeepAlive`](leaf_core::KeepAlive) — also what
+    /// `RunningApp::park_until_shutdown` parks on for a web app.
+    #[must_use]
+    pub fn shutdown_signal(&self) -> ShutdownSignal {
+        self.shutdown_signal.clone()
+    }
+
+    /// A clone of the paired [`ShutdownTriggerHandle`](leaf_core::ShutdownTriggerHandle)
+    /// (the run pipeline ARMs this onto the [`ShutdownTrigger`](leaf_core::ShutdownTrigger)).
+    #[must_use]
+    pub fn shutdown_trigger_handle(&self) -> ShutdownTriggerHandle {
+        self.shutdown_trigger_handle.clone()
+    }
+
+    /// Register a started [`KeepAlive`](leaf_core::KeepAlive)'s spawned
+    /// [`SpawnHandle`](leaf_core::SpawnHandle) (joined, bounded by the grace budget,
+    /// at teardown) and bump the keep-alive count.
+    pub fn register_keep_alive(&self, handle: SpawnHandle) {
+        self.keepalive_handles.register(handle);
+        self.keep_alive_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The number of started [`KeepAlive`](leaf_core::KeepAlive) components — the
+    /// DETERMINISTIC park gate (`0` ⇒ a non-web app; `> 0` ⇒ park until shutdown).
+    #[must_use]
+    pub fn keep_alive_count(&self) -> usize {
+        self.keep_alive_count.load(Ordering::SeqCst)
     }
 
     // ── R0..R8: refresh ──────────────────────────────────────────────────────
@@ -662,6 +720,16 @@ impl RunUnit {
         }
         self.transition(RunState::Stopping);
 
+        // (1b) QUIESCE every started KeepAlive: FIRE the shutdown signal so a running
+        // component (its `start` future parked on `ctx.shutdown.quiesce()`) drains,
+        // THEN JOIN the spawned handles bounded by the `grace` budget (the SAME
+        // sleeper/deadline primitive the detached-task drain uses), aborting any
+        // survivor past the deadline. This runs BEFORE the detached-task drain. A
+        // non-web app (zero KeepAlive handles) makes this a no-op — production
+        // behavior is unchanged.
+        self.shutdown_trigger_handle.fire();
+        self.join_keepalive_handles().await;
+
         // (2) the C7 in-flight-request DRAIN under the two budgets. REACTIVELY
         // drain the in-flight DETACHED fire-and-forget async-event tasks (the
         // `DispatchOutcome::Scheduled` path) via the per-app drain registry: race
@@ -694,6 +762,23 @@ impl RunUnit {
         self.transition(RunState::Closed);
 
         ShutdownReport { run_state: RunState::Closed, reason, shutdown: outcome }
+    }
+
+    /// JOIN every started [`KeepAlive`](leaf_core::KeepAlive) handle bounded by the
+    /// `grace` budget, via the SAME reactive race+abort drain primitive the detached
+    /// async-event tasks use ([`DetachedTaskRegistry::drain_with_deadline`]): race the
+    /// held handles against the runtime-supplied reactive sleep (the `drain_sleeper`),
+    /// aborting any survivor past the deadline. With no `drain_sleeper` /
+    /// `Deadline::Indefinite` the join is an unbounded clean drain. Empty (the non-web
+    /// app) ⇒ an immediate no-op. NO `futures` in leaf-boot library code — the race
+    /// lives in the leaf-core primitive.
+    async fn join_keepalive_handles(&self) {
+        let deadline = self
+            .shutdown_settings
+            .grace
+            .as_duration()
+            .and_then(|d| self.drain_sleeper.as_ref().map(|sleep| sleep(d)));
+        let _drained = self.keepalive_handles.drain_with_deadline(deadline).await;
     }
 
     // ── cancel-cascade (B) ─────────────────────────────────────────────────────
@@ -1479,5 +1564,88 @@ mod tests {
         let unit = RunUnit::from_builder(RegistryBuilder::new()).unwrap().with_scheduled(vec![task]);
         let err = block(unit.refresh()).expect_err("no scheduler for a scheduled task");
         assert_eq!(err.kind, ErrorKind::NoSuchBean);
+    }
+
+    // ── KeepAlive teardown: the bounded grace-join (Stage 1 machinery) ──────────
+    //
+    // The KeepAlive analogue of `shutdown_aborts_a_hung_detached_async_event_task`:
+    // a started KeepAlive whose task IGNORES the shutdown signal is JOINED bounded by
+    // the `grace` budget — the deadline fires and the handle is ABORTED, so shutdown
+    // reaches Closed promptly instead of hanging on the stubborn component.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_aborts_a_stubborn_keepalive_past_the_grace_deadline() {
+        use leaf_core::{Deadline, ShutdownSettings};
+        let _ = leaf_tokio::install_ambient_store();
+        let spawner = Arc::new(leaf_tokio::TokioExecutionFacility::new());
+        let unit = RunUnit::from_builder(RegistryBuilder::new())
+            .unwrap()
+            .with_spawner(Arc::clone(&spawner) as Arc<dyn Spawner>)
+            .with_shutdown_settings(ShutdownSettings {
+                grace: Deadline::After(Duration::from_millis(50)),
+                finalize_grace: Deadline::Indefinite,
+            })
+            .with_drain_sleeper(|d| Box::pin(tokio::time::sleep(d)))
+            .refresh()
+            .await
+            .expect("the empty unit refreshes to Running");
+
+        // A stubborn KeepAlive task: parks forever (ignores the signal). Only an
+        // abort frees it — the grace-join must bound it.
+        let handle = spawner.spawn(Box::pin(async {
+            std::future::pending::<()>().await;
+        }));
+        unit.register_keep_alive(handle);
+        assert_eq!(unit.keep_alive_count(), 1, "the KeepAlive registered + counted");
+
+        let start = std::time::Instant::now();
+        let report = unit.shutdown().await;
+        let elapsed = start.elapsed();
+        assert_eq!(report.run_state, RunState::Closed, "shutdown still reached Closed");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the grace-join aborted the stubborn KeepAlive (elapsed {elapsed:?}), not hung"
+        );
+    }
+
+    // A COOPERATIVE KeepAlive — one that parks on `ctx.shutdown.quiesce()` and then
+    // returns — is JOINED cleanly: the teardown FIRES the signal, the task drains, and
+    // the join completes well within the grace budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cleanly_joins_a_cooperative_keepalive() {
+        use leaf_core::{Deadline, ShutdownSettings};
+        let _ = leaf_tokio::install_ambient_store();
+        let spawner = Arc::new(leaf_tokio::TokioExecutionFacility::new());
+        let unit = RunUnit::from_builder(RegistryBuilder::new())
+            .unwrap()
+            .with_spawner(Arc::clone(&spawner) as Arc<dyn Spawner>)
+            .with_shutdown_settings(ShutdownSettings {
+                grace: Deadline::After(Duration::from_secs(5)),
+                finalize_grace: Deadline::Indefinite,
+            })
+            .with_drain_sleeper(|d| Box::pin(tokio::time::sleep(d)))
+            .refresh()
+            .await
+            .expect("the empty unit refreshes to Running");
+
+        // The component parks on the unit's reactive shutdown signal, then records it
+        // drained — exactly the cooperative `KeepAlive::start` shape.
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = Arc::clone(&drained);
+        let signal = unit.shutdown_signal();
+        let handle = spawner.spawn(Box::pin(async move {
+            signal.quiesce().await;
+            d.store(true, Ordering::SeqCst);
+        }));
+        unit.register_keep_alive(handle);
+
+        let start = std::time::Instant::now();
+        let report = unit.shutdown().await;
+        let elapsed = start.elapsed();
+        assert_eq!(report.run_state, RunState::Closed);
+        assert!(drained.load(Ordering::SeqCst), "the cooperative KeepAlive drained on the fired signal");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the clean join completed well within the grace budget (elapsed {elapsed:?})"
+        );
     }
 }

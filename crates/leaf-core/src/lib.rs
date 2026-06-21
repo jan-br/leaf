@@ -93,6 +93,7 @@ pub mod identity;
 pub mod injectable;
 pub mod injectable_ctor;
 pub mod injection;
+pub mod keepalive;
 pub mod lifecycle;
 pub mod lifecycle_engine;
 pub mod metadata;
@@ -250,6 +251,18 @@ pub use metadata::{
 pub use lifecycle::{
     run_state_channel, run_state_sender, watch_channel, watch_run_state, Changed, Lifecycle,
     RunState, RunStateReceiver, RunStateSender, Shutdown, WaitFor, WatchReceiver, WatchSender,
+};
+
+// - keepalive: the long-running lifecycle-component machinery (Spring
+//   `SmartLifecycle` analogue) — the backend-free `ShutdownSignal`/
+//   `ShutdownTriggerHandle` handshake over the SAME std-based `watch` cell (NO
+//   tokio), the `LifecycleCtx` (shutdown + on_ready readiness latch + grace
+//   budget), and the `KeepAlive` dyn-view trait leaf-boot collects + spawns. The
+//   embedded web server (Stage 2) implements `KeepAlive`; leaf-boot names no
+//   leaf-web type.
+
+pub use keepalive::{
+    shutdown_channel, KeepAlive, LifecycleCtx, ShutdownSignal, ShutdownTriggerHandle,
 };
 
 // - cx: the ONE ambient bundle (`Cx`/`CxKey`/`Propagation`), the `AmbientStore`

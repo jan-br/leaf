@@ -234,6 +234,24 @@ impl RunningApp {
     pub async fn shutdown(&self) -> crate::ShutdownReport {
         self.unit.shutdown().await
     }
+
+    /// PARK the caller until shutdown is requested — the embedded-server lifetime
+    /// seam (the Spring `WebServer` "keep the process serving" model).
+    ///
+    /// DETERMINISTIC gate (no type-name detection): returns IMMEDIATELY when
+    /// [`keep_alive_count`](leaf_core::lifecycle) is `0` (a non-web app — identical
+    /// timing to today, a pure no-op). With one or more started
+    /// [`KeepAlive`](leaf_core::KeepAlive) components it parks on the unit's reactive
+    /// [`ShutdownSignal::quiesce`](leaf_core::ShutdownSignal::quiesce) until a
+    /// SIGTERM/SIGINT-armed trigger or a programmatic [`shutdown`](RunningApp::shutdown)
+    /// fires the signal. The await is runtime-neutral (it parks on leaf's own `watch`
+    /// cell — NO `tokio::select!`).
+    pub async fn park_until_shutdown(&self) {
+        if self.unit.keep_alive_count() == 0 {
+            return; // the non-web fast path: nothing to park on.
+        }
+        self.unit.shutdown_signal().quiesce().await;
+    }
 }
 
 impl std::process::Termination for RunningApp {
@@ -275,6 +293,7 @@ pub struct Application {
     plan_of: PlanResolver,
     inj_of: InjectionResolver,
     spawner: Option<Arc<dyn Spawner>>,
+    shutdown_trigger: Option<Arc<dyn leaf_core::ShutdownTrigger>>,
     scheduler: Option<Arc<dyn SchedulerCore>>,
     cron_factory: Option<CronTriggerFactory>,
     analyzers: Vec<Box<dyn FailureAnalyzer>>,
@@ -310,6 +329,7 @@ impl Application {
             plan_of: Arc::new(|_| LifecyclePlan::EMPTY),
             inj_of: Arc::new(|_| InjectionPlan::EMPTY),
             spawner: None,
+            shutdown_trigger: None,
             scheduler: None,
             cron_factory: None,
             analyzers: Vec::new(),
@@ -487,6 +507,17 @@ impl Application {
     #[must_use]
     pub fn with_spawner(mut self, spawner: Arc<dyn Spawner>) -> Self {
         self.spawner = Some(spawner);
+        self
+    }
+
+    /// The [`ShutdownTrigger`](leaf_core::ShutdownTrigger) the run pipeline ARMs onto
+    /// the run unit's shutdown signal (the leaf-tokio impl listens for SIGINT/SIGTERM
+    /// and fires once). With no trigger configured the signal is fired only by a
+    /// programmatic `RunningApp::shutdown` — the previously-dormant `arm` seam is now
+    /// closed by [`Application::run`].
+    #[must_use]
+    pub fn with_shutdown_trigger(mut self, trigger: Arc<dyn leaf_core::ShutdownTrigger>) -> Self {
+        self.shutdown_trigger = Some(trigger);
         self
     }
 
@@ -808,14 +839,37 @@ impl Application {
         // (12) Started + Liveness=Correct already fired inside refresh R8.
         *phase = RunMilestone::Started;
 
+        // (12b) ARM the shutdown trigger ONCE (the FIRST-EVER `arm` call — closes the
+        // audit gap): the configured `ShutdownTrigger` (leaf-tokio = SIGINT/SIGTERM)
+        // fires the unit's shutdown signal so any started KeepAlive quiesces. A
+        // programmatic `RunningApp::shutdown` fires the same handle. With no trigger
+        // configured this is skipped — production behavior is unchanged.
+        if let Some(trigger) = self.shutdown_trigger.as_ref() {
+            let handle = unit.shutdown_trigger_handle();
+            trigger.arm(Box::new(move || handle.fire()));
+        }
+
         // (13) call_runners() in the readiness-gate window (after Started+Liveness,
         // BEFORE Ready+Readiness) — sequentially, abort on the first Err. The
-        // `#[runner]` beans are AUTO-COLLECTED from the live Context here.
+        // `#[runner]` beans are AUTO-COLLECTED from the live Context here. UNCHANGED.
         self.call_runners(unit.context(), &run_args).await?;
         *phase = RunMilestone::RunnersInvoked;
 
+        // (13b) COLLECT + START the KeepAlive lifecycle components (Stage 1: a no-op
+        // in every existing app — no real KeepAlive bean exists yet). Each provider of
+        // the `dyn KeepAlive` VIEW is collected through the SAME by-trait/collection
+        // path `dyn Route`/`dyn WebFilter` use, then SPAWNED via the unit's Spawner
+        // onto a `LifecycleCtx` whose `on_ready` flips readiness and whose `shutdown`
+        // is the unit's reactive signal. The spawned handle is registered for the
+        // bounded grace-join at teardown.
+        self.start_keep_alives(&unit).await?;
+
         // (14) Ready: flip Readiness=AcceptingTraffic (the K8s readiness gate — the
         // `Ready` fact IS the AvailabilityChanged(Readiness) the watch cell wakes).
+        // For a non-web app (keep_alive_count == 0) this is the SOLE readiness flip,
+        // exactly as before. With KeepAlive components the `on_ready` latch flips it
+        // when each binds/serves; this site is the BOUNDED FALLBACK so readiness can
+        // never get stuck if a component's `on_ready` is slow (idempotent re-publish).
         unit.availability()
             .set_readiness(leaf_core::ReadinessState::AcceptingTraffic, "ready");
         *phase = RunMilestone::Ready;
@@ -942,6 +996,68 @@ impl Application {
             let bean = engine.get_erased(BeanKey::ByContract(contract)).await?;
             let runner = upcast(bean).ok_or_else(|| runner_upcast_failed(contract))?;
             runner.run(args).await?;
+        }
+        Ok(())
+    }
+
+    /// COLLECT every [`KeepAlive`](leaf_core::KeepAlive) provider from the live
+    /// engine and START each on the unit's [`Spawner`], registering the spawned handle
+    /// for the bounded grace-join at teardown.
+    ///
+    /// The collection rides the SAME by-trait/collection seam `dyn Route`/`dyn
+    /// WebFilter` use ([`Engine::resolve_collection`](leaf_core::Engine::resolve_collection)
+    /// over `TypeId::of::<dyn KeepAlive>()` + [`view_from_holder`](leaf_core::view_from_holder))
+    /// — never a type-name match. Each started component receives a
+    /// [`LifecycleCtx`](leaf_core::LifecycleCtx): the unit's reactive `shutdown`
+    /// signal, an `on_ready` closure that flips readiness to `AcceptingTraffic` when
+    /// the component is serving, and the `grace` budget. The `KeepAlive::start` future
+    /// is `'static` (it owns its `ctx`), so it spawns cleanly; its `Result` is logged
+    /// (a start fault never aborts the already-Ready app — it surfaces at the join).
+    ///
+    /// Stage 1: with NO real KeepAlive bean in production this collects ZERO providers
+    /// and is a pure no-op (the spawn/register path never runs) — production behavior
+    /// is unchanged. A missing [`Spawner`] when a KeepAlive IS present is a loud fault.
+    ///
+    /// # Errors
+    /// A [`LeafError`] from the collection resolve, or a missing [`Spawner`] when at
+    /// least one KeepAlive provider needs to be spawned.
+    async fn start_keep_alives(&self, unit: &RunUnit) -> Result<(), LeafError> {
+        let engine = unit.context().engine();
+        let holders = engine
+            .resolve_collection(std::any::TypeId::of::<dyn leaf_core::KeepAlive>())
+            .await?;
+        if holders.is_empty() {
+            return Ok(()); // the non-web fast path: zero KeepAlive components.
+        }
+        let spawner = self.spawner.as_ref().ok_or_else(missing_keep_alive_spawner)?;
+        let grace = unit.shutdown_settings().grace.as_duration();
+        for holder in holders {
+            let component: leaf_core::Ref<dyn leaf_core::KeepAlive> =
+                leaf_core::view_from_holder::<dyn leaf_core::KeepAlive>(holder)?;
+            // The on_ready latch: flip readiness when the component is bound/serving.
+            // A clone of the availability handle writes the SAME cell.
+            let availability = unit.availability().clone();
+            let on_ready: Box<dyn FnOnce() + Send> = Box::new(move || {
+                availability
+                    .set_readiness(leaf_core::ReadinessState::AcceptingTraffic, "ready");
+            });
+            let ctx = leaf_core::LifecycleCtx {
+                shutdown: unit.shutdown_signal(),
+                on_ready,
+                grace,
+            };
+            // `start` returns a 'static future that resolves when the component has
+            // fully stopped; spawn it and retain the handle for the grace-join.
+            let fut = component.start(ctx);
+            let started: leaf_core::BoxFuture<'static, ()> = Box::pin(async move {
+                if let Err(err) = fut.await {
+                    // Degrade-and-warn (leaf-boot's house style): a KeepAlive fault
+                    // never aborts the already-Ready app — it surfaces here.
+                    eprintln!("a KeepAlive component stopped with an error: {err}");
+                }
+            });
+            let handle = spawner.spawn(started);
+            unit.register_keep_alive(handle);
         }
         Ok(())
     }
@@ -1089,6 +1205,17 @@ fn runner_upcast_failed(contract: leaf_core::ContractId) -> LeafError {
              recover an `Arc<dyn Runner>` (the macro-emitted thunk names a different concrete type \
              than the resolved bean)"
         ),
+    ))
+}
+
+/// A KeepAlive lifecycle component is present but no [`Spawner`] is configured to
+/// run it on (the embedded server needs an executor for its long-running task).
+fn missing_keep_alive_spawner() -> LeafError {
+    LeafError::new(leaf_core::ErrorKind::NoSuchBean).caused_by(leaf_core::Cause::plain(
+        "starting the KeepAlive lifecycle components",
+        "a `KeepAlive` component is registered but no `Spawner` is configured to run its \
+         long-running task on. Force-link a runtime (the default `tokio` feature pulls \
+         leaf-tokio's ExecutionFacility) or configure a `Spawner` via `with_spawner`.",
     ))
 }
 
