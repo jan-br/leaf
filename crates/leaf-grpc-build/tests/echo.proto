@@ -1,0 +1,16 @@
+syntax = "proto3";
+package echo.v1;
+
+message Ping { string msg = 1; }
+message Pong { string msg = 1; }
+
+service Echo {
+  // unary
+  rpc Get(Ping) returns (Pong);
+  // server-streaming
+  rpc List(Ping) returns (stream Pong);
+  // client-streaming
+  rpc Upload(stream Ping) returns (Pong);
+  // bidi
+  rpc Chat(stream Ping) returns (stream Pong);
+}

@@ -30,3 +30,10 @@ prost-types.workspace = true
 # Parse-check the rendered service source in unit tests (no compiler-link needed) —
 # the descriptor.rs `syn::parse_str::<File>` discipline.
 syn = { workspace = true }
+# The build-output proof (`tests/generated_service.rs`) includes the generated module
+# and exercises the leaf server trait — whose signatures name `leaf_grpc::Streaming`/
+# `Status`/`CallShape`/`MethodDescriptor` (Stage 2). Dev-only: the production lib names
+# no leaf-* crate. prost (the runtime message codec) backs the generated `#[derive(Message)]`
+# structs at TEST compile time.
+leaf-grpc = { workspace = true }
+prost = { workspace = true }

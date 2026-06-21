@@ -167,6 +167,10 @@ pub fn render_service(svc: &ServiceSpec) -> String {
     let mut out = String::new();
 
     // ── the server trait (async-fn-in-trait so a `#[grpc_controller]` impl is plain) ──
+    // `#[allow(async_fn_in_trait)]`: the trait is implemented ONLY in the app's own
+    // crate (via `#[grpc_controller]`) — the lint's documented escape — so the missing
+    // `Send` bound on the returned future is intentional, not a public-API hazard.
+    out.push_str("#[allow(async_fn_in_trait)]\n");
     out.push_str(&format!("pub trait {}: Send + Sync {{\n", svc.name));
     for m in &svc.methods {
         out.push_str("    ");
