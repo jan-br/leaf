@@ -146,10 +146,11 @@ fn emit_grpc_route_bean(
     let descriptor_path = descriptor_const_path(service_trait, &method_name);
     // `path()` reads the descriptor's `.path` field (the `/pkg.Service/Method` const).
     let path_expr = quote! { #descriptor_path.path };
-    // The CALL-SHAPE wrapper token: which framing/codec adapter `call` wraps the typed method
-    // with (unary/server/client/bidi). Read from the descriptor seam — never inferred from the
-    // textual type of `req`/the return.
-    let dispatch = shape_dispatch(&descriptor_path, method_ident);
+    // The CALL-SHAPE wrapper: which framing/codec adapter `call` wraps the typed method with
+    // (unary/server/client/bidi). See [`shape_dispatch`] for the descriptor-authority +
+    // structural-selection design (and why one wrapper is emitted, not a four-arm match).
+    let shape = classify_call_shape(method);
+    let dispatch = shape_dispatch(&descriptor_path, shape, method_ident);
 
     // The struct's injected fields (field injection through `Injectable`): the controller bean
     // + the prost codec. `&*self.controller` / `&*self.codec` deref the `Ref<…>` to the
@@ -219,38 +220,110 @@ fn emit_grpc_route_bean(
     Ok(quote! { #items #registration })
 }
 
-/// The CALL-SHAPE dispatch expression: wrap the typed user method with the framing/codec
-/// adapter selected by the method's gRPC shape (unary/server/client/bidi). The macro reads
-/// the shape from the Stage-3 descriptor seam (a `const` the macro NAMES, never a type
-/// check): the emitted `match` lets the COMPILER pick the wrapper from the const shape, so
-/// the macro inspects NO type. All four arms are present; the const-folded `match` keeps one.
-fn shape_dispatch(descriptor_path: &TokenStream, method_ident: &syn::Ident) -> TokenStream {
+/// The CALL-SHAPE dispatch expression: wrap the typed user method with the ONE framing/codec
+/// adapter for its gRPC shape (`call_unary`/`call_server_stream`/`call_client_stream`/
+/// `call_bidi`).
+///
+/// ## Why ONE wrapper, not a four-arm `match` on the descriptor const (a deviation)
+///
+/// The original plan emitted a four-arm `match #descriptor.shape { … }` so "the compiler
+/// picks the wrapper from the const shape." That does NOT compile: Rust typechecks ALL match
+/// arms before any const-folding, and the four wrappers carry DIFFERENT closure-return bounds
+/// (`call_server_stream`/`call_bidi` require `Result<Streaming<U>, Status>`, `call_unary`/
+/// `call_client_stream` require `Result<U, Status>`) — a single native method signature
+/// (e.g. unary `T -> Result<U, Status>`) can satisfy only its own arm, so the others are
+/// hard type errors. The macro must therefore emit exactly ONE wrapper call, chosen at MACRO
+/// time. The macro cannot read the descriptor const's RUNTIME `.shape` value, so the shape is
+/// classified STRUCTURALLY (see [`classify_call_shape`]) — the SAME `(client_streaming,
+/// server_streaming)` classification Stage-3 itself performs, expressed over the framework's
+/// own `Streaming<…>` wrapper on the param/return (NOT a user message-type name, and via
+/// `syn::Ident`-to-`syn::Ident` equality so no ident-to-string-literal type-name detection
+/// is introduced).
+///
+/// The descriptor const stays AUTHORITATIVE for `path()` and for the runtime shape; this
+/// also emits a `const _` assertion that the structurally-classified shape EQUALS
+/// `#descriptor.shape`, so a structural/descriptor disagreement is a hard compile error (the
+/// descriptor remains the source of truth — the structural pick can never silently diverge).
+fn shape_dispatch(
+    descriptor_path: &TokenStream,
+    shape: CallShape,
+    method_ident: &syn::Ident,
+) -> TokenStream {
     // The typed invocation, referenced by method name on the injected controller Ref. The
     // wrapper supplies `__msg` (T for unary/server-stream, Streaming<T> for client-stream/bidi)
     // and consumes the method's returned future. ONE invocation form serves all four shapes —
     // the wrapper differs, not the call.
     let invoke = quote! { __controller.#method_ident(__msg).await };
-    // The shape is the descriptor const's `.shape` field (the `MethodDescriptor` const the
-    // macro names, never a type check): the emitted `match` lets the COMPILER pick the wrapper
-    // from the const shape, so the macro inspects NO type. All four arms are present; the
-    // const-folded `match` keeps one. The wrapper closures are monomorphized per generated
-    // method so each sees the concrete `T`/`U`.
+    let (wrapper, shape_variant) = match shape {
+        CallShape::Unary => (quote!(call_unary), quote!(Unary)),
+        CallShape::ServerStream => (quote!(call_server_stream), quote!(ServerStream)),
+        CallShape::ClientStream => (quote!(call_client_stream), quote!(ClientStream)),
+        CallShape::Bidi => (quote!(call_bidi), quote!(Bidi)),
+    };
     quote! {
-        match #descriptor_path.shape {
-            ::leaf_grpc::CallShape::Unary => {
-                ::leaf_grpc::call_unary(__req, __codec, |__msg| async move { #invoke }).await
-            }
-            ::leaf_grpc::CallShape::ServerStream => {
-                ::leaf_grpc::call_server_stream(__req, __codec, |__msg| async move { #invoke }).await
-            }
-            ::leaf_grpc::CallShape::ClientStream => {
-                ::leaf_grpc::call_client_stream(__req, __codec, |__msg| async move { #invoke }).await
-            }
-            ::leaf_grpc::CallShape::Bidi => {
-                ::leaf_grpc::call_bidi(__req, __codec, |__msg| async move { #invoke }).await
-            }
-        }
+        // The descriptor stays AUTHORITATIVE: assert the structurally-classified shape equals
+        // the Stage-3 descriptor const's shape (a const-folded check; a disagreement is a hard
+        // compile error, so the wire shape never silently diverges from the descriptor).
+        const _: () = ::core::assert!(
+            matches!(#descriptor_path.shape, ::leaf_grpc::CallShape::#shape_variant),
+            "gRPC call-shape mismatch: the method's signature shape disagrees with its \
+             Stage-3 descriptor shape. Regenerate the service trait from the .proto."
+        );
+        ::leaf_grpc::#wrapper(__req, __codec, |__msg| async move { #invoke }).await
     }
+}
+
+/// Classify an RPC method's [`CallShape`] STRUCTURALLY from the framework's `Streaming<…>`
+/// wrapper on the (first non-receiver) parameter + the return's `Ok` type — the SAME
+/// `(client_streaming, server_streaming)` classification Stage-3 performs. A `Streaming<T>`
+/// PARAMETER ⇒ client-streaming; a `Result<Streaming<U>, _>` RETURN ⇒ server-streaming.
+///
+/// This is structural arg/return handling (the allowed kind), NEVER a branch on a user
+/// message-type name, and uses `syn::Ident`-to-`syn::Ident` equality — so it introduces NO
+/// ident-to-string-literal type-name detection. The descriptor const remains authoritative;
+/// [`shape_dispatch`] emits a compile-time assertion that this classification matches it.
+fn classify_call_shape(method: &ImplItemFn) -> CallShape {
+    let client_streaming = first_param_type(method).is_some_and(is_streaming_wrapped);
+    let server_streaming = result_ok_type(&method.sig.output).is_some_and(is_streaming_wrapped);
+    match (client_streaming, server_streaming) {
+        (false, false) => CallShape::Unary,
+        (false, true) => CallShape::ServerStream,
+        (true, false) => CallShape::ClientStream,
+        (true, true) => CallShape::Bidi,
+    }
+}
+
+/// The type of the FIRST non-receiver parameter (the single request `T` or `Streaming<T>`),
+/// or `None` for a no-argument method.
+fn first_param_type(method: &ImplItemFn) -> Option<&Type> {
+    method.sig.inputs.iter().find_map(|a| match a {
+        FnArg::Typed(pt) => Some(&*pt.ty),
+        FnArg::Receiver(_) => None,
+    })
+}
+
+/// The `Ok` type of a `Result<Ok, Err>` return (the `U` or `Streaming<U>`), or `None` for a
+/// non-`Result` / unit return.
+fn result_ok_type(output: &syn::ReturnType) -> Option<&Type> {
+    let syn::ReturnType::Type(_, ty) = output else { return None };
+    let Type::Path(tp) = &**ty else { return None };
+    let last = tp.path.segments.last()?;
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else { return None };
+    args.args.iter().find_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    })
+}
+
+/// `true` iff `ty` is the framework's `Streaming<…>` wrapper — matched by the LAST path
+/// segment's ident via `syn::Ident`-to-`syn::Ident` equality (the framework's OWN streaming
+/// marker, not a user message-type name; no ident-to-string-literal comparison). The
+/// `::leaf_grpc::Streaming` / `leaf_grpc::Streaming` / bare `Streaming` spellings all
+/// classify, so an aliased message type inside the wrapper is irrelevant.
+fn is_streaming_wrapped(ty: &Type) -> bool {
+    let Type::Path(tp) = ty else { return false };
+    let streaming = format_ident!("Streaming");
+    tp.path.segments.last().is_some_and(|s| s.ident == streaming)
 }
 
 /// The `<service-mod>::<METHOD>_DESCRIPTOR` const path for a method NAME. DRIFT-aware: the
