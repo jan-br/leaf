@@ -38,3 +38,16 @@ pub use handler::{GrpcHandler, GrpcRoute};
 pub use mapper::{DefaultGrpcStatusMapper, GrpcStatusMapper};
 pub use status::{Code, Status};
 pub use streaming::Streaming;
+
+/// Splice a `leaf-grpc-build`-generated module into the current scope.
+///
+/// `leaf_grpc::include_proto!("pkg")` expands to
+/// `include!(concat!(env!("OUT_DIR"), "/pkg.rs"))` — the standard prost/tonic include
+/// idiom, the sugar for the proto-first codegen `leaf_grpc_build::compile` writes into
+/// `OUT_DIR`.
+#[macro_export]
+macro_rules! include_proto {
+    ($pkg:literal) => {
+        include!(concat!(env!("OUT_DIR"), "/", $pkg, ".rs"));
+    };
+}
