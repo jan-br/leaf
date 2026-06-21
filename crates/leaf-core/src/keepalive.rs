@@ -110,14 +110,149 @@ pub fn shutdown_channel() -> (ShutdownSignal, ShutdownTriggerHandle) {
     (ShutdownSignal { rx }, ShutdownTriggerHandle { tx })
 }
 
+/// The bind OUTCOME a started [`KeepAlive`] reports back to the run pipeline, ridden
+/// over ONE leaf `watch` cell (std-based, NO tokio — the same primitive the shutdown
+/// handshake uses).
+///
+/// The pipeline AWAITS this outcome (bounded by a short timeout) BEFORE it declares the
+/// app Ready: `Bound` flips availability to `AcceptingTraffic` (the FIRST/real readiness
+/// transition — the cell is seeded `RefusingTraffic`); `Failed` makes boot FAIL (a taken
+/// port is not a silent dead server, exactly like Spring failing to start). `Pending` is
+/// the seed (the component has neither bound nor faulted yet).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+enum BindOutcome {
+    /// The seed: the component has neither bound nor faulted yet.
+    #[default]
+    Pending,
+    /// The component bound/serves — the `on_ready` latch fired (readiness may open).
+    Bound,
+    /// The component's `start` resolved `Err` before binding (e.g. a port-in-use bind
+    /// failure) — boot must fail. The rendered error message rides along.
+    Failed(String),
+}
+
+/// The bounded bind outcome leaf-boot observes per started [`KeepAlive`] (the result of
+/// [`ReadySignal::settled_within`]): the component bound, faulted, or neither within the
+/// timeout. Public so the run pipeline can match it; the inner wire vocabulary the report
+/// rides (a private `watch`-cell enum) stays an implementation detail.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ReadyOutcome {
+    /// The component bound and serves — readiness may flip to `AcceptingTraffic`.
+    Bound,
+    /// The component's `start` faulted before binding (the rendered error) — boot fails.
+    Failed(String),
+    /// Neither outcome arrived within the bounded timeout — readiness stays closed.
+    TimedOut,
+}
+
+/// The subscribing half of the bind-outcome report — leaf-boot AWAITS this per started
+/// [`KeepAlive`] before flipping readiness, so the readiness transition is precise (it
+/// happens only AFTER an actual bind) and a bind failure is SURFACED (not swallowed).
+///
+/// Cheap to clone (one `Arc` bump on the underlying leaf `watch` cell). Backend-free.
+#[derive(Clone)]
+pub struct ReadySignal {
+    rx: WatchReceiver<BindOutcome>,
+}
+
+/// The publishing half of the bind-outcome report, handed (as the `on_ready` latch +
+/// the failure path) to a started [`KeepAlive`]. leaf-boot builds the `on_ready` closure
+/// in [`LifecycleCtx`] over [`report_bound`](ReadyReporter::report_bound), and reports a
+/// `start` `Err` over [`report_failed`](ReadyReporter::report_failed) from the spawn
+/// wrapper. Idempotent — the FIRST outcome wins (a later re-publish is ignored).
+#[derive(Clone)]
+pub struct ReadyReporter {
+    tx: WatchSender<BindOutcome>,
+}
+
+impl ReadyReporter {
+    /// Report that the component BOUND and is serving (the `on_ready` latch fired). The
+    /// first outcome wins: a failure already reported is not overwritten.
+    pub fn report_bound(&self) {
+        if self.tx.borrow() == BindOutcome::Pending {
+            self.tx.send(BindOutcome::Bound);
+        }
+    }
+
+    /// Report that the component's `start` FAILED before binding (the rendered error).
+    /// The first outcome wins.
+    pub fn report_failed(&self, message: String) {
+        if self.tx.borrow() == BindOutcome::Pending {
+            self.tx.send(BindOutcome::Failed(message));
+        }
+    }
+}
+
+impl ReadySignal {
+    /// AWAIT the bind outcome reactively (parks on the leaf `watch` cell — NEVER a
+    /// busy-poll): resolves `Ok(())` once the component reports `Bound`, or
+    /// `Err(message)` once it reports `Failed`. Returns immediately if the outcome was
+    /// already reported before this call.
+    ///
+    /// # Errors
+    /// The rendered start-failure message iff the component reported `Failed`.
+    pub async fn settled(&self) -> Result<(), String> {
+        let mut rx = self.rx.clone();
+        let outcome = rx.wait_for(|o| *o != BindOutcome::Pending).await;
+        match outcome {
+            BindOutcome::Bound => Ok(()),
+            BindOutcome::Failed(message) => Err(message),
+            // `wait_for` only resolves on a non-Pending value, so this is unreachable;
+            // treat a defensive Pending as "not yet bound" (the timeout caller decides).
+            BindOutcome::Pending => Ok(()),
+        }
+    }
+
+    /// AWAIT the bind outcome bounded by an optional `deadline` (a runtime-supplied
+    /// reactive sleep future — the SAME `drain_sleeper` primitive the teardown drain
+    /// uses; the ONLY runtime-named input, so core stays runtime-agnostic). The race is
+    /// REACTIVE (`select` over the settle and the deadline) — never a busy-poll. `None`
+    /// ⇒ the unbounded await (a cooperative component reports promptly).
+    ///
+    /// Returns [`ReadyOutcome::Bound`]/[`ReadyOutcome::Failed`] once the component
+    /// reports, or [`ReadyOutcome::TimedOut`] if the deadline wins first.
+    pub async fn settled_within(&self, deadline: Option<BoxFuture<'static, ()>>) -> ReadyOutcome {
+        let settled = self.settled();
+        let Some(deadline) = deadline else {
+            return match settled.await {
+                Ok(()) => ReadyOutcome::Bound,
+                Err(message) => ReadyOutcome::Failed(message),
+            };
+        };
+        futures::pin_mut!(settled);
+        match futures::future::select(settled, deadline).await {
+            futures::future::Either::Left((Ok(()), _)) => ReadyOutcome::Bound,
+            futures::future::Either::Left((Err(message), _)) => ReadyOutcome::Failed(message),
+            futures::future::Either::Right(((), _)) => ReadyOutcome::TimedOut,
+        }
+    }
+
+    /// `true` iff the component has reported `Bound` (a cheap point read).
+    #[must_use]
+    pub fn is_bound(&self) -> bool {
+        self.rx.borrow() == BindOutcome::Bound
+    }
+}
+
+/// Construct a fresh bind-outcome report: the [`ReadyReporter`] a started [`KeepAlive`]
+/// publishes through (its `on_ready` latch + a `start`-failure path) + the [`ReadySignal`]
+/// leaf-boot awaits before flipping readiness. Backed by ONE leaf `watch` cell.
+#[must_use]
+pub fn ready_report() -> (ReadySignal, ReadyReporter) {
+    let (tx, rx) = watch_channel(BindOutcome::Pending);
+    (ReadySignal { rx }, ReadyReporter { tx })
+}
+
 /// The context handed to a [`KeepAlive::start`]ed component: the shutdown signal it
 /// parks on, the readiness latch it calls ONCE when bound/serving, and the optional
 /// graceful-drain budget.
 ///
-/// `on_ready` is the "I am now bound/serving" callback — leaf-boot supplies a
-/// closure that flips availability to `AcceptingTraffic` (so readiness reaches the
-/// K8s gate only after the component is actually serving, not merely spawned). The
-/// component calls it exactly once; the closure is `FnOnce`.
+/// `on_ready` is the "I am now bound/serving" callback — leaf-boot supplies a closure
+/// that REPORTS the bind so the run pipeline can flip availability to `AcceptingTraffic`
+/// (the availability cell is seeded `RefusingTraffic`, so this is the FIRST/real readiness
+/// transition — readiness reaches the K8s gate only after the component actually binds,
+/// not merely when it is spawned). The component calls it exactly once; the closure is
+/// `FnOnce`.
 pub struct LifecycleCtx {
     /// The reactive shutdown signal the component parks on (then drains).
     pub shutdown: ShutdownSignal,
@@ -253,6 +388,53 @@ mod tests {
         let clone = signal.clone();
         handle.fire();
         assert!(signal.fired() && clone.fired(), "a clone observes the same cell");
+    }
+
+    #[test]
+    fn ready_report_settles_bound() {
+        let (signal, reporter) = ready_report();
+        assert!(!signal.is_bound(), "a fresh report is Pending, not bound");
+        reporter.report_bound();
+        assert!(signal.is_bound(), "report_bound flips the point read");
+        assert_eq!(block(signal.settled()), Ok(()), "settled resolves Ok on Bound");
+    }
+
+    #[test]
+    fn ready_report_settles_failed_with_the_message() {
+        let (signal, reporter) = ready_report();
+        reporter.report_failed("port in use".to_string());
+        assert!(!signal.is_bound());
+        assert_eq!(
+            block(signal.settled()),
+            Err("port in use".to_string()),
+            "settled surfaces the failure message"
+        );
+    }
+
+    #[test]
+    fn ready_report_first_outcome_wins() {
+        // A bind failure already reported is NOT overwritten by a later spurious Bound.
+        let (signal, reporter) = ready_report();
+        reporter.report_failed("bind failed".to_string());
+        reporter.report_bound(); // ignored — Failed already won.
+        assert!(!signal.is_bound());
+        assert_eq!(block(signal.settled()), Err("bind failed".to_string()));
+    }
+
+    #[test]
+    fn ready_report_settled_parks_until_an_outcome() {
+        // settled must PARK while the outcome is Pending, then resolve once reported.
+        let (signal, reporter) = ready_report();
+        let fut = signal.settled();
+        futures::pin_mut!(fut);
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut cx).is_pending(),
+            "settled parks while Pending"
+        );
+        reporter.report_bound();
+        assert_eq!(block(fut), Ok(()), "settled resolves after the outcome is reported");
     }
 
     #[test]

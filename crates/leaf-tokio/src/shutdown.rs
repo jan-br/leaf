@@ -7,11 +7,9 @@
 //! stops listening. The container's [`run_state`](leaf_core::watch_run_state)
 //! teardown is what `fire` drives.
 //!
-//! The listener runs on a spawned task (so arming returns immediately); a guard
-//! `AtomicBool` makes `fire` once-only even if two signals race.
-
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+//! The listener runs on a spawned task (so arming returns immediately) and fires
+//! `fire` exactly once: the signal future resolves on the FIRST signal and the task
+//! ends, so a single `arm_on` await fires at most once by construction.
 
 use leaf_core::ShutdownTrigger;
 
@@ -36,16 +34,15 @@ impl ShutdownTrigger for TokioShutdownTrigger {
     }
 }
 
-/// The once-only firing core, generic over the signal future so it is testable
-/// without raising a real signal at the test process: await `signal`, then invoke
-/// `fire` at most once.
+/// The firing core, generic over the signal future so it is testable without raising a
+/// real signal at the test process: await the FIRST signal, then invoke `fire` once.
+///
+/// Once-only is structural: `wait_for_signal` resolves on the first SIGINT/SIGTERM and
+/// this future completes (the spawned task ends), so a racing second signal has no live
+/// `arm_on` left to fire again — no guard flag needed.
 async fn arm_on<S: std::future::Future<Output = ()>>(signal: S, fire: Box<dyn Fn() + Send + Sync>) {
-    let fired = Arc::new(AtomicBool::new(false));
     signal.await;
-    // Once-only: a second racing signal must not double-fire teardown.
-    if !fired.swap(true, Ordering::SeqCst) {
-        fire();
-    }
+    fire();
 }
 
 /// Await the first shutdown signal: Ctrl-C / `SIGINT` everywhere, plus `SIGTERM`
@@ -80,7 +77,8 @@ async fn wait_for_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]

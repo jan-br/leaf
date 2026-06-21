@@ -79,6 +79,11 @@ impl WebServer for HyperServer {
 
             // Track every in-flight connection so the drain can wait them out gracefully.
             let graceful = GracefulShutdown::new();
+            // The spawned per-connection task handles, retained so the grace timeout can
+            // ABORT (not merely abandon) a straggler — dropping `graceful.shutdown()` on a
+            // timeout does NOT cancel the detached tasks, so a slow connection would leak
+            // until the runtime drops. We abort these explicitly past the budget.
+            let mut conn_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             loop {
                 tokio::select! {
@@ -109,11 +114,13 @@ impl WebServer for HyperServer {
                         let builder = ConnBuilder::new(TokioExecutor::new());
                         let conn = builder.serve_connection(io, service);
                         let watched = graceful.watch(conn.into_owned());
-                        tokio::spawn(async move {
+                        // RETAIN the JoinHandle (not a detached spawn) so the grace timeout
+                        // can abort the connection's task if it overruns the budget.
+                        conn_tasks.push(tokio::spawn(async move {
                             // A connection error is per-connection and does not bring the
                             // server down.
                             let _ = watched.await;
-                        });
+                        }));
                     }
                     // Shutdown requested: stop accepting and break to the drain. Dropping the
                     // listener here refuses any NEW connection that arrives during the drain.
@@ -123,12 +130,19 @@ impl WebServer for HyperServer {
 
             // Stop accepting (refuse new connections), then DRAIN the in-flight ones:
             // `graceful.shutdown()` signals every watched connection to finish and awaits
-            // them, BOUNDED by `ctx.grace` (a too-slow straggler is aborted past the budget;
-            // an unbounded grace drains cleanly).
+            // them, BOUNDED by `ctx.grace`. On a clean drain (or an unbounded grace) every
+            // connection task finishes on its own. On a grace TIMEOUT we ABORT every
+            // still-running connection task — so a too-slow straggler is genuinely torn
+            // down (its socket closed), never leaked to run until the runtime drops.
             drop(listener);
             match ctx.grace {
                 Some(d) => {
-                    let _ = tokio::time::timeout(d, graceful.shutdown()).await;
+                    if tokio::time::timeout(d, graceful.shutdown()).await.is_err() {
+                        // The budget elapsed with connections still in flight: abort them.
+                        for task in &conn_tasks {
+                            task.abort();
+                        }
+                    }
                 }
                 None => graceful.shutdown().await,
             }

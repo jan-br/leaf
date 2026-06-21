@@ -259,7 +259,11 @@ impl RunUnit {
             cx_decorator: None,
             detached_registry: Arc::new(DetachedTaskRegistry::new()),
             drain_sleeper: None,
-            availability: AvailabilityHandle::new(),
+            // Seed RefusingTraffic: readiness stays closed during bring-up and opens
+            // only at the FIRST real transition — the post-`call_runners` flip (non-web)
+            // or a started KeepAlive's `on_ready` bind latch (web). A failed bind never
+            // reads AcceptingTraffic.
+            availability: AvailabilityHandle::refusing_traffic(),
             run_state_tx: tx,
             run_state_rx: rx,
             shutdown_settings: ShutdownSettings::default(),

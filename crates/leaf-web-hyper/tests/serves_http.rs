@@ -341,7 +341,12 @@ async fn a_too_slow_straggler_is_aborted_past_the_grace_budget() {
 
     let in_flight = {
         let url = format!("{base}/slow");
-        tokio::spawn(async move { reqwest::Client::new().get(url).send().await })
+        // Read the FULL body so the client only succeeds if the whole response arrives —
+        // an aborted connection mid-body is then observably an error, not a partial Ok.
+        tokio::spawn(async move {
+            let resp = reqwest::Client::new().get(url).send().await?;
+            resp.text().await
+        })
     };
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
@@ -362,9 +367,24 @@ async fn a_too_slow_straggler_is_aborted_past_the_grace_budget() {
         "the straggler was aborted past the grace budget, not waited out"
     );
 
-    // The aborted in-flight request never gets its full response (the connection was torn
-    // down past the budget) — it errors rather than returning "slow".
-    let _ = in_flight.await;
+    // STRONGER than "serve returned": the in-flight connection was actually TORN DOWN
+    // (its spawned task aborted past the grace budget), so the client never gets the full
+    // "slow" response — it observes the connection drop as an Err well before the 10s
+    // handler would have finished. A leaked (merely-abandoned) connection would instead
+    // run to completion and hand back "slow".
+    let client_result = tokio::time::timeout(std::time::Duration::from_secs(3), in_flight)
+        .await
+        .expect("the client observes the torn-down connection promptly, not after 10s")
+        .expect("in-flight task joins");
+    assert!(
+        client_result.is_err(),
+        "the aborted straggler's connection was torn down — the client got an error, not the \
+         full 'slow' body: {client_result:?}"
+    );
+    assert!(
+        fired_at.elapsed() < std::time::Duration::from_secs(5),
+        "the connection was cut shortly past the grace budget, not waited out for 10s"
+    );
 }
 
 /// Poll a raw TCP connect until the server is accepting connections (the bind happens

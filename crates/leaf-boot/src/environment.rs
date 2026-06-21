@@ -430,6 +430,19 @@ fn bind_to_application(env: &leaf_core::Env) -> BootstrapSettings {
         };
     }
 
+    // The graceful-shutdown drain budget (Spring's `spring.lifecycle.timeout-per-shutdown-phase`):
+    // the default is a FINITE 30s so a stuck connection can never wedge teardown. The operator
+    // opts BACK into an unbounded drain with the literal `indefinite`, or sets an explicit
+    // bound in whole seconds (e.g. `=10`). An unparseable value keeps the finite default.
+    if let Some(rv) = env.get("leaf.lifecycle.timeout-per-shutdown-phase") {
+        let raw = rv.raw.trim();
+        if raw.eq_ignore_ascii_case("indefinite") {
+            s.shutdown.grace = leaf_core::Deadline::Indefinite;
+        } else if let Ok(secs) = raw.parse::<u64>() {
+            s.shutdown.grace = leaf_core::Deadline::secs(secs);
+        }
+    }
+
     s
 }
 
@@ -611,6 +624,32 @@ mod tests {
         assert_eq!(sealed.settings.startup_validation, StartupValidation::Lenient);
         // Unset fields keep the default.
         assert!(sealed.settings.register_shutdown_hook);
+    }
+
+    #[test]
+    fn shutdown_grace_defaults_finite_but_indefinite_is_an_explicit_opt_in() {
+        // With nothing configured the grace is the FINITE 30s default (a stuck connection
+        // cannot wedge teardown).
+        let sealed = block_on(seal_environment(SealInputs::new())).expect("seals");
+        assert_eq!(sealed.settings.shutdown.grace, leaf_core::Deadline::secs(30));
+
+        // The operator opts BACK into an unbounded drain with the literal `indefinite`.
+        let sealed = block_on(seal_environment(SealInputs::new().with_args([
+            "--leaf.lifecycle.timeout-per-shutdown-phase=indefinite",
+        ])))
+        .expect("seals");
+        assert_eq!(
+            sealed.settings.shutdown.grace,
+            leaf_core::Deadline::Indefinite,
+            "Indefinite stays available as an explicit config opt-in"
+        );
+
+        // An explicit finite bound in whole seconds binds too.
+        let sealed = block_on(seal_environment(
+            SealInputs::new().with_args(["--leaf.lifecycle.timeout-per-shutdown-phase=10"]),
+        ))
+        .expect("seals");
+        assert_eq!(sealed.settings.shutdown.grace, leaf_core::Deadline::secs(10));
     }
 
     #[test]

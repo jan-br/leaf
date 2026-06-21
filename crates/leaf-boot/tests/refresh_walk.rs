@@ -241,7 +241,12 @@ async fn refresh_brings_up_the_graph_eagerly_once_and_teardown_drains_lifo() {
 
     assert_eq!(unit.run_state(), RunState::Running);
     assert_eq!(unit.availability().liveness(), LivenessState::Correct);
-    assert_eq!(unit.availability().readiness(), ReadinessState::AcceptingTraffic);
+    // `refresh()` brings the graph up + fires Started/Liveness=Correct, but it does NOT
+    // open the K8s readiness gate — that is the run pipeline's job (the post-`call_runners`
+    // flip for a non-web app, or a KeepAlive's `on_ready` bind latch for a web app). So
+    // after a bare `refresh()` (no run pipeline) readiness stays at the RefusingTraffic
+    // SEED — proving readiness is never open before the pipeline's real transition.
+    assert_eq!(unit.availability().readiness(), ReadinessState::RefusingTraffic);
 
     // The graph resolves; a second resolve of B is the SAME Arc (once-only).
     let a = unit.context().get::<A>().await.expect("A resolves");

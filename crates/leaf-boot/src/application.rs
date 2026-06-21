@@ -303,6 +303,7 @@ pub struct Application {
     spawner: Option<Arc<dyn Spawner>>,
     shutdown_trigger: Option<Arc<dyn leaf_core::ShutdownTrigger>>,
     drain_sleeper: Option<DrainSleeper>,
+    availability_observer: Option<Arc<dyn Fn(leaf_core::AvailabilityHandle) + Send + Sync>>,
     scheduler: Option<Arc<dyn SchedulerCore>>,
     cron_factory: Option<CronTriggerFactory>,
     analyzers: Vec<Box<dyn FailureAnalyzer>>,
@@ -340,6 +341,7 @@ impl Application {
             spawner: None,
             shutdown_trigger: None,
             drain_sleeper: None,
+            availability_observer: None,
             scheduler: None,
             cron_factory: None,
             analyzers: Vec::new(),
@@ -543,6 +545,22 @@ impl Application {
         sleeper: impl Fn(std::time::Duration) -> leaf_core::BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Self {
         self.drain_sleeper = Some(Arc::new(sleeper));
+        self
+    }
+
+    /// Observe the run unit's [`AvailabilityHandle`](leaf_core::AvailabilityHandle) the
+    /// MOMENT it is constructed — BEFORE refresh, the readiness-gate runner window, and
+    /// the KeepAlive bring-up. The closure receives a clone of the (liveness/readiness)
+    /// watch handle, so an embedder/test can subscribe to readiness transitions from the
+    /// very start (the cell is seeded `RefusingTraffic`) — e.g. to drive a readiness probe
+    /// endpoint, or to PROVE readiness stays `RefusingTraffic` until a KeepAlive actually
+    /// binds. Invoked exactly once per `run`.
+    #[must_use]
+    pub fn with_availability_observer(
+        mut self,
+        observe: impl Fn(leaf_core::AvailabilityHandle) + Send + Sync + 'static,
+    ) -> Self {
+        self.availability_observer = Some(Arc::new(observe));
         self
     }
 
@@ -858,6 +876,13 @@ impl Application {
         // (11) Context::refresh() — R0..R8. Refreshed/Started fire DURING via the
         // now-live EventPublisher; the runner window opens after.
         let unit = self.build_run_unit(app, movable, inj_of)?;
+        // Hand the availability handle to any observer the MOMENT it exists (the cell is
+        // seeded RefusingTraffic) — before refresh/runners/keepalives — so an embedder can
+        // subscribe to readiness from the very start (a readiness probe; the R1 proof that
+        // readiness stays RefusingTraffic until a KeepAlive actually binds).
+        if let Some(observe) = self.availability_observer.as_ref() {
+            observe(unit.availability().clone());
+        }
         let unit = unit.refresh().await?;
         *phase = RunMilestone::Refreshed;
 
@@ -891,12 +916,17 @@ impl Application {
 
         // (14) Ready: flip Readiness=AcceptingTraffic (the K8s readiness gate — the
         // `Ready` fact IS the AvailabilityChanged(Readiness) the watch cell wakes).
-        // For a non-web app (keep_alive_count == 0) this is the SOLE readiness flip,
-        // exactly as before. With KeepAlive components the `on_ready` latch flips it
-        // when each binds/serves; this site is the BOUNDED FALLBACK so readiness can
-        // never get stuck if a component's `on_ready` is slow (idempotent re-publish).
-        unit.availability()
-            .set_readiness(leaf_core::ReadinessState::AcceptingTraffic, "ready");
+        // For a NON-web app (keep_alive_count == 0) this is the SOLE readiness flip over
+        // the RefusingTraffic seed, exactly as before. For a WEB app the flip already
+        // happened PRECISELY inside `start_keep_alives` — once each KeepAlive reported it
+        // actually BOUND (its `on_ready` latch), and a bind FAILURE already failed boot
+        // above. So we must NOT blindly re-flip here: that would mask a failed bind /
+        // re-open readiness a component left RefusingTraffic. The flip is gated on the
+        // non-web fast path.
+        if unit.keep_alive_count() == 0 {
+            unit.availability()
+                .set_readiness(leaf_core::ReadinessState::AcceptingTraffic, "ready");
+        }
         *phase = RunMilestone::Ready;
 
         let exit_code = compute_exit_code(&self.exit_code_contributors);
@@ -1062,33 +1092,67 @@ impl Application {
         }
         let spawner = self.spawner.as_ref().ok_or_else(missing_keep_alive_spawner)?;
         let grace = unit.shutdown_settings().grace.as_duration();
+        // Each started component's bind OUTCOME is observed BEFORE we declare Ready: a
+        // `ReadySignal` per keep-alive whose `on_ready` latch reports `Bound` and whose
+        // spawn wrapper reports `Failed` if `start` resolves `Err` (a bind failure). We
+        // AWAIT each (bounded) below so the readiness flip is precise (only after an
+        // actual bind) and a bind failure FAILS boot — never a silent dead server.
+        let mut reports: Vec<leaf_core::ReadySignal> = Vec::new();
         for holder in holders {
             let component: leaf_core::Ref<dyn leaf_core::KeepAlive> =
                 leaf_core::view_from_holder::<dyn leaf_core::KeepAlive>(holder)?;
-            // The on_ready latch: flip readiness when the component is bound/serving.
-            // A clone of the availability handle writes the SAME cell.
-            let availability = unit.availability().clone();
-            let on_ready: Box<dyn FnOnce() + Send> = Box::new(move || {
-                availability
-                    .set_readiness(leaf_core::ReadinessState::AcceptingTraffic, "ready");
-            });
+            let (signal, reporter) = leaf_core::ready_report();
+            // The on_ready latch REPORTS the bind (the pipeline flips readiness when it
+            // observes `Bound` below — keeping readiness RefusingTraffic until then).
+            let bound_reporter = reporter.clone();
+            let on_ready: Box<dyn FnOnce() + Send> =
+                Box::new(move || bound_reporter.report_bound());
             let ctx = leaf_core::LifecycleCtx {
                 shutdown: unit.shutdown_signal(),
                 on_ready,
                 grace,
             };
             // `start` returns a 'static future that resolves when the component has
-            // fully stopped; spawn it and retain the handle for the grace-join.
+            // fully stopped (or `Err` on a bind/serve fault); spawn it, report a fault
+            // back to the pipeline, and retain the handle for the grace-join.
             let fut = component.start(ctx);
+            let fault_reporter = reporter;
             let started: leaf_core::BoxFuture<'static, ()> = Box::pin(async move {
                 if let Err(err) = fut.await {
-                    // Degrade-and-warn (leaf-boot's house style): a KeepAlive fault
-                    // never aborts the already-Ready app — it surfaces here.
-                    eprintln!("a KeepAlive component stopped with an error: {err}");
+                    // Surface the bind/serve fault to the run pipeline (which fails boot
+                    // if it arrives before the component bound) — never just eprintln'd.
+                    fault_reporter.report_failed(err.render_to_string(RenderStyle::Human));
                 }
             });
             let handle = spawner.spawn(started);
             unit.register_keep_alive(handle);
+            reports.push(signal);
+        }
+
+        // AWAIT each bind outcome (bounded by a short readiness timeout via the
+        // drain-sleeper, so a never-reporting component can't wedge boot — the SAME
+        // runtime-supplied reactive sleep the teardown drain uses, NEVER a busy-poll):
+        // on `Bound` flip readiness to AcceptingTraffic (the FIRST/real transition over
+        // the RefusingTraffic seed); on `Failed` FAIL boot with the surfaced error (a
+        // taken port is not a silent Ok — Spring fails to start on a bound port). A
+        // timeout (neither bound nor failed) leaves readiness RefusingTraffic and warns.
+        for signal in reports {
+            let deadline =
+                self.drain_sleeper.as_ref().map(|sleep| sleep(KEEP_ALIVE_READY_TIMEOUT));
+            match signal.settled_within(deadline).await {
+                leaf_core::ReadyOutcome::Bound => unit
+                    .availability()
+                    .set_readiness(leaf_core::ReadinessState::AcceptingTraffic, "ready"),
+                leaf_core::ReadyOutcome::Failed(message) => {
+                    return Err(keep_alive_bind_failed(&message))
+                }
+                leaf_core::ReadyOutcome::TimedOut => {
+                    eprintln!(
+                        "a KeepAlive component did not report ready within the bind timeout; \
+                         readiness stays RefusingTraffic"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1235,6 +1299,27 @@ fn runner_upcast_failed(contract: leaf_core::ContractId) -> LeafError {
             "the runner bean {contract:?} resolved, but its RunnerPairing upcast thunk did not \
              recover an `Arc<dyn Runner>` (the macro-emitted thunk names a different concrete type \
              than the resolved bean)"
+        ),
+    ))
+}
+
+/// The bounded window the run pipeline AWAITS each started [`KeepAlive`](leaf_core::KeepAlive)'s
+/// bind outcome before declaring the app Ready (a generous bind handshake — binding a
+/// socket is near-instant, so a component that hasn't reported within this is wedged, not
+/// merely slow; the await is reactive, never a busy-poll). Bounds boot so a misbehaving
+/// component can't hang it forever; a bind FAILURE is reported well before this elapses.
+const KEEP_ALIVE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A started [`KeepAlive`](leaf_core::KeepAlive) reported a bind/serve FAILURE (e.g. the
+/// configured port is already in use) before it bound — boot FAILS (Spring's "fail to
+/// start on a taken port"), never a silent Ok with a dead server. The component's rendered
+/// error rides along.
+fn keep_alive_bind_failed(message: &str) -> LeafError {
+    LeafError::new(leaf_core::ErrorKind::ConstructionFailed).caused_by(leaf_core::Cause::plain(
+        "starting the KeepAlive lifecycle components",
+        format!(
+            "a `KeepAlive` component (e.g. the embedded web server) failed to bind/serve before \
+             it became ready, so the application cannot start:\n{message}"
         ),
     ))
 }

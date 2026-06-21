@@ -208,19 +208,14 @@ async fn readiness_reaches_accepting_traffic_while_the_socket_actually_serves() 
     let port = free_port();
     let running = boot_web_app("web-ready-while-serving", port).await;
 
-    // The socket comes up asynchronously on the spawned serve task; wait for the readiness
-    // cell to reach AcceptingTraffic (the on_ready latch), bounded so a regression fails
-    // loudly rather than hanging.
-    let mut reached = false;
-    for _ in 0..400 {
-        if running.unit().availability().readiness() == leaf_core::ReadinessState::AcceptingTraffic
-        {
-            reached = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(reached, "readiness reached AcceptingTraffic (the embedded server's on_ready latch)");
+    // With R1/R2 `run()` returns only AFTER each KeepAlive reported it actually bound, so by
+    // the time we hold the RunningApp readiness is ALREADY AcceptingTraffic (the on_ready
+    // latch — over the RefusingTraffic seed — is the FIRST/real transition).
+    assert_eq!(
+        running.unit().availability().readiness(),
+        leaf_core::ReadinessState::AcceptingTraffic,
+        "run() returns Ready only once the embedded server's on_ready bind latch fired"
+    );
 
     // AT THIS POINT a real HTTP request must succeed — the socket is genuinely accepting.
     let base = format!("http://127.0.0.1:{port}");
@@ -232,6 +227,130 @@ async fn readiness_reaches_accepting_traffic_while_the_socket_actually_serves() 
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "serving WHILE AcceptingTraffic");
 
     let _ = running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readiness_is_refusing_traffic_until_the_socket_actually_binds_then_flips() {
+    // R1 — the AcceptingTraffic-while-serving ORDERING is real: the availability cell is
+    // seeded RefusingTraffic and the on_ready bind latch is the FIRST transition. The
+    // availability observer fires BEFORE refresh/runners/keepalives — i.e. provably before
+    // the embedded server has bound — and DETERMINISTICALLY snapshots readiness +
+    // whether the socket is up at that instant; both must say "not ready, not bound". Then
+    // boot completes (the socket binds) and readiness flips to AcceptingTraffic. If on_ready
+    // were never called, boot would not flip the cell and the post-boot assert would fail —
+    // so this does not pass incidentally.
+    force_link();
+    let port = free_port();
+
+    // Snapshotted synchronously INSIDE the observer (before refresh/runners/keepalives, so
+    // the embedded server cannot have bound yet): (readiness, socket_already_up).
+    let snapshot: Arc<std::sync::Mutex<Option<(leaf_core::ReadinessState, bool)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let handle_out: Arc<std::sync::Mutex<Option<leaf_core::AvailabilityHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let snap = Arc::clone(&snapshot);
+    let hout = Arc::clone(&handle_out);
+
+    let spawner: Arc<dyn leaf_core::Spawner> = Arc::new(leaf_tokio::TokioExecutionFacility::new());
+    let running = Application::new()
+        .with_name("web-ready-ordering")
+        .with_spawner(spawner)
+        .with_drain_sleeper(|d| Box::pin(tokio::time::sleep(d)))
+        .with_availability_observer(move |handle| {
+            // The instant the unit exists (pre-refresh): readiness is the RefusingTraffic
+            // seed and the embedded server has not bound, so a raw TCP connect is refused.
+            let socket_up = std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
+            *snap.lock().unwrap() = Some((handle.readiness(), socket_up));
+            *hout.lock().unwrap() = Some(handle);
+        })
+        .run(
+            SealInputs::new().with_args([format!("--leaf.web.server.port={port}")]),
+            RunOverlay::none(),
+        )
+        .await
+        .expect("the web app boots to Ready");
+
+    // BEFORE the bind: readiness was RefusingTraffic (the seed, not an open cell) AND the
+    // socket was not yet accepting.
+    let (readiness_before, socket_up_before) =
+        snapshot.lock().unwrap().expect("the observer captured a pre-bind snapshot");
+    assert_eq!(
+        readiness_before,
+        leaf_core::ReadinessState::RefusingTraffic,
+        "readiness is RefusingTraffic before the embedded server binds (the seed)"
+    );
+    assert!(!socket_up_before, "the socket was not yet accepting before the bind");
+
+    // AFTER boot returns (the bind settled): readiness flipped to AcceptingTraffic. If
+    // on_ready were never called this would still read RefusingTraffic and the assert fails.
+    let handle = handle_out.lock().unwrap().clone().expect("handle captured");
+    assert_eq!(
+        handle.readiness(),
+        leaf_core::ReadinessState::AcceptingTraffic,
+        "readiness flipped to AcceptingTraffic only AFTER the socket bound (the on_ready latch)"
+    );
+
+    // And the socket genuinely serves now.
+    wait_until_up(port).await;
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/ping/leaf"))
+        .send()
+        .await
+        .expect("serves once AcceptingTraffic");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let _ = running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bind_failure_on_a_taken_port_fails_the_boot_loudly() {
+    // R2 — FAIL-FAST: a port already in use makes the embedded server's bind FAIL. That
+    // failure is reported back to the run pipeline (NOT swallowed by an eprintln), so
+    // `run()` returns Err — a taken port is NOT a silent Ok with a dead server (Spring's
+    // "fail to start on a bound port"). We hold a TcpListener on the port for the whole
+    // boot attempt so the bind genuinely cannot succeed.
+    force_link();
+    let port = free_port();
+    let _occupier = std::net::TcpListener::bind(("127.0.0.1", port))
+        .expect("occupy the port for the whole boot attempt");
+
+    let availability: Arc<std::sync::Mutex<Option<leaf_core::AvailabilityHandle>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cap = Arc::clone(&availability);
+
+    let spawner: Arc<dyn leaf_core::Spawner> = Arc::new(leaf_tokio::TokioExecutionFacility::new());
+    let outcome = Application::new()
+        .with_name("web-bind-failure")
+        .with_spawner(spawner)
+        .with_drain_sleeper(|d| Box::pin(tokio::time::sleep(d)))
+        .with_availability_observer(move |handle| {
+            *cap.lock().unwrap() = Some(handle);
+        })
+        .run(
+            SealInputs::new().with_args([format!("--leaf.web.server.port={port}")]),
+            RunOverlay::none(),
+        )
+        .await;
+
+    let failure = outcome.expect_err("a taken port must FAIL the boot, not return a dead Ok");
+    // The surfaced error mentions the KeepAlive bind failure (the rendered backend bind
+    // error rides along) — it is a real diagnostic, not a swallowed eprintln.
+    use leaf_core::Diagnostic as _;
+    let rendered = failure.error.render_to_string(leaf_core::RenderStyle::Human);
+    assert!(
+        rendered.to_lowercase().contains("bind") || rendered.to_lowercase().contains("keepalive"),
+        "the bind failure is surfaced in the boot error, got: {rendered}"
+    );
+
+    // And readiness never opened (it stayed RefusingTraffic — a failed bind never reads
+    // AcceptingTraffic).
+    if let Some(handle) = availability.lock().unwrap().clone() {
+        assert_eq!(
+            handle.readiness(),
+            leaf_core::ReadinessState::RefusingTraffic,
+            "a failed bind leaves readiness RefusingTraffic — never AcceptingTraffic"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

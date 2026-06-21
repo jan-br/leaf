@@ -808,6 +808,19 @@ impl AvailabilityHandle {
         AvailabilityHandle::with_states(LivenessState::Correct, ReadinessState::AcceptingTraffic)
     }
 
+    /// Build a fresh handle that is LIVE but REFUSING traffic — `(Correct,
+    /// RefusingTraffic)`.
+    ///
+    /// The run pipeline seeds the [`RunUnit`](crate::lifecycle) availability cell with
+    /// this so readiness stays `RefusingTraffic` during bring-up: the K8s readiness gate
+    /// opens only at the FIRST real transition — the post-`call_runners` flip (a non-web
+    /// app) or a started [`KeepAlive`](crate::KeepAlive)'s `on_ready` bind latch (a web
+    /// app). A web app whose bind FAILS therefore never reads `AcceptingTraffic`.
+    #[must_use]
+    pub fn refusing_traffic() -> Self {
+        AvailabilityHandle::with_states(LivenessState::Correct, ReadinessState::RefusingTraffic)
+    }
+
     /// Build a handle at explicit initial states.
     #[must_use]
     pub fn with_states(liveness: LivenessState, readiness: ReadinessState) -> Self {
@@ -1276,6 +1289,18 @@ mod tests {
     }
 
     // ── availability over watch RunState ──────────────────────────────────────
+
+    #[test]
+    fn refusing_traffic_seed_is_live_but_not_ready() {
+        // The run-pipeline seed: LIVE (Correct) but REFUSING traffic, so readiness opens
+        // only at the first real transition (the post-runners flip / a KeepAlive bind).
+        let h = AvailabilityHandle::refusing_traffic();
+        assert_eq!(h.liveness(), LivenessState::Correct, "liveness is unchanged (Correct)");
+        assert_eq!(h.readiness(), ReadinessState::RefusingTraffic, "readiness is closed at seed");
+        // It flips open exactly like any handle.
+        h.set_readiness(ReadinessState::AcceptingTraffic, "ready");
+        assert_eq!(h.readiness(), ReadinessState::AcceptingTraffic);
+    }
 
     #[test]
     fn availability_handle_point_reads_and_flips() {

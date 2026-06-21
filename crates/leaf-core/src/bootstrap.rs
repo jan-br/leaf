@@ -478,12 +478,29 @@ impl Deadline {
 
 /// The two shutdown drain budgets (bootstrap-diagnostics, `[C1/C7]`), consumed
 /// by the container-lifecycle teardown step.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShutdownSettings {
-    /// The in-flight-request body-drain budget.
+    /// The in-flight-request body-drain budget. Defaults to a FINITE 30s (matching
+    /// Spring Boot's `spring.lifecycle.timeout-per-shutdown-phase`) so a single stuck
+    /// connection can never wedge teardown by default; set `Deadline::Indefinite`
+    /// explicitly to opt back into an unbounded drain.
     pub grace: Deadline,
     /// The per-request tx-finalize budget AFTER the body grace elapses.
     pub finalize_grace: Deadline,
+}
+
+impl ShutdownSettings {
+    /// The default budgets: a FINITE 30s body-drain grace (a stuck connection cannot
+    /// hang teardown by default) + an indefinite per-request tx-finalize budget. The
+    /// 30s matches Spring Boot's `spring.lifecycle.timeout-per-shutdown-phase`.
+    pub const DEFAULT: ShutdownSettings =
+        ShutdownSettings { grace: Deadline::secs(30), finalize_grace: Deadline::Indefinite };
+}
+
+impl Default for ShutdownSettings {
+    fn default() -> Self {
+        ShutdownSettings::DEFAULT
+    }
 }
 
 /// The frozen read-only `leaf.main.*` self-binding record (bootstrap-diagnostics,
@@ -522,7 +539,9 @@ impl BootstrapSettings {
         register_shutdown_hook: true,
         keep_alive: false,
         startup_validation: StartupValidation::Strict,
-        shutdown: ShutdownSettings { grace: Deadline::Indefinite, finalize_grace: Deadline::Indefinite },
+        // A FINITE default grace (30s) so a stuck connection cannot wedge teardown by
+        // default; `Indefinite` stays available as an explicit config opt-in.
+        shutdown: ShutdownSettings::DEFAULT,
     };
 }
 
@@ -748,7 +767,25 @@ mod tests {
         assert_eq!(s.startup_validation, StartupValidation::Strict);
         assert!(s.register_shutdown_hook);
         assert!(!s.lazy_initialization);
-        assert_eq!(s.shutdown.grace, Deadline::Indefinite);
+        // The default shutdown grace is FINITE (30s, matching Spring Boot's
+        // `spring.lifecycle.timeout-per-shutdown-phase`) so a stuck connection cannot
+        // wedge teardown forever by default — NOT the old hang-prone Indefinite.
+        assert_eq!(s.shutdown.grace, Deadline::secs(30));
+        assert_eq!(
+            s.shutdown.grace.as_duration(),
+            Some(Duration::from_secs(30)),
+            "the default grace is a finite 30s budget"
+        );
+    }
+
+    #[test]
+    fn default_shutdown_grace_is_a_finite_30s_not_indefinite() {
+        // The bare `ShutdownSettings::default()` (what an un-configured RunUnit seeds with)
+        // is the finite 30s default, NOT the derive-Default Indefinite that used to let a
+        // single stuck connection hang teardown.
+        let s = ShutdownSettings::default();
+        assert_eq!(s.grace, Deadline::secs(30));
+        assert_ne!(s.grace, Deadline::Indefinite, "the default grace must not be unbounded");
     }
 
     #[test]

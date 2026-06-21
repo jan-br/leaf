@@ -262,7 +262,8 @@ pub use lifecycle::{
 //   leaf-web type.
 
 pub use keepalive::{
-    shutdown_channel, KeepAlive, LifecycleCtx, ShutdownSignal, ShutdownTriggerHandle,
+    ready_report, shutdown_channel, KeepAlive, LifecycleCtx, ReadyOutcome, ReadySignal,
+    ReadyReporter, ShutdownSignal, ShutdownTriggerHandle,
 };
 
 // - cx: the ONE ambient bundle (`Cx`/`CxKey`/`Propagation`), the `AmbientStore`
