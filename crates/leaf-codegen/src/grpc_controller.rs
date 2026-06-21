@@ -558,4 +558,43 @@ mod tests {
             "the impl asserts the struct carries the GrpcControllerKind marker: {s}"
         );
     }
+
+    #[test]
+    fn a_generic_grpc_controller_impl_is_a_hard_error() {
+        let item = impl_item(
+            r#"impl<T> catalog::Catalog for CatalogController<T> {
+                async fn get(&self, req: ProductReq) -> Result<Product, Status> { todo!() }
+            }"#,
+        );
+        let err = expand_grpc_controller_impl(&item)
+            .expect_err("a generic grpc-controller impl hard-errors");
+        assert!(err.message.contains("generic"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn an_inherent_grpc_controller_impl_is_a_hard_error() {
+        // `#[grpc_controller]` lowers a `impl ServiceTrait for Controller` trait impl (the
+        // Stage-3 generated server trait). An inherent `impl Controller { .. }` has no trait
+        // to read the path/shape seam from, so it is a loud error.
+        let item = impl_item(
+            r#"impl CatalogController {
+                async fn get(&self, req: ProductReq) -> Result<Product, Status> { todo!() }
+            }"#,
+        );
+        let err = expand_grpc_controller_impl(&item)
+            .expect_err("an inherent grpc-controller impl hard-errors");
+        assert!(err.message.contains("trait impl"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn an_rpc_method_without_a_self_receiver_is_an_error() {
+        let item = impl_item(
+            r#"impl catalog::Catalog for CatalogController {
+                async fn get(req: ProductReq) -> Result<Product, Status> { todo!() }
+            }"#,
+        );
+        let err = expand_grpc_controller_impl(&item)
+            .expect_err("an RPC method needs a self receiver");
+        assert!(err.message.contains("self"), "got: {}", err.message);
+    }
 }
