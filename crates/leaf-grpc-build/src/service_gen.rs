@@ -68,6 +68,62 @@ fn method_signature(name: &str, input: &str, output: &str, shape: CallShape) -> 
     )
 }
 
+/// The canonical gRPC method path `/package.Service/Method`. `package` may be empty
+/// (then the path is `/Service/Method`).
+fn grpc_path(package: &str, service: &str, method: &str) -> String {
+    if package.is_empty() {
+        format!("/{service}/{method}")
+    } else {
+        format!("/{package}.{service}/{method}")
+    }
+}
+
+/// SCREAMING_SNAKE constant base for a method name (`Get` -> `GET`, `ListAll` ->
+/// `LIST_ALL`). Pure case mechanics — NOT type-name detection (it derives an IDENT
+/// from the proto's own method name, no behavior keyed on the text).
+fn const_ident(method: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in method.chars().enumerate() {
+        if ch.is_ascii_uppercase() && i != 0 {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_uppercase());
+    }
+    out
+}
+
+/// The `leaf_grpc::CallShape` const path for a shape.
+fn shape_const_path(shape: CallShape) -> &'static str {
+    match shape {
+        CallShape::Unary => "::leaf_grpc::CallShape::Unary",
+        CallShape::ServerStream => "::leaf_grpc::CallShape::ServerStream",
+        CallShape::ClientStream => "::leaf_grpc::CallShape::ClientStream",
+        CallShape::Bidi => "::leaf_grpc::CallShape::Bidi",
+    }
+}
+
+/// The `pub const <METHOD>_PATH: &str = "/pkg.Service/Method";` line.
+#[allow(dead_code)]
+fn path_const(service: &str, package: &str, method: &str, _svc_alias: &str) -> String {
+    let path = grpc_path(package, service, method);
+    let ident = const_ident(method);
+    format!("pub const {ident}_PATH: &str = {path:?};")
+}
+
+/// The `#[doc(hidden)]` const `leaf_grpc::MethodDescriptor` the `#[grpc_controller]`
+/// macro reads: the canonical path + the call shape. Named
+/// `<METHOD>_DESCRIPTOR` beside its `<METHOD>_PATH`.
+#[allow(dead_code)]
+fn method_descriptor(method: &str, package: &str, service: &str, shape: CallShape) -> String {
+    let path = grpc_path(package, service, method);
+    let ident = const_ident(method);
+    let shape_path = shape_const_path(shape);
+    format!(
+        "#[doc(hidden)] pub const {ident}_DESCRIPTOR: ::leaf_grpc::MethodDescriptor = \
+         ::leaf_grpc::MethodDescriptor {{ path: {path:?}, shape: {shape_path} }};"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +182,44 @@ mod tests {
         assert!(
             flat.contains("::core::result::Result<::leaf_grpc::Streaming<super::Pong>,::leaf_grpc::Status>"),
             "bidi response is Streaming<U>: {flat}"
+        );
+    }
+
+    #[test]
+    fn emits_the_grpc_path_constant() {
+        let c = path_const("Echo", "echo.v1", "Get", "Echo");
+        let flat = c.split_whitespace().collect::<String>();
+        assert!(
+            flat.contains(r#"pubconstGET_PATH:&str="/echo.v1.Echo/Get""#),
+            "the path is the canonical /pkg.Service/Method literal: {flat}"
+        );
+    }
+
+    #[test]
+    fn emits_the_doc_hidden_method_descriptor() {
+        let d = method_descriptor("Get", "echo.v1", "Echo", CallShape::Unary);
+        let flat = d.split_whitespace().collect::<String>();
+        assert!(flat.contains("#[doc(hidden)]"), "descriptor is doc-hidden: {flat}");
+        assert!(
+            flat.contains(r#"path:"/echo.v1.Echo/Get""#),
+            "descriptor carries the path: {flat}"
+        );
+        assert!(
+            flat.contains("shape:::leaf_grpc::CallShape::Unary"),
+            "descriptor carries the call shape: {flat}"
+        );
+        assert!(
+            flat.contains("::leaf_grpc::MethodDescriptor"),
+            "descriptor is the leaf_grpc::MethodDescriptor type: {flat}"
+        );
+    }
+
+    #[test]
+    fn descriptor_shape_matches_the_streaming_flags_for_bidi() {
+        let d = method_descriptor("Chat", "echo.v1", "Echo", CallShape::Bidi);
+        assert!(
+            d.split_whitespace().collect::<String>().contains("shape:::leaf_grpc::CallShape::Bidi"),
+            "got: {d}"
         );
     }
 }
