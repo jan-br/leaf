@@ -1,0 +1,36 @@
+[package]
+name = "leaf-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# leaf-grpc is the gRPC ABSTRACTION crate: it rests on leaf-web (the shared
+# Request/Response/Body + the ProtocolDispatch seam it implements) and leaf-core
+# (BoxFuture/BoxStream/Ref/LeafError). The dep arrow is leaf-grpc -> leaf-web ->
+# leaf-core; leaf-web never names leaf-grpc.
+leaf-core.workspace = true
+leaf-web.workspace = true
+# The stereotype macros leaf-grpc dogfoods: GrpcDispatch is PROVIDED as
+# dyn ProtocolDispatch by a #[configuration]/#[bean] factory, and
+# DefaultGrpcStatusMapper is an #[auto_config] FALLBACK — no hand-rolled Provider,
+# exactly like leaf-cache/leaf-web-hyper.
+leaf-macros.workspace = true
+# prost — the protobuf MESSAGE codec, confined to ProstCodec (the serde_json analogue).
+prost.workspace = true
+# The body carrier at the frame edge + the neutral HTTP value vocabulary (HeaderMap
+# for grpc-status trailers). NO hyper/h2 — only the server-agnostic `http` types.
+bytes.workspace = true
+http.workspace = true
+# BoxStream lives in leaf-core (Stage 1), but leaf-grpc names `futures::Stream` /
+# stream combinators directly for Streaming<T> + the de-framing combinators.
+futures.workspace = true
+
+[dev-dependencies]
+# A minimal block_on to drive the async framing/dispatch units with no runtime.
+futures.workspace = true
+# The DI-assembly proof: leaf-boot lifts the macro-emitted #[bean]/#[auto_config]
+# seeds so a test can resolve Vec<Ref<dyn GrpcRoute>> / dyn ProtocolDispatch /
+# dyn GrpcStatusMapper by collection + by-trait injection (the same path the
+# EmbeddedWebServer uses). Dev-only: production deps stay leaf-core/leaf-web/prost.
+leaf-boot.workspace = true

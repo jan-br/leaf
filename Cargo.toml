@@ -38,6 +38,7 @@ leaf-starter-redis = { path = "crates/leaf-starter-redis", version = "0.1.0" }
 leaf-starter-web = { path = "crates/leaf-starter-web", version = "0.1.0" }
 leaf-web = { path = "crates/leaf-web", version = "0.1.0" }
 leaf-web-hyper = { path = "crates/leaf-web-hyper", version = "0.1.0" }
+leaf-grpc = { path = "crates/leaf-grpc", version = "0.1.0" }
 leaf = { path = "crates/leaf", version = "0.1.0" }
 
 # External deps (pinned centrally — the internal BOM also covers third-party versions)
@@ -54,6 +55,12 @@ smol = "2"
 # (server-agnostic; the hyper backend lives in its own crate).
 http = "1"
 bytes = "1"
+
+# prost — the protobuf MESSAGE codec (the `serde_json` analogue for gRPC),
+# confined to leaf-grpc's `ProstCodec` exactly as serde_json is confined to
+# leaf-serde's JsonConverter. A pure codec, NOT a transport backend: it names no
+# hyper/tower/h2, so it is the sanctioned gRPC-message dep (the design's §9).
+prost = "0.13"
 
 # The HTTP-server BACKEND deps — pinned here but used ONLY by `leaf-web-hyper`, the
 # single crate allowed to name hyper/tower/axum (every other crate stays backend-free).
