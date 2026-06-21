@@ -35,5 +35,6 @@ pub use codec::{GrpcCodec, ProstCodec};
 pub use dispatch::GrpcDispatch;
 pub use framing::{decode_frames, encode_frame};
 pub use handler::{GrpcHandler, GrpcRoute};
+pub use mapper::{DefaultGrpcStatusMapper, GrpcStatusMapper};
 pub use status::{Code, Status};
 pub use streaming::Streaming;
