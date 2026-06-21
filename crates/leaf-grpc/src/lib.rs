@@ -31,5 +31,5 @@ leaf_core::declare_source!("leaf-grpc");
 //   pub use framing::{decode_frames, encode_frame};
 //   pub use handler::{GrpcHandler, GrpcRoute};
 //   pub use mapper::{DefaultGrpcStatusMapper, GrpcStatusMapper};
-//   pub use status::{Code, Status};
 //   pub use streaming::Streaming;
+pub use status::Code;
