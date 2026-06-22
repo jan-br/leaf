@@ -26,6 +26,16 @@ http.workspace = true
 # stream combinators directly for Streaming<T> + the de-framing combinators.
 futures.workspace = true
 
+[build-dependencies]
+# Compile tests/proto/echo.proto -> OUT_DIR (prost messages + the leaf service trait +
+# path constants the #[grpc_controller] consumes). protox (pure-Rust) means NO protoc
+# system binary. BUILD-ONLY: it never enters the shipped (normal) dep graph.
+leaf-grpc-build.workspace = true
+# tonic-build is the BUILD-ONLY companion that emits tonic's OWN client stub from the
+# SAME echo.proto (the polyglot interop point: leaf's server trait + tonic's client over
+# one wire). It names hyper/h2/prost-build at BUILD time only; never a normal dep.
+tonic-build.workspace = true
+
 [dev-dependencies]
 # A minimal block_on to drive the async framing/dispatch units + the DI-assembly proof
 # with no runtime (the same `futures::executor::block_on` leaf-web's assembly test uses).
@@ -37,10 +47,19 @@ futures.workspace = true
 # tests/dispatch_through_mock.rs uses (no eager validate, no transport). Dev-only:
 # production deps stay leaf-core/leaf-web/prost.
 leaf-boot.workspace = true
+# The tonic INTEGRATION proof (`tests/serves_grpc.rs`) boots the shared hyper WebServer
+# in-process (the http2-enabled backend + the JSON converter so HTTP-on-the-same-port
+# works) and drives it with a REAL tonic client across all four call shapes. DEV-ONLY:
+# leaf-grpc's shipped deps stay leaf-core/leaf-web/leaf-macros/prost.
+leaf-tokio.workspace = true
+leaf-web-hyper.workspace = true
+leaf-serde.workspace = true
+prost.workspace = true
+tonic.workspace = true
+http.workspace = true
 # The cross-cutting integration test drives the leaf-web Dispatcher across the
-# WebFilter chain + the GrpcStatusMapper error model with a tokio runtime
-# (#[tokio::test]) — no hyper/tonic (that is Stage 6). macros + the current-thread
-# rt only; tokio is NOT a production dep (leaf-grpc stays backend/runtime-free).
-tokio = { workspace = true, features = ["macros", "rt"] }
+# WebFilter chain + the GrpcStatusMapper error model with a tokio runtime; the tonic
+# proof boots a real server on a multi-thread runtime + drives the socket (net/time).
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "time"] }
 # (leaf-macros/http/bytes are normal deps, available in tests for the filter/proto
 #  fakes that dogfood #[async_impl] on WebFilter + the Request/Response shapes.)

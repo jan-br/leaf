@@ -88,6 +88,16 @@ http-body = "1"
 # stack (no system OpenSSL): the test only exercises plaintext HTTP/1 on localhost.
 reqwest = { version = "0.13", default-features = false }
 
+# The CANONICAL gRPC stack, used ONLY as a DEV/BUILD-dependency interop test peer (the
+# polyglot-interop proof): tonic GETs/streams a booted leaf #[grpc_controller] over real
+# H2 on localhost. It NEVER enters the shipped dep graph — leaf owns its own gRPC engine
+# (Status/framing/dispatch). Version-aligned to the workspace `prost` 0.13 (tonic 0.13 is
+# the latest tonic line that rides prost 0.13; tonic 0.14 moved to prost 0.14). tonic-build
+# is the BUILD-only client-stub generator (tonic's own codegen, over the SAME .proto), pinned
+# to the same 0.13 line so its prost-build matches the workspace.
+tonic = { version = "0.13", default-features = false, features = ["transport", "codegen", "prost"] }
+tonic-build = { version = "0.13", default-features = false, features = ["prost"] }
+
 # Codegen deps (leaf-codegen is a normal lib using proc-macro2/syn/quote so it is
 # unit-testable without a compiler; leaf-macros is the thin proc-macro that calls it).
 proc-macro2 = "1"
