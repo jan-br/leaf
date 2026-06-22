@@ -128,6 +128,20 @@ impl ReflectionIndex {
         Some(self.closure_for(file_name))
     }
 
+    /// The file declaring the extension `number` on `extendee` (a fully-qualified WIRE
+    /// type name, leading `.` tolerated) PLUS its transitive dependency closure, or
+    /// `None` if no such extension is indexed.
+    #[must_use]
+    pub fn file_containing_extension(
+        &self,
+        extendee: &str,
+        number: i32,
+    ) -> Option<Vec<FileDescriptorProto>> {
+        let key = (normalize_symbol(extendee), number);
+        let file_name = self.by_extension.get(&key)?;
+        Some(self.closure_for(file_name))
+    }
+
     /// The transitive `dependency` closure of `root` — `root`'s file followed by every
     /// file it imports, recursively, each appearing exactly once. A `dependency` naming
     /// an un-indexed file is skipped (a partial set still answers what it can).
@@ -185,8 +199,8 @@ mod tests {
     use super::*;
     use prost::Message;
     use prost_types::{
-        DescriptorProto, FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto,
-        ServiceDescriptorProto,
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        MethodDescriptorProto, ServiceDescriptorProto,
     };
 
     /// A minimal message descriptor (name only).
@@ -346,6 +360,44 @@ mod tests {
                 "storefront.catalog.Catalog".to_string(),
             ]
         );
+    }
+
+    /// A file declaring two file-level extensions on `.pkg.Base` (numbers 100, 101).
+    fn extensions_file() -> FileDescriptorProto {
+        let ext = |name: &str, number: i32| FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(number),
+            extendee: Some(".pkg.Base".to_string()),
+            ..Default::default()
+        };
+        FileDescriptorProto {
+            name: Some("ext.proto".to_string()),
+            package: Some("pkg".to_string()),
+            message_type: vec![message("Base")],
+            extension: vec![ext("first", 100), ext("second", 101)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn file_containing_extension_resolves_extendee_and_number() {
+        let bytes = encode_set(vec![extensions_file()]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+
+        let files = index
+            .file_containing_extension("pkg.Base", 100)
+            .expect("extension 100 resolves");
+        assert_eq!(files[0].name.as_deref(), Some("ext.proto"));
+
+        // A leading-dot extendee resolves the same.
+        assert!(index.file_containing_extension(".pkg.Base", 101).is_some());
+    }
+
+    #[test]
+    fn file_containing_extension_returns_none_for_unknown_number() {
+        let bytes = encode_set(vec![extensions_file()]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+        assert!(index.file_containing_extension("pkg.Base", 999).is_none());
     }
 
     #[test]
