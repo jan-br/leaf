@@ -107,6 +107,40 @@ impl ReflectionIndex {
     pub fn list_services(&self) -> Vec<String> {
         self.services.clone()
     }
+
+    /// The file with this `name` PLUS the transitive closure of its `dependency`
+    /// imports (deduped, the matched file first), or `None` if no such file is indexed.
+    #[must_use]
+    pub fn file_by_filename(&self, name: &str) -> Option<Vec<FileDescriptorProto>> {
+        if !self.by_filename.contains_key(name) {
+            return None;
+        }
+        Some(self.closure_for(name))
+    }
+
+    /// The transitive `dependency` closure of `root` — `root`'s file followed by every
+    /// file it imports, recursively, each appearing exactly once. A `dependency` naming
+    /// an un-indexed file is skipped (a partial set still answers what it can).
+    fn closure_for(&self, root: &str) -> Vec<FileDescriptorProto> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root.to_string());
+        seen.insert(root.to_string());
+
+        while let Some(name) = queue.pop_front() {
+            let Some(file) = self.by_filename.get(&name) else {
+                continue;
+            };
+            out.push(file.clone());
+            for dep in &file.dependency {
+                if seen.insert(dep.clone()) {
+                    queue.push_back(dep.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Strip a leading `.` from a wire type reference. `input_type`/`output_type`/`extendee`
@@ -215,6 +249,77 @@ mod tests {
     /// Encode one FileDescriptorProto into a one-file FileDescriptorSet's bytes.
     fn encode_set(files: Vec<FileDescriptorProto>) -> Vec<u8> {
         FileDescriptorSet { file: files }.encode_to_vec()
+    }
+
+    /// `app.proto` → depends on a.proto + b.proto; both → depend on common.proto.
+    fn diamond_files() -> Vec<FileDescriptorProto> {
+        let common = FileDescriptorProto {
+            name: Some("common.proto".to_string()),
+            package: Some("common".to_string()),
+            message_type: vec![message("Shared")],
+            ..Default::default()
+        };
+        let a = FileDescriptorProto {
+            name: Some("a.proto".to_string()),
+            package: Some("a".to_string()),
+            dependency: vec!["common.proto".to_string()],
+            message_type: vec![message("A")],
+            ..Default::default()
+        };
+        let b = FileDescriptorProto {
+            name: Some("b.proto".to_string()),
+            package: Some("b".to_string()),
+            dependency: vec!["common.proto".to_string()],
+            message_type: vec![message("B")],
+            ..Default::default()
+        };
+        let app = FileDescriptorProto {
+            name: Some("app.proto".to_string()),
+            package: Some("app".to_string()),
+            dependency: vec!["a.proto".to_string(), "b.proto".to_string()],
+            message_type: vec![message("App")],
+            ..Default::default()
+        };
+        vec![common, a, b, app]
+    }
+
+    fn names_of(files: &[FileDescriptorProto]) -> Vec<String> {
+        files
+            .iter()
+            .map(|f| f.name.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn file_by_filename_returns_the_file_first_then_its_transitive_closure_deduped() {
+        let bytes = encode_set(diamond_files());
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+
+        let files = index.file_by_filename("app.proto").expect("app.proto is indexed");
+        let names = names_of(&files);
+
+        // The matched file is first.
+        assert_eq!(names[0], "app.proto");
+        // The full closure is present, deduped (common.proto exactly once).
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "a.proto".to_string(),
+                "app.proto".to_string(),
+                "b.proto".to_string(),
+                "common.proto".to_string(),
+            ]
+        );
+        assert_eq!(names.iter().filter(|n| *n == "common.proto").count(), 1);
+    }
+
+    #[test]
+    fn file_by_filename_returns_none_for_an_unknown_file() {
+        let bytes = encode_set(diamond_files());
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+        assert!(index.file_by_filename("nope.proto").is_none());
     }
 
     #[test]
