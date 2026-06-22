@@ -1,0 +1,21 @@
+syntax = "proto3";
+package echo;
+
+message EchoRequest  { string text = 1; }
+message EchoReply    { string text = 1; }
+message CountReply   { uint32 n = 1; }
+
+service Echo {
+  // unary
+  rpc Unary (EchoRequest) returns (EchoReply);
+  // server-streaming: replies one EchoReply per word in `text`
+  rpc ServerStream (EchoRequest) returns (stream EchoReply);
+  // client-streaming: counts the inbound messages, replies the count
+  rpc ClientStream (stream EchoRequest) returns (CountReply);
+  // bidi: echoes each inbound message back, upper-cased
+  rpc Bidi (stream EchoRequest) returns (stream EchoReply);
+  // an RPC whose handler ALWAYS returns an explicit Status (the error proof)
+  rpc Boom (EchoRequest) returns (EchoReply);
+  // an RPC that raises a domain LeafError the GrpcStatusMapper maps to a Status
+  rpc Domain (EchoRequest) returns (EchoReply);
+}
