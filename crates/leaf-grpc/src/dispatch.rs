@@ -3,35 +3,54 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use http::{HeaderMap, HeaderValue};
-use leaf_core::{BoxFuture, LeafError, Ref};
-use leaf_web::{Frame, ProtocolDispatch, Request, Response};
+use leaf_core::{BoxFuture, BoxStream, LeafError, Ref};
+use leaf_web::{Body, Frame, ProtocolDispatch, Request, Response};
 
 use crate::handler::GrpcRoute;
-use crate::status::Status;
+use crate::mapper::GrpcStatusMapper;
+use crate::status::{Code, Status};
+
+/// A one-element [`Body::Stream`] payload carrying ONLY the gRPC status trailers —
+/// the wire shape for an empty (or short-circuited) gRPC response: HTTP 200, no data
+/// frames, a single `Frame::Trailers(grpc-status/grpc-message)`. Backend-free
+/// (`BoxStream` is `futures`, not hyper). Used by the GrpcHandler success/error edges
+/// and by a filter short-circuiting a gRPC call. The single trailer-stream builder so
+/// explicit-Status and mapped-LeafError trailers are byte-identical.
+#[must_use]
+pub fn status_trailers_stream(status: Status) -> BoxStream<'static, Result<Frame, LeafError>> {
+    let trailers = status.to_trailers();
+    Box::pin(futures::stream::once(async move { Ok(Frame::Trailers(trailers)) }))
+}
+
+/// Drain a [`Body`] and return its trailers (the last `Frame::Trailers` map), ignoring
+/// any data frames. A test/utility helper for asserting a rendered gRPC response's
+/// grpc-status; it walks the abstract `leaf_web::Body`, naming no backend.
+pub async fn collect_trailers(body: Body) -> http::HeaderMap {
+    use futures::StreamExt;
+    match body {
+        Body::Full(_) => http::HeaderMap::new(),
+        Body::Stream(mut s) => {
+            let mut trailers = http::HeaderMap::new();
+            while let Some(frame) = s.next().await {
+                if let Ok(Frame::Trailers(t)) = frame {
+                    trailers = t;
+                }
+            }
+            trailers
+        }
+    }
+}
 
 /// Render a [`Status`] as a STATUS-ONLY gRPC response (no data frames, just the
-/// `grpc-status`/`grpc-message` trailer frame). The shape an unknown method or a
-/// short-circuited request takes. Backend-free: a leaf [`Response`] with a
-/// `Body::Stream` of one [`Frame::Trailers`].
+/// `grpc-status`/`grpc-message` trailer frame). The shape an unknown method, a
+/// mapped handler `LeafError`, or a short-circuited request takes. Backend-free: a leaf
+/// [`Response`] with a `Body::Stream` of one [`Frame::Trailers`] over HTTP 200 — gRPC's
+/// failure lives in the trailers, never the HTTP status.
 #[must_use]
 pub fn status_response(status: &Status) -> Response {
-    let mut trailers = HeaderMap::new();
-    // The discriminant IS the wire number (Code is repr(i32)), so no lookup table.
-    let code_str = (status.code as i32).to_string();
-    trailers.insert(
-        "grpc-status",
-        HeaderValue::from_str(&code_str).unwrap_or(HeaderValue::from_static("2")),
-    );
-    if !status.message.is_empty()
-        && let Ok(v) = HeaderValue::from_str(&status.message)
-    {
-        trailers.insert("grpc-message", v);
-    }
-    let out = futures::stream::once(async move { Ok::<_, LeafError>(Frame::Trailers(trailers)) });
     Response::ok()
         .with_header(leaf_web::http::header::CONTENT_TYPE, "application/grpc")
-        .with_body_stream(Box::pin(out))
+        .with_body_stream(status_trailers_stream(status.clone()))
 }
 
 /// The gRPC [`ProtocolDispatch`] impl (the design's §4 protocol branch): leaf-web's
@@ -49,26 +68,59 @@ pub struct GrpcDispatch {
     /// Field-injected; the O(1) map is built per dispatch off it (cheap — a
     /// borrow-and-find — see `routes_map`).
     routes: Vec<Ref<dyn GrpcRoute>>,
+    /// The ordered `LeafError -> Status` mappers (user mappers + the FALLBACK floor),
+    /// field-injected as the `dyn GrpcStatusMapper` collection. Consulted first-`Some`-
+    /// wins to render a domain/framework error (or a filter short-circuit) as grpc-status
+    /// trailers — the gRPC analogue of leaf-web's `ControlAdvice` chain.
+    mappers: Vec<Ref<dyn GrpcStatusMapper>>,
 }
 
 impl GrpcDispatch {
-    /// The constructor the `#[bean]` provider calls: it injects the route collection
-    /// (the `#[bean]` factory wires this from `Vec<Ref<dyn GrpcRoute>>`).
+    /// The constructor the `#[bean]` provider calls: it injects the route collection AND
+    /// the mapper collection (the `#[bean]` factory wires both from their `Vec<Ref<dyn _>>`).
     #[must_use]
-    pub fn new(routes: Vec<Ref<dyn GrpcRoute>>) -> Self {
-        GrpcDispatch { routes }
+    pub fn new(routes: Vec<Ref<dyn GrpcRoute>>, mappers: Vec<Ref<dyn GrpcStatusMapper>>) -> Self {
+        GrpcDispatch { routes, mappers }
     }
 
     /// A test/explicit constructor over already-resolved `Arc<dyn GrpcRoute>`s (the
-    /// `Ref` newtype wraps an `Arc`, so this is the same shape DI produces).
+    /// `Ref` newtype wraps an `Arc`, so this is the same shape DI produces). The mapper
+    /// chain is seeded with the [`DefaultGrpcStatusMapper`](crate::DefaultGrpcStatusMapper)
+    /// FALLBACK floor alone — the SAME floor production always has present — so the
+    /// unknown-method path maps `NoSuchBean -> Unimplemented` exactly as DI does.
     #[must_use]
     pub fn from_routes(routes: Vec<Arc<dyn GrpcRoute>>) -> Self {
-        GrpcDispatch { routes: routes.into_iter().map(Ref::from_arc).collect() }
+        let floor: Arc<dyn GrpcStatusMapper> = Arc::new(crate::mapper::DefaultGrpcStatusMapper::new());
+        GrpcDispatch {
+            routes: routes.into_iter().map(Ref::from_arc).collect(),
+            mappers: vec![Ref::from_arc(floor)],
+        }
     }
 
     /// Build the O(1) `path -> route` map once (a borrow of the injected collection).
     fn routes_map(&self) -> HashMap<&str, &dyn GrpcRoute> {
         self.routes.iter().map(|r| (r.path(), &**r)).collect()
+    }
+
+    /// A shareable `Arc` view of the injected mapper chain (the `Ref` newtype wraps an
+    /// `Arc`), the slice [`status_for`](Self::status_for) consumes.
+    fn mappers_as_arcs(&self) -> Vec<Arc<dyn GrpcStatusMapper>> {
+        self.mappers.iter().cloned().map(Ref::into_arc).collect()
+    }
+
+    /// Map a handler/filter [`LeafError`] to a [`Status`] via the ordered mapper chain
+    /// (user mappers consulted first, the `DefaultGrpcStatusMapper` FALLBACK last). The
+    /// floor never declines, so the production chain always yields a `Status`; if NO
+    /// mapper is wired at all (degenerate), it defaults to [`Code::Unknown`] so a
+    /// well-formed trailer is still produced. Pure + backend-free.
+    #[must_use]
+    pub fn status_for(mappers: &[Arc<dyn GrpcStatusMapper>], err: &LeafError) -> Status {
+        for m in mappers {
+            if let Some(s) = m.map(err) {
+                return s;
+            }
+        }
+        Status::new(Code::Unknown, err.to_string())
     }
 }
 
@@ -86,12 +138,22 @@ impl ProtocolDispatch for GrpcDispatch {
                 // Known method: hand the framed request to its handler (which NEVER
                 // errors — it renders any Status as trailers), wrapped as Ok.
                 Some(route) => Ok(route.handler().call(req).await),
-                // Unknown method: Unimplemented, rendered as trailers (never an Err —
-                // a gRPC client must still read a valid grpc-status, not an HTTP body).
-                None => Ok(status_response(&Status::unimplemented(format!(
-                    "no gRPC method registered for {}",
-                    req.path()
-                )))),
+                // Unknown method: a `NoSuchBean` LeafError run through the ordered mapper
+                // chain (user mappers first, the FALLBACK floor last — which maps
+                // NoSuchBean -> Unimplemented). Rendered as trailers (never an Err — a
+                // gRPC client must still read a valid grpc-status, not an HTTP body). This
+                // is the SAME mapper channel a handler-surfaced domain error rides, so a
+                // user mapper can even reshape "unknown method".
+                None => {
+                    let err = LeafError::new(leaf_core::ErrorKind::NoSuchBean).caused_by(
+                        leaf_core::Cause::plain(
+                            "no gRPC method registered",
+                            req.path().to_owned(),
+                        ),
+                    );
+                    let status = Self::status_for(&self.mappers_as_arcs(), &err);
+                    Ok(status_response(&status))
+                }
             }
         })
     }
@@ -124,10 +186,16 @@ impl Default for GrpcDispatchConfig {
 #[leaf_macros::configuration]
 impl GrpcDispatchConfig {
     /// Contribute [`GrpcDispatch`] as the `dyn ProtocolDispatch` bean, field-injecting
-    /// the collection of every contributed `dyn GrpcRoute`.
+    /// BOTH the collection of every contributed `dyn GrpcRoute` AND the ordered
+    /// `dyn GrpcStatusMapper` chain (user mappers + the FALLBACK floor) — the gRPC
+    /// analogue of leaf-web's `ControlAdvice` chain, collected the SAME DI way.
     #[bean(name = "grpcDispatch", provides = "dyn ::leaf_web::ProtocolDispatch")]
-    fn grpc_dispatch(&self, routes: Vec<Ref<dyn GrpcRoute>>) -> GrpcDispatch {
-        GrpcDispatch::new(routes)
+    fn grpc_dispatch(
+        &self,
+        routes: Vec<Ref<dyn GrpcRoute>>,
+        mappers: Vec<Ref<dyn GrpcStatusMapper>>,
+    ) -> GrpcDispatch {
+        GrpcDispatch::new(routes, mappers)
     }
 }
 
@@ -205,6 +273,50 @@ mod tests {
             }
             Frame::Data(_) => panic!("expected trailers, got a data frame"),
         }
+    }
+
+    #[test]
+    fn a_handler_leaf_error_is_rendered_as_status_trailers_via_the_mapper_chain() {
+        use crate::mapper::{DefaultGrpcStatusMapper, GrpcStatusMapper};
+        use crate::status::{Code, Status};
+        use leaf_core::{ContractId, ErrorKind, LeafError};
+        use std::sync::Arc;
+
+        // A user mapper claiming a domain Integration{kind_id} -> NotFound (the gRPC
+        // analogue of the storefront's unknown-SKU -> 404 advice).
+        fn unknown_sku() -> ContractId {
+            ContractId::of("storefront::catalog::UnknownSku")
+        }
+        struct DomainMapper;
+        impl GrpcStatusMapper for DomainMapper {
+            fn map(&self, err: &LeafError) -> Option<Status> {
+                match err.kind {
+                    ErrorKind::Integration { kind_id } if kind_id == unknown_sku() => {
+                        Some(Status::not_found("unknown sku"))
+                    }
+                    _ => None,
+                }
+            }
+        }
+
+        // The mapper chain: the user mapper FIRST, the FALLBACK floor LAST.
+        let mappers: Vec<Arc<dyn GrpcStatusMapper>> =
+            vec![Arc::new(DomainMapper), Arc::new(DefaultGrpcStatusMapper::new())];
+
+        // GrpcDispatch's pure error->trailers entry point (no transport): given a
+        // handler LeafError, it consults the chain (user-first) and renders trailers.
+        let err = LeafError::new(ErrorKind::Integration { kind_id: unknown_sku() });
+        let trailers = GrpcDispatch::status_for(&mappers, &err).to_trailers();
+        assert_eq!(
+            trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "the domain Integration error mapped to NotFound (5) via the user mapper"
+        );
+
+        // An UNCLAIMED error falls through to the FALLBACK floor -> Unknown (2).
+        let other = LeafError::new(ErrorKind::ConstructionFailed);
+        let s = GrpcDispatch::status_for(&mappers, &other);
+        assert_eq!(s.code, Code::Unknown);
     }
 
     #[test]

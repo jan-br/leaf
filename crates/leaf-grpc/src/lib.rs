@@ -35,7 +35,7 @@ leaf_core::declare_source!("leaf-grpc");
 //   pub use mapper::{DefaultGrpcStatusMapper, GrpcStatusMapper};
 pub use caller::{GrpcControllerKind, GrpcRecv, GrpcSend};
 pub use codec::{GrpcCodec, ProstCodec};
-pub use dispatch::GrpcDispatch;
+pub use dispatch::{collect_trailers, status_trailers_stream, GrpcDispatch};
 pub use framing::{decode_frames, encode_frame};
 pub use handler::{GrpcHandler, GrpcRoute};
 pub use mapper::{map_first, DefaultGrpcStatusMapper, GrpcStatusMapper};

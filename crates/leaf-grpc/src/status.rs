@@ -86,6 +86,47 @@ impl Status {
     pub fn unimplemented(message: impl Into<String>) -> Self {
         Status::new(Code::Unimplemented, message)
     }
+
+    /// Render this status as the gRPC HTTP/2 trailers (`grpc-status` = the numeric
+    /// [`Code`], `grpc-message` = the percent-encoded message). These are the trailing
+    /// metadata a gRPC response carries — the [`Frame::Trailers`](leaf_web::Frame::Trailers)
+    /// the gRPC edge appends to the response body stream. A tonic/grpc-go peer reads
+    /// `grpc-status: <code as i32>` canonically.
+    ///
+    /// `grpc-message` is percent-encoded per the gRPC HTTP/2 spec (bytes outside
+    /// `%x20-%x7E`, and `%` itself, become `%XX`) so an arbitrary message is always a
+    /// valid ASCII [`HeaderValue`](http::HeaderValue). An empty message is omitted.
+    #[must_use]
+    pub fn to_trailers(&self) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        // grpc-status is the numeric code (0..=16). The discriminant IS the wire number;
+        // `HeaderValue: From<u16>` renders it as ASCII digits with no allocation.
+        h.insert("grpc-status", http::HeaderValue::from(self.code as u16));
+        // grpc-message is percent-encoded; an empty message carries no trailer.
+        if !self.message.is_empty() {
+            let encoded = percent_encode_grpc_message(&self.message);
+            if let Ok(v) = http::HeaderValue::from_str(&encoded) {
+                h.insert("grpc-message", v);
+            }
+        }
+        h
+    }
+}
+
+/// Percent-encode a grpc-message per the gRPC HTTP/2 protocol: any byte not in
+/// `%x20-%x7E` (and `%` itself) becomes `%XX`. Pure, backend-free.
+fn percent_encode_grpc_message(msg: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(msg.len());
+    for &b in msg.as_bytes() {
+        if (0x20..=0x7E).contains(&b) && b != b'%' {
+            out.push(b as char);
+        } else {
+            // `write!` into a String is infallible; the result is discarded.
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -125,6 +166,39 @@ mod status_tests {
         let s = Status::new(Code::NotFound, "no such product");
         assert_eq!(s.code, Code::NotFound);
         assert_eq!(s.message, "no such product");
+    }
+
+    #[test]
+    fn status_renders_as_grpc_status_and_message_trailers() {
+        let s = Status::new(Code::NotFound, "no such product");
+        let trailers = s.to_trailers();
+        assert_eq!(
+            trailers.get("grpc-status").and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "grpc-status carries the numeric Code"
+        );
+        // Per the gRPC HTTP/2 spec, bytes 0x20..=0x7E (incl. SPACE) are NOT encoded;
+        // only bytes outside that range and `%` itself become %XX. So an ASCII message
+        // with spaces rides through literally — the load-bearing invariant is the
+        // numeric grpc-status, and that an arbitrary message is a valid ASCII header.
+        assert_eq!(
+            trailers.get("grpc-message").and_then(|v| v.to_str().ok()),
+            Some("no such product"),
+            "grpc-message carries the (percent-encoded) message"
+        );
+    }
+
+    #[test]
+    fn grpc_message_percent_encodes_bytes_outside_the_printable_ascii_range() {
+        // A newline (0x0A, below 0x20) and `%` (0x25) MUST be %XX-escaped so the value
+        // is always a valid ASCII HeaderValue (the gRPC HTTP/2 spec's percent-encoding).
+        let s = Status::new(Code::Internal, "a\nb%c");
+        let trailers = s.to_trailers();
+        assert_eq!(
+            trailers.get("grpc-message").and_then(|v| v.to_str().ok()),
+            Some("a%0Ab%25c"),
+            "newline -> %0A, percent -> %25; printable ASCII passes through"
+        );
     }
 
     #[test]
