@@ -18,6 +18,10 @@ leaf-web.workspace = true
 leaf-macros.workspace = true
 # prost — the protobuf MESSAGE codec, confined to ProstCodec (the serde_json analogue).
 prost.workspace = true
+# prost-types — the well-known descriptor value types (FileDescriptorSet / FileDescriptorProto)
+# the reflection INDEX decodes the discovery slice into. Pure Rust (no protoc, no hyper/h2),
+# so leaf-grpc stays backend-free; re-exported as `prost_types` for the umbrella facade.
+prost-types.workspace = true
 # The body carrier at the frame edge + the neutral HTTP value vocabulary (HeaderMap
 # for grpc-status trailers). NO hyper/h2 — only the server-agnostic `http` types.
 bytes.workspace = true
@@ -59,10 +63,8 @@ leaf-tokio.workspace = true
 leaf-web-hyper.workspace = true
 leaf-serde.workspace = true
 prost.workspace = true
-# prost-types — the well-known FileDescriptorSet/FileDescriptorProto value types the
-# reflected-FDS slice test decodes the collected discovery-slice bytes into (it is a
-# transitive dep through prost, but named explicitly so the test resolves `::prost_types`).
-prost-types.workspace = true
+# (prost-types is now a NORMAL dep above — the reflected-FDS slice test + the reflection
+# index resolve `::prost_types` through it, so no separate dev-dep entry is needed.)
 tonic.workspace = true
 http.workspace = true
 # The cross-cutting integration test drives the leaf-web Dispatcher across the

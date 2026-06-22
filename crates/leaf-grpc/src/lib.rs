@@ -28,6 +28,7 @@ pub mod dispatch;
 pub mod framing;
 pub mod handler;
 pub mod mapper;
+pub mod reflection;
 pub mod status;
 pub mod streaming;
 
@@ -48,6 +49,7 @@ pub use dispatch::{collect_trailers, status_trailers_stream, GrpcDispatch};
 pub use framing::{decode_frames, encode_frame};
 pub use handler::{GrpcHandler, GrpcRoute};
 pub use mapper::{map_first, DefaultGrpcStatusMapper, GrpcStatusMapper};
+// `pub use reflection::ReflectionIndex;` is activated in Task 2.2 (the type lands there).
 pub use descriptor::{CallShape, MethodDescriptor};
 pub use status::{Code, Status};
 pub use streaming::Streaming;
@@ -60,6 +62,12 @@ pub use streaming::Streaming;
 // dep. prost is leaf-grpc's normal (runtime) codec dependency — the re-export only exposes it.
 #[doc(no_inline)]
 pub use prost;
+
+// prost-types — the descriptor value types the reflection index decodes the discovery
+// slice into; re-exported (the same umbrella-facade trick as `prost`) so a proto-first
+// downstream resolves `::leaf_grpc::prost_types::FileDescriptorProto` through the one dep.
+#[doc(no_inline)]
+pub use prost_types;
 
 // `linkme` re-exported THROUGH leaf-core (which does `pub use linkme;`), so the
 // `leaf-grpc-build`-generated FDS registration rows resolve `::leaf_grpc::linkme`
