@@ -4,9 +4,12 @@
 //!
 //! `leaf-grpc-build` renders, beside each generated server trait, a `#[doc(hidden)]`
 //! `pub const <METHOD>_DESCRIPTOR: leaf_grpc::MethodDescriptor` carrying the canonical
-//! `/pkg.Service/Method` path + the [`CallShape`]. The `#[grpc_controller]` lowering
-//! consults the SHAPE here (NOT the textual type of `req`/the return) to pick the
-//! framing/codec wrapper, so the no-type-name-detection rule holds end to end.
+//! `/pkg.Service/Method` path + the [`CallShape`]. The `#[grpc_controller]` lowering reads the
+//! PATH here for `GrpcRoute::path()`; the call SHAPE is resolved by the disjoint
+//! [`GrpcRecv`](crate::GrpcRecv)/[`GrpcSend`](crate::GrpcSend) seams on the method's REAL
+//! argument/return types (NOT the textual type of `req`/the return, and no longer read from
+//! this const), so the no-type-name-detection rule holds end to end. The [`CallShape`] here
+//! remains the documentary record of the wire arity + a build-time descriptor field.
 
 /// The RPC call shape — the streaming arity of an RPC, decided at codegen time ONLY
 /// from the FileDescriptorSet's `client_streaming`/`server_streaming` flags (never from

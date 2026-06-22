@@ -1,23 +1,29 @@
-//! The four CALL-SHAPE framing/codec wrappers the `#[grpc_controller]` macro (Stage 4)
-//! references — the runtime adapters that sit between the wire [`Request`]/[`Response`]
-//! and the typed user RPC method. Each wrapper has the SAME shape `(req, codec, body)`:
-//! it de-frames + decodes the inbound side into the typed argument the closure wants
-//! (`T` or [`Streaming<T>`]), runs the user method, then encodes + frames the typed
-//! result (`U` or `Streaming<U>`) and appends the `grpc-status` trailer.
+//! The gRPC framing/codec dispatch the `#[grpc_controller]` macro (Stage 4) references —
+//! the runtime adapters that sit between the wire [`Request`]/[`Response`] and the typed
+//! user RPC method, expressed as TWO DISJOINT-TRAIT seams resolved on the REAL message
+//! types (NEVER a textual type name):
 //!
-//! The shape (which wrapper) is chosen by the macro from the Stage-3
-//! [`MethodDescriptor`](crate::MethodDescriptor) seam — NEVER from the textual type of
-//! the request/response. These fns only DO the framing once the shape is known.
+//! - [`GrpcRecv`] de-frames + decodes the inbound [`Request`] into the typed handler
+//!   argument. The blanket `impl for M: prost::Message` decodes exactly ONE message (the
+//!   unary / server-stream input `T`); the `impl for Streaming<M>` decodes the inbound
+//!   message STREAM (the client-stream / bidi input). These are DISJOINT — `Streaming<M>`
+//!   is not a `prost::Message`, so no autoref/specialization is needed.
+//! - [`GrpcSend`] encodes + frames the handler's `Ok` output into the response [`Body`] +
+//!   the `grpc-status` trailers. The blanket `impl for M: prost::Message` encodes ONE
+//!   message + Ok trailers (the unary / client-stream output `U`); the `impl for
+//!   Streaming<M>` frames the outbound message STREAM (the server-stream / bidi output).
+//!   Also disjoint.
 //!
-//! A handler NEVER returns `Err`: a [`Status`] from the user method (or a malformed
-//! request) is RENDERED as `grpc-status`/`grpc-message` trailers (a valid gRPC response),
-//! exactly like [`status_response`](crate::dispatch::status_response).
-
-use std::future::Future;
+//! The call SHAPE (unary vs server/client/bidi) thus falls out of TRAIT RESOLUTION on the
+//! method's real argument/return types — the macro emits ONE uniform wrapper and never
+//! inspects the signature for a `Streaming` name. A handler NEVER returns `Err`: a
+//! [`Status`] from the user method (or a malformed request) is RENDERED as
+//! `grpc-status`/`grpc-message` trailers (a valid gRPC response), exactly like
+//! [`crate::dispatch::status_response`].
 
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue};
-use leaf_core::LeafError;
+use leaf_core::{BoxFuture, LeafError};
 use leaf_web::{Body, Frame, Request, Response};
 use prost::Message;
 
@@ -57,100 +63,14 @@ fn grpc_response(
 }
 
 /// Decode the FIRST inbound message as `T` (the single-request side of unary/server-stream).
-/// `Ok(None)` means the client sent no message — surfaced as an `InvalidArgument` status by
-/// the callers.
-async fn decode_first<T: Message + Default>(codec: &ProstCodec, body: Body) -> Result<T, Status> {
+/// `Ok(None)` means the client sent no message — surfaced as an `InvalidArgument` status.
+async fn decode_first<T: Message + Default>(codec: ProstCodec, body: Body) -> Result<T, Status> {
     let mut msgs = decode_frames(body);
     match msgs.next().await {
         Some(Ok(raw)) => codec.decode::<T>(&raw),
         Some(Err(status)) => Err(status),
         None => Err(Status::invalid_argument("expected one request message, got none")),
     }
-}
-
-/// **Unary** (`T -> Result<U, Status>`): decode the single request `T`, run the method,
-/// encode the single `U`, frame it + Ok trailers. Any [`Status`] renders as trailers.
-pub async fn call_unary<T, U, F, Fut>(req: Request, codec: &ProstCodec, body: F) -> Response
-where
-    T: Message + Default,
-    U: Message,
-    F: FnOnce(T) -> Fut,
-    Fut: Future<Output = Result<U, Status>>,
-{
-    let codec_owned = *codec;
-    let msg: T = match decode_first(codec, req.into_body()).await {
-        Ok(m) => m,
-        Err(status) => return status_response(&status),
-    };
-    match body(msg).await {
-        Ok(out) => {
-            let data = Frame::Data(encode_frame(&codec_owned.encode(&out)));
-            grpc_response(futures::stream::iter(vec![Ok(data), Ok(ok_trailers())]))
-        }
-        Err(status) => status_response(&status),
-    }
-}
-
-/// **Server-stream** (`T -> Result<Streaming<U>, Status>`): decode the single request `T`,
-/// run the method, then frame EACH yielded `U` as a data frame, terminating with Ok trailers
-/// (or a mid-stream `Status` as trailers).
-pub async fn call_server_stream<T, U, F, Fut>(req: Request, codec: &ProstCodec, body: F) -> Response
-where
-    T: Message + Default,
-    U: Message + Send + Sync + 'static,
-    F: FnOnce(T) -> Fut,
-    Fut: Future<Output = Result<Streaming<U>, Status>>,
-{
-    let codec_owned = *codec;
-    let msg: T = match decode_first(codec, req.into_body()).await {
-        Ok(m) => m,
-        Err(status) => return status_response(&status),
-    };
-    let stream = match body(msg).await {
-        Ok(s) => s,
-        Err(status) => return status_response(&status),
-    };
-    grpc_response(frame_out_stream(codec_owned, stream))
-}
-
-/// **Client-stream** (`Streaming<T> -> Result<U, Status>`): de-frame the inbound body into a
-/// typed `Streaming<T>` (decode each message via the codec), hand it to the method, encode the
-/// single `U`, frame it + Ok trailers.
-pub async fn call_client_stream<T, U, F, Fut>(req: Request, codec: &ProstCodec, body: F) -> Response
-where
-    T: Message + Default + Send + Sync + 'static,
-    U: Message,
-    F: FnOnce(Streaming<T>) -> Fut,
-    Fut: Future<Output = Result<U, Status>>,
-{
-    let codec_owned = *codec;
-    let inbound = decode_in_stream::<T>(codec_owned, req.into_body());
-    match body(inbound).await {
-        Ok(out) => {
-            let data = Frame::Data(encode_frame(&codec_owned.encode(&out)));
-            grpc_response(futures::stream::iter(vec![Ok(data), Ok(ok_trailers())]))
-        }
-        Err(status) => status_response(&status),
-    }
-}
-
-/// **Bidi** (`Streaming<T> -> Result<Streaming<U>, Status>`): de-frame the inbound body into a
-/// typed `Streaming<T>`, hand it to the method, then frame EACH yielded `U`, terminating with
-/// trailers.
-pub async fn call_bidi<T, U, F, Fut>(req: Request, codec: &ProstCodec, body: F) -> Response
-where
-    T: Message + Default + Send + Sync + 'static,
-    U: Message + Send + Sync + 'static,
-    F: FnOnce(Streaming<T>) -> Fut,
-    Fut: Future<Output = Result<Streaming<U>, Status>>,
-{
-    let codec_owned = *codec;
-    let inbound = decode_in_stream::<T>(codec_owned, req.into_body());
-    let stream = match body(inbound).await {
-        Ok(s) => s,
-        Err(status) => return status_response(&status),
-    };
-    grpc_response(frame_out_stream(codec_owned, stream))
 }
 
 /// De-frame + decode the inbound body into a typed [`Streaming<T>`] (each wire frame decoded
@@ -188,6 +108,76 @@ fn frame_out_stream<U: Message + Send + Sync + 'static>(
             St::Done => None,
         }
     })
+}
+
+/// Encode a single message `U` + Ok trailers as a complete two-frame gRPC response.
+fn unary_response<U: Message>(codec: ProstCodec, out: &U) -> Response {
+    let data = Frame::Data(encode_frame(&codec.encode(out)));
+    grpc_response(futures::stream::iter(vec![Ok(data), Ok(ok_trailers())]))
+}
+
+/// The INBOUND side of a gRPC method: produce the typed handler argument from the framed
+/// [`Request`]. Resolved on the REAL argument type — the blanket `impl for M: Message`
+/// decodes ONE message (unary / server-stream input), the `impl for Streaming<M>` decodes
+/// the inbound message STREAM (client-stream / bidi input). DISJOINT (a `Streaming<M>` is
+/// not a `prost::Message`), so the `#[grpc_controller]` macro picks the shape by TRAIT
+/// resolution on the type the user wrote — never by spelling its name.
+pub trait GrpcRecv: Sized {
+    /// De-frame + decode `req` into `Self` (the typed handler argument). The future is
+    /// `'static` (the codec is copied in), so it composes inside the boxed `GrpcHandler::call`
+    /// future. A malformed request / decode failure surfaces as an `Err(Status)` the caller
+    /// renders as trailers.
+    fn recv(req: Request, codec: &ProstCodec) -> BoxFuture<'static, Result<Self, Status>>;
+}
+
+/// **Unary / server-stream input** (`T`): decode exactly ONE inbound message.
+impl<M: Message + Default + 'static> GrpcRecv for M {
+    fn recv(req: Request, codec: &ProstCodec) -> BoxFuture<'static, Result<Self, Status>> {
+        let codec = *codec;
+        Box::pin(async move { decode_first::<M>(codec, req.into_body()).await })
+    }
+}
+
+/// **Client-stream / bidi input** (`Streaming<T>`): de-frame the inbound body into the typed
+/// message STREAM (decode is lazy per item, so this never fails at recv time).
+impl<M: Message + Default + Send + Sync + 'static> GrpcRecv for Streaming<M> {
+    fn recv(req: Request, codec: &ProstCodec) -> BoxFuture<'static, Result<Self, Status>> {
+        let codec = *codec;
+        Box::pin(async move { Ok(decode_in_stream::<M>(codec, req.into_body())) })
+    }
+}
+
+/// The OUTBOUND side of a gRPC method: render the handler's `Result<Self, Status>` into the
+/// framed [`Response`]. Resolved on the REAL `Ok` type — the blanket `impl for M: Message`
+/// encodes ONE message + Ok trailers (unary / client-stream output), the `impl for
+/// Streaming<M>` frames the outbound message STREAM (server-stream / bidi output). DISJOINT,
+/// so the macro picks the shape by TRAIT resolution. A handler `Err(Status)` (or a recv
+/// failure threaded in by the caller) renders as `grpc-status` trailers, NEVER an `Err`.
+pub trait GrpcSend: Sized {
+    /// Render `out` into the framed [`Response`]: encode + frame the `Ok` value, or render a
+    /// carried [`Status`] as `grpc-status`/`grpc-message` trailers.
+    fn send(out: Result<Self, Status>, codec: &ProstCodec) -> Response;
+}
+
+/// **Unary / client-stream output** (`U`): encode the single message + Ok trailers.
+impl<M: Message + 'static> GrpcSend for M {
+    fn send(out: Result<Self, Status>, codec: &ProstCodec) -> Response {
+        match out {
+            Ok(msg) => unary_response(*codec, &msg),
+            Err(status) => status_response(&status),
+        }
+    }
+}
+
+/// **Server-stream / bidi output** (`Streaming<U>`): frame each yielded message, terminating
+/// with Ok trailers (or a mid-stream `Status` as trailers).
+impl<M: Message + Send + Sync + 'static> GrpcSend for Streaming<M> {
+    fn send(out: Result<Self, Status>, codec: &ProstCodec) -> Response {
+        match out {
+            Ok(stream) => grpc_response(frame_out_stream(*codec, stream)),
+            Err(status) => status_response(&status),
+        }
+    }
 }
 
 /// The `#[grpc_controller]` dual-form CONSISTENCY marker — the gRPC twin of
@@ -242,16 +232,31 @@ mod tests {
         }
     }
 
+    /// The uniform wrapper the `#[grpc_controller]` macro emits, expressed once over the
+    /// disjoint `GrpcRecv`/`GrpcSend` seams for the test (trait resolution picks the shape
+    /// from `Arg`/`Out`, never a name): recv the arg, run the handler, send the result.
+    async fn run<Arg, Out, F, Fut>(req: Request, codec: &ProstCodec, handler: F) -> Response
+    where
+        Arg: GrpcRecv,
+        Out: GrpcSend,
+        F: FnOnce(Arg) -> Fut,
+        Fut: std::future::Future<Output = Result<Out, Status>>,
+    {
+        let arg = match <Arg as GrpcRecv>::recv(req, codec).await {
+            Ok(a) => a,
+            Err(status) => return status_response(&status),
+        };
+        <Out as GrpcSend>::send(handler(arg).await, codec)
+    }
+
     // `String` is a complete prost Message (prost impls Message for the scalar wrappers), so
-    // the unary round-trip codec test uses it as both T and U.
+    // the round-trip codec tests use it as both T and U.
 
     #[test]
-    fn call_unary_decodes_runs_encodes_and_appends_ok_trailers() {
+    fn unary_recv_decodes_one_then_send_encodes_with_ok_trailers() {
         let codec = ProstCodec::new();
         let req = grpc_req(encode_frame(&codec.encode(&"ping".to_string())));
-        let resp = block_on(call_unary::<String, String, _, _>(req, &codec, |msg: String| async move {
-            Ok(format!("{msg}-pong"))
-        }));
+        let resp = block_on(run(req, &codec, |msg: String| async move { Ok(format!("{msg}-pong")) }));
         let frames = frames_of(resp);
         let out: String = codec.decode(&first_message(&frames)).expect("decode U");
         assert_eq!(out, "ping-pong");
@@ -259,10 +264,10 @@ mod tests {
     }
 
     #[test]
-    fn call_unary_renders_a_status_as_trailers_never_an_err() {
+    fn a_status_renders_as_trailers_never_an_err() {
         let codec = ProstCodec::new();
         let req = grpc_req(encode_frame(&codec.encode(&"x".to_string())));
-        let resp = block_on(call_unary::<String, String, _, _>(req, &codec, |_msg: String| async move {
+        let resp = block_on(run::<String, String, _, _>(req, &codec, |_msg| async move {
             Err(Status::not_found("nope"))
         }));
         let frames = frames_of(resp);
@@ -270,10 +275,10 @@ mod tests {
     }
 
     #[test]
-    fn call_server_stream_frames_each_message_then_ok_trailers() {
+    fn server_stream_send_frames_each_message_then_ok_trailers() {
         let codec = ProstCodec::new();
         let req = grpc_req(encode_frame(&codec.encode(&"seed".to_string())));
-        let resp = block_on(call_server_stream::<String, String, _, _>(req, &codec, |seed: String| async move {
+        let resp = block_on(run(req, &codec, |seed: String| async move {
             let items = vec![Ok(format!("{seed}-1")), Ok(format!("{seed}-2"))];
             Ok(Streaming::new(Box::pin(futures::stream::iter(items))))
         }));
@@ -284,14 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn call_client_stream_consumes_the_inbound_stream_and_replies_once() {
+    fn client_stream_recv_consumes_the_inbound_stream_then_sends_once() {
         let codec = ProstCodec::new();
         // Two framed inbound messages in one Full body.
         let mut wire = Vec::new();
         wire.extend_from_slice(&encode_frame(&codec.encode(&"a".to_string())));
         wire.extend_from_slice(&encode_frame(&codec.encode(&"b".to_string())));
         let req = grpc_req(Bytes::from(wire));
-        let resp = block_on(call_client_stream::<String, String, _, _>(req, &codec, |mut s| async move {
+        let resp = block_on(run(req, &codec, |mut s: Streaming<String>| async move {
             let mut count = 0;
             while let Some(item) = s.next().await {
                 item.expect("decoded inbound");
@@ -306,10 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn call_bidi_streams_both_ways() {
+    fn bidi_streams_both_ways() {
         let codec = ProstCodec::new();
         let req = grpc_req(encode_frame(&codec.encode(&"hi".to_string())));
-        let resp = block_on(call_bidi::<String, String, _, _>(req, &codec, |mut s| async move {
+        let resp = block_on(run(req, &codec, |mut s: Streaming<String>| async move {
             // Echo each inbound message back.
             let mut out = Vec::new();
             while let Some(item) = s.next().await {
@@ -321,6 +326,16 @@ mod tests {
         // One echoed message + the Ok trailer.
         assert_eq!(frames.len(), 2);
         assert_eq!(trailer_status(&frames), "0");
+    }
+
+    #[test]
+    fn a_recv_decode_failure_renders_invalid_argument_trailers() {
+        let codec = ProstCodec::new();
+        // An empty body (no framed message) → recv yields InvalidArgument, rendered as trailers.
+        let req = grpc_req(Bytes::new());
+        let resp = block_on(run::<String, String, _, _>(req, &codec, |msg| async move { Ok(msg) }));
+        let frames = frames_of(resp);
+        assert_eq!(trailer_status(&frames), "3", "no inbound message → InvalidArgument (3)");
     }
 
     #[test]

@@ -15,9 +15,11 @@
 //! - its `impl ::leaf_grpc::GrpcRoute` (`path()` = the `/pkg.Service/Method` constant read
 //!   from the Stage-3 trait seam; `handler()` = `self`),
 //! - its `impl ::leaf_grpc::GrpcHandler` whose `call` wraps the typed method with
-//!   framing/codec via the CALL-SHAPE wrapper (`call_unary`/`call_server_stream`/
-//!   `call_client_stream`/`call_bidi`) — the shape read from the Stage-3 trait seam, NEVER
-//!   from the textual type of `req`/the return (the no-type-names rule),
+//!   framing/codec via ONE UNIFORM wrapper over the disjoint `::leaf_grpc::GrpcRecv` /
+//!   `::leaf_grpc::GrpcSend` seams — the call SHAPE (unary/server/client/bidi) falls out of
+//!   TRAIT RESOLUTION on the method's REAL argument/return types, NEVER from their textual
+//!   spelling (the no-type-names rule). The macro is shape-agnostic: it never inspects the
+//!   signature for a `Streaming` name.
 //! - the `#[component]`-equivalent bean registration (one const `::leaf_core::Descriptor`
 //!   into `COMPONENTS`, via the SAME [`crate::descriptor::emit`] currency the stereotypes
 //!   use) that `provides` the `dyn ::leaf_grpc::GrpcRoute` view, so `GrpcDispatch`'s
@@ -39,9 +41,10 @@
 //! generic over `M: prost::Message`), so the codec is injected as the CONCRETE
 //! `::leaf_grpc::ProstCodec` bean. This module therefore:
 //!
-//! - reads the per-method path + shape from `<service-mod>::<METHOD>_DESCRIPTOR` (a `const`
-//!   the compiler folds), by the SCREAMING_SNAKE of `sig.ident` — STILL never a type-name
-//!   check on `req`/the return, the no-type-names rule held end to end, and
+//! - reads the per-method PATH from `<service-mod>::<METHOD>_DESCRIPTOR.path` (a `const` the
+//!   compiler folds), by the SCREAMING_SNAKE of `sig.ident` — never a type-name check on
+//!   `req`/the return; the per-method SHAPE is no longer read here at all (it is resolved by
+//!   `GrpcRecv`/`GrpcSend` on the real types), so the no-type-names rule holds end to end, and
 //! - field-injects `codec: ::leaf_core::Ref<::leaf_grpc::ProstCodec>` (the concrete codec
 //!   bean), not a `dyn` view.
 //!
@@ -56,21 +59,6 @@ use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Type};
 
 use crate::descriptor::{self, BeanInput, Dependency, EmitError, FieldShape, Scope, ServiceView, Slice};
 use crate::stereotype::Stereotype;
-
-/// The four gRPC call shapes (§5). The shape selects WHICH framing/codec wrapper the
-/// generated `GrpcHandler::call` invokes around the typed user method — read from the
-/// Stage-3 trait seam, NEVER inferred from the textual type of `req`/the return.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallShape {
-    /// `async fn m(&self, req: T) -> Result<U, Status>`.
-    Unary,
-    /// `async fn m(&self, req: T) -> Result<Streaming<U>, Status>`.
-    ServerStream,
-    /// `async fn m(&self, req: Streaming<T>) -> Result<U, Status>`.
-    ClientStream,
-    /// `async fn m(&self, req: Streaming<T>) -> Result<Streaming<U>, Status>`.
-    Bidi,
-}
 
 /// Lower a `#[grpc_controller] impl ServiceTrait for Bean` block to its per-RPC `GrpcRoute`
 /// beans (one const `Descriptor` + the generated `GrpcRoute`/`GrpcHandler` impls per RPC
@@ -146,11 +134,11 @@ fn emit_grpc_route_bean(
     let descriptor_path = descriptor_const_path(service_trait, &method_name);
     // `path()` reads the descriptor's `.path` field (the `/pkg.Service/Method` const).
     let path_expr = quote! { #descriptor_path.path };
-    // The CALL-SHAPE wrapper: which framing/codec adapter `call` wraps the typed method with
-    // (unary/server/client/bidi). See [`shape_dispatch`] for the descriptor-authority +
-    // structural-selection design (and why one wrapper is emitted, not a four-arm match).
-    let shape = classify_call_shape(method);
-    let dispatch = shape_dispatch(&descriptor_path, shape, method_ident);
+    // The SHAPE-AGNOSTIC dispatch: ONE uniform wrapper over the disjoint `GrpcRecv`/`GrpcSend`
+    // seams. The macro takes the method's first non-receiver param type + its `Result` `Ok`
+    // type VERBATIM and lets TRAIT RESOLUTION pick unary-vs-streaming from the real types —
+    // it NEVER inspects the signature for a `Streaming` name. See [`shape_dispatch`].
+    let dispatch = shape_dispatch(method, method_ident)?;
 
     // The struct's injected fields (field injection through `Injectable`): the controller bean
     // + the prost codec. `&*self.controller` / `&*self.codec` deref the `Ref<…>` to the
@@ -192,7 +180,6 @@ fn emit_grpc_route_bean(
                 __req: ::leaf_web::Request,
             ) -> ::leaf_core::BoxFuture<'__a, ::leaf_web::Response> {
                 ::std::boxed::Box::pin(async move {
-                    let __controller = &*self.controller;
                     let __codec: &::leaf_grpc::ProstCodec = &*self.codec;
                     #dispatch
                 })
@@ -220,81 +207,68 @@ fn emit_grpc_route_bean(
     Ok(quote! { #items #registration })
 }
 
-/// The CALL-SHAPE dispatch expression: wrap the typed user method with the ONE framing/codec
-/// adapter for its gRPC shape (`call_unary`/`call_server_stream`/`call_client_stream`/
-/// `call_bidi`).
+/// The SHAPE-AGNOSTIC dispatch expression: ONE uniform wrapper that resolves the gRPC call
+/// shape (unary/server-stream/client-stream/bidi) by TRAIT RESOLUTION on the method's REAL
+/// argument/return types — the macro NEVER inspects the signature for a `Streaming` name.
 ///
-/// ## Why ONE wrapper, not a four-arm `match` on the descriptor const (a deviation)
+/// It emits, verbatim over the user's first non-receiver param type `#arg_ty` and the `Ok`
+/// type `#ok_ty` of the `Result` return:
 ///
-/// The original plan emitted a four-arm `match #descriptor.shape { … }` so "the compiler
-/// picks the wrapper from the const shape." That does NOT compile: Rust typechecks ALL match
-/// arms before any const-folding, and the four wrappers carry DIFFERENT closure-return bounds
-/// (`call_server_stream`/`call_bidi` require `Result<Streaming<U>, Status>`, `call_unary`/
-/// `call_client_stream` require `Result<U, Status>`) — a single native method signature
-/// (e.g. unary `T -> Result<U, Status>`) can satisfy only its own arm, so the others are
-/// hard type errors. The macro must therefore emit exactly ONE wrapper call, chosen at MACRO
-/// time. The macro cannot read the descriptor const's RUNTIME `.shape` value, so the shape is
-/// classified STRUCTURALLY (see [`classify_call_shape`]) — the SAME `(client_streaming,
-/// server_streaming)` classification Stage-3 itself performs, expressed over the framework's
-/// own `Streaming<…>` wrapper on the param/return (NOT a user message-type name, and via
-/// `syn::Ident`-to-`syn::Ident` equality so no ident-to-string-literal type-name detection
-/// is introduced).
+/// ```ignore
+/// let __arg = match <#arg_ty as ::leaf_grpc::GrpcRecv>::recv(__req, __codec).await {
+///     Ok(a) => a,
+///     Err(__status) => return ::leaf_grpc::dispatch::status_response(&__status),
+/// };
+/// <#ok_ty as ::leaf_grpc::GrpcSend>::send(__controller.#method(__arg).await, __codec)
+/// ```
 ///
-/// The descriptor const stays AUTHORITATIVE for `path()` and for the runtime shape; this
-/// also emits a `const _` assertion that the structurally-classified shape EQUALS
-/// `#descriptor.shape`, so a structural/descriptor disagreement is a hard compile error (the
-/// descriptor remains the source of truth — the structural pick can never silently diverge).
-fn shape_dispatch(
-    descriptor_path: &TokenStream,
-    shape: CallShape,
-    method_ident: &syn::Ident,
-) -> TokenStream {
-    // The typed invocation, referenced by method name on the injected controller Ref. The
-    // wrapper supplies `__msg` (T for unary/server-stream, Streaming<T> for client-stream/bidi)
-    // and consumes the method's returned future. ONE invocation form serves all four shapes —
-    // the wrapper differs, not the call.
-    let invoke = quote! { __controller.#method_ident(__msg).await };
-    let (wrapper, shape_variant) = match shape {
-        CallShape::Unary => (quote!(call_unary), quote!(Unary)),
-        CallShape::ServerStream => (quote!(call_server_stream), quote!(ServerStream)),
-        CallShape::ClientStream => (quote!(call_client_stream), quote!(ClientStream)),
-        CallShape::Bidi => (quote!(call_bidi), quote!(Bidi)),
-    };
-    quote! {
-        // The descriptor stays AUTHORITATIVE: assert the structurally-classified shape equals
-        // the Stage-3 descriptor const's shape (a const-folded check; a disagreement is a hard
-        // compile error, so the wire shape never silently diverges from the descriptor).
-        const _: () = ::core::assert!(
-            matches!(#descriptor_path.shape, ::leaf_grpc::CallShape::#shape_variant),
-            "gRPC call-shape mismatch: the method's signature shape disagrees with its \
-             Stage-3 descriptor shape. Regenerate the service trait from the .proto."
-        );
-        ::leaf_grpc::#wrapper(__req, __codec, |__msg| async move { #invoke }).await
-    }
+/// `GrpcRecv` (inbound) and `GrpcSend` (outbound) are DISJOINT seams: their blanket
+/// `impl for M: prost::Message` and `impl for Streaming<M>` never overlap (`Streaming<M>` is
+/// not a `prost::Message`), so the compiler picks unary-vs-streaming framing/codec from the
+/// REAL types the user wrote — name-free + alias-proof. No structural shape classification, no
+/// descriptor-shape assertion: the Stage-3 descriptor const stays authoritative ONLY for
+/// `path()`.
+///
+/// # Errors
+/// [`EmitError`] when the method has no non-receiver parameter or a non-`Result` return — a
+/// `#[grpc_controller]` RPC method is always `async fn m(&self, arg: A) -> Result<O, Status>`.
+fn shape_dispatch(method: &ImplItemFn, method_ident: &syn::Ident) -> Result<TokenStream, EmitError> {
+    let method_name = method_ident.to_string();
+    // The handler argument type, taken VERBATIM from the signature (no name inspection): the
+    // first non-receiver param. `GrpcRecv` resolves on it (a `Message` ⇒ one-message recv, a
+    // `Streaming<_>` ⇒ stream recv). Both are referenced as opaque types.
+    let arg_ty = first_param_type(method).ok_or_else(|| EmitError {
+        message: format!(
+            "`{method_name}` is a `#[grpc_controller]` RPC method but takes no request \
+             argument: an RPC method is `async fn m(&self, arg: A) -> Result<O, Status>`."
+        ),
+    })?;
+    // The `Ok` type of the `Result` return, taken VERBATIM (structurally, NEVER name-checked):
+    // `GrpcSend` resolves on it.
+    let ok_ty = result_ok_type(&method.sig.output).ok_or_else(|| EmitError {
+        message: format!(
+            "`{method_name}` is a `#[grpc_controller]` RPC method but does not return a \
+             `Result<O, Status>`: an RPC method renders its `Ok` value (or a `Status`) to the \
+             wire, so the return must be a `Result`."
+        ),
+    })?;
+
+    Ok(quote! {
+        let __arg = match <#arg_ty as ::leaf_grpc::GrpcRecv>::recv(__req, __codec).await {
+            ::core::result::Result::Ok(__a) => __a,
+            ::core::result::Result::Err(__status) => {
+                return ::leaf_grpc::dispatch::status_response(&__status);
+            }
+        };
+        <#ok_ty as ::leaf_grpc::GrpcSend>::send(
+            self.controller.#method_ident(__arg).await,
+            __codec,
+        )
+    })
 }
 
-/// Classify an RPC method's [`CallShape`] STRUCTURALLY from the framework's `Streaming<…>`
-/// wrapper on the (first non-receiver) parameter + the return's `Ok` type — the SAME
-/// `(client_streaming, server_streaming)` classification Stage-3 performs. A `Streaming<T>`
-/// PARAMETER ⇒ client-streaming; a `Result<Streaming<U>, _>` RETURN ⇒ server-streaming.
-///
-/// This is structural arg/return handling (the allowed kind), NEVER a branch on a user
-/// message-type name, and uses `syn::Ident`-to-`syn::Ident` equality — so it introduces NO
-/// ident-to-string-literal type-name detection. The descriptor const remains authoritative;
-/// [`shape_dispatch`] emits a compile-time assertion that this classification matches it.
-fn classify_call_shape(method: &ImplItemFn) -> CallShape {
-    let client_streaming = first_param_type(method).is_some_and(is_streaming_wrapped);
-    let server_streaming = result_ok_type(&method.sig.output).is_some_and(is_streaming_wrapped);
-    match (client_streaming, server_streaming) {
-        (false, false) => CallShape::Unary,
-        (false, true) => CallShape::ServerStream,
-        (true, false) => CallShape::ClientStream,
-        (true, true) => CallShape::Bidi,
-    }
-}
-
-/// The type of the FIRST non-receiver parameter (the single request `T` or `Streaming<T>`),
-/// or `None` for a no-argument method.
+/// The type of the FIRST non-receiver parameter (the single request `A`), taken VERBATIM — the
+/// macro passes it to `GrpcRecv` without inspecting its name. `None` for a no-argument method.
 fn first_param_type(method: &ImplItemFn) -> Option<&Type> {
     method.sig.inputs.iter().find_map(|a| match a {
         FnArg::Typed(pt) => Some(&*pt.ty),
@@ -302,8 +276,9 @@ fn first_param_type(method: &ImplItemFn) -> Option<&Type> {
     })
 }
 
-/// The `Ok` type of a `Result<Ok, Err>` return (the `U` or `Streaming<U>`), or `None` for a
-/// non-`Result` / unit return.
+/// The `Ok` type of a `Result<Ok, Err>` return (the `O`), taken STRUCTURALLY (the first
+/// angle-bracketed generic arg of the return path — never a `Result` name check), or `None`
+/// for a non-`Result` / unit return. Passed VERBATIM to `GrpcSend`; never name-inspected.
 fn result_ok_type(output: &syn::ReturnType) -> Option<&Type> {
     let syn::ReturnType::Type(_, ty) = output else { return None };
     let Type::Path(tp) = &**ty else { return None };
@@ -313,17 +288,6 @@ fn result_ok_type(output: &syn::ReturnType) -> Option<&Type> {
         syn::GenericArgument::Type(t) => Some(t),
         _ => None,
     })
-}
-
-/// `true` iff `ty` is the framework's `Streaming<…>` wrapper — matched by the LAST path
-/// segment's ident via `syn::Ident`-to-`syn::Ident` equality (the framework's OWN streaming
-/// marker, not a user message-type name; no ident-to-string-literal comparison). The
-/// `::leaf_grpc::Streaming` / `leaf_grpc::Streaming` / bare `Streaming` spellings all
-/// classify, so an aliased message type inside the wrapper is irrelevant.
-fn is_streaming_wrapped(ty: &Type) -> bool {
-    let Type::Path(tp) = ty else { return false };
-    let streaming = format_ident!("Streaming");
-    tp.path.segments.last().is_some_and(|s| s.ident == streaming)
 }
 
 /// The `<service-mod>::<METHOD>_DESCRIPTOR` const path for a method NAME. DRIFT-aware: the
@@ -513,21 +477,29 @@ mod tests {
             "the prost codec is field-injected as Ref<ProstCodec>: {s}"
         );
 
-        // (d) the typed method is wrapped through the UNARY framing/codec wrapper.
+        // (d) the typed method is wrapped through the UNIFORM `GrpcRecv`/`GrpcSend` seams,
+        //     parameterised on the VERBATIM arg type (`ProductReq`) + `Ok` type (`Product`) —
+        //     trait resolution picks the shape, the macro never names `Streaming`.
         assert!(
-            s.contains("::leaf_grpc::call_unary("),
-            "a unary method wraps through ::leaf_grpc::call_unary: {s}"
+            s.contains("<ProductReqas::leaf_grpc::GrpcRecv>::recv(__req,__codec)"),
+            "the arg type is recv'd through the GrpcRecv seam: {s}"
+        );
+        assert!(
+            s.contains("<Productas::leaf_grpc::GrpcSend>::send("),
+            "the Ok type is sent through the GrpcSend seam: {s}"
         );
         // The controller method is invoked inside the wrapper (by NAME, on the injected Ref).
-        assert!(s.contains(".get(") && s.contains(".await"), "invokes the controller method: {s}");
+        assert!(
+            s.contains("self.controller.get(__arg).await"),
+            "invokes the controller method on the injected Ref: {s}"
+        );
     }
 
     #[test]
-    fn a_server_stream_rpc_wraps_through_call_server_stream() {
+    fn a_server_stream_rpc_sends_through_the_streaming_grpcsend_impl() {
         // Server-stream: `async fn list(&self, req: ListReq) -> Result<Streaming<Product>, Status>`.
-        // The shape is read from the Stage-3 descriptor seam (a const the macro names), so the
-        // codegen wraps through `call_server_stream` — never inferred from the `Streaming<U>`
-        // RETURN type (no type-name detection).
+        // The shape falls out of `GrpcSend` resolving on the VERBATIM `Streaming<Product>` Ok
+        // type — the macro passes the type through unexamined (no `Streaming` name check).
         let item = impl_item(
             r#"impl catalog::Catalog for CatalogController {
                 async fn list(&self, req: ListReq) -> Result<Streaming<Product>, Status> { todo!() }
@@ -537,17 +509,24 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("::leaf_grpc::call_server_stream("),
-            "a server-stream method wraps through call_server_stream: {s}"
+            s.contains("<ListReqas::leaf_grpc::GrpcRecv>::recv("),
+            "the unary input is recv'd through GrpcRecv: {s}"
         );
-        assert!(s.contains(".list(") && s.contains(".await"), "invokes the controller method: {s}");
+        assert!(
+            s.contains("<Streaming<Product>as::leaf_grpc::GrpcSend>::send("),
+            "the streaming Ok type is sent through GrpcSend VERBATIM: {s}"
+        );
+        assert!(
+            s.contains("self.controller.list(__arg).await"),
+            "invokes the controller method: {s}"
+        );
     }
 
     #[test]
-    fn a_client_stream_rpc_wraps_through_call_client_stream() {
+    fn a_client_stream_rpc_recvs_through_the_streaming_grpcrecv_impl() {
         // Client-stream: `async fn upload(&self, reqs: Streaming<Chunk>) -> Result<Summary, Status>`.
-        // The wrapper de-frames the inbound stream into a `Streaming<T>` and hands it to the
-        // method; the shape is read from the descriptor seam, never from the `Streaming<T>` PARAM type.
+        // `GrpcRecv` resolves on the VERBATIM `Streaming<Chunk>` arg type to the stream-recv
+        // impl; the macro never names `Streaming`.
         let item = impl_item(
             r#"impl catalog::Catalog for CatalogController {
                 async fn upload(&self, reqs: Streaming<Chunk>) -> Result<Summary, Status> { todo!() }
@@ -557,14 +536,20 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("::leaf_grpc::call_client_stream("),
-            "a client-stream method wraps through call_client_stream: {s}"
+            s.contains("<Streaming<Chunk>as::leaf_grpc::GrpcRecv>::recv("),
+            "the streaming input is recv'd through GrpcRecv VERBATIM: {s}"
+        );
+        assert!(
+            s.contains("<Summaryas::leaf_grpc::GrpcSend>::send("),
+            "the unary Ok type is sent through GrpcSend: {s}"
         );
     }
 
     #[test]
-    fn a_bidi_rpc_wraps_through_call_bidi() {
+    fn a_bidi_rpc_uses_streaming_on_both_grpcrecv_and_grpcsend() {
         // Bidi: `async fn chat(&self, reqs: Streaming<Msg>) -> Result<Streaming<Msg>, Status>`.
+        // Both seams resolve on the VERBATIM `Streaming<Msg>` types — the shape is pure trait
+        // dispatch on the real types.
         let item = impl_item(
             r#"impl catalog::Catalog for CatalogController {
                 async fn chat(&self, reqs: Streaming<Msg>) -> Result<Streaming<Msg>, Status> { todo!() }
@@ -574,8 +559,12 @@ mod tests {
         syn::parse2::<syn::File>(ts.clone()).expect("valid items");
         let s = flat(&ts);
         assert!(
-            s.contains("::leaf_grpc::call_bidi("),
-            "a bidi method wraps through call_bidi: {s}"
+            s.contains("<Streaming<Msg>as::leaf_grpc::GrpcRecv>::recv("),
+            "bidi input recv'd through the streaming GrpcRecv impl: {s}"
+        );
+        assert!(
+            s.contains("<Streaming<Msg>as::leaf_grpc::GrpcSend>::send("),
+            "bidi output sent through the streaming GrpcSend impl: {s}"
         );
     }
 
