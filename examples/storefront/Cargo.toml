@@ -18,9 +18,17 @@ serde = { version = "1", features = ["derive"] }
 # Mirror the umbrella's capability features so the binary-crate `leaf::force_link!()`
 # shim's `#[cfg(feature = "redis")]` gate (checked in THIS crate's namespace) matches.
 [features]
-default = ["redis", "web"]
+default = ["redis", "web", "grpc"]
 redis = ["leaf/redis"]
 web = ["leaf/web"]
+# The gRPC capability (passthrough to `leaf/grpc`): the storefront serves its catalog
+# domain over gRPC on the SAME embedded server, alongside the `web` HTTP surface.
+grpc = ["leaf/grpc"]
+
+# The proto compiler, present so build.rs can compile catalog.proto (the leaf server trait
+# + path/descriptor module). protox is pure-Rust — NO protoc system binary. BUILD-only.
+[build-dependencies]
+leaf-grpc-build = { path = "../../crates/leaf-grpc-build", version = "0.1.0" }
 
 # The `web`-feature REST proof (`tests/http.rs`) boots the storefront on a dedicated
 # thread and drives real HTTP through it with a `reqwest` client, asserting JSON bodies

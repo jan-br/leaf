@@ -25,6 +25,9 @@ extern crate leaf as leaf_tx;
 #[cfg(feature = "web")]
 #[allow(unused_extern_crates)]
 extern crate leaf as leaf_web;
+#[cfg(feature = "grpc")]
+#[allow(unused_extern_crates)]
+extern crate leaf as leaf_grpc;
 
 pub mod catalog;
 pub mod order;
@@ -35,3 +38,8 @@ pub mod pricing;
 /// error mapping. Present iff the `web` feature is enabled.
 #[cfg(feature = "web")]
 pub mod web;
+/// The gRPC surface (the `grpc` capability feature): a `#[grpc_controller]` over the
+/// catalog domain (the same `CatalogService`/`ProductRepository` the HTTP controllers use),
+/// served over H2 on the SAME embedded server. Present iff the `grpc` feature is enabled.
+#[cfg(feature = "grpc")]
+pub mod grpc;

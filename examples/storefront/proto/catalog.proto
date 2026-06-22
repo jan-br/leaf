@@ -1,0 +1,14 @@
+syntax = "proto3";
+package storefront.catalog;
+
+message GetProductRequest { string sku = 1; }
+message Product { string sku = 1; string name = 2; int64 price_cents = 3; }
+message ListProductsRequest {}
+
+service Catalog {
+  // unary: a known SKU returns its Product; an unknown SKU is a NotFound Status (the
+  // unknown-SKU domain channel mapped by the storefront's GrpcStatusMapper).
+  rpc GetProduct (GetProductRequest) returns (Product);
+  // server-stream: every catalog product, one Product per frame.
+  rpc ListProducts (ListProductsRequest) returns (stream Product);
+}
