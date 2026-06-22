@@ -49,7 +49,7 @@ pub use dispatch::{collect_trailers, status_trailers_stream, GrpcDispatch};
 pub use framing::{decode_frames, encode_frame};
 pub use handler::{GrpcHandler, GrpcRoute};
 pub use mapper::{map_first, DefaultGrpcStatusMapper, GrpcStatusMapper};
-// `pub use reflection::ReflectionIndex;` is activated in Task 2.2 (the type lands there).
+pub use reflection::ReflectionIndex;
 pub use descriptor::{CallShape, MethodDescriptor};
 pub use status::{Code, Status};
 pub use streaming::Streaming;

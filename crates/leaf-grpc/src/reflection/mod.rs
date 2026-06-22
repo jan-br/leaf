@@ -16,5 +16,4 @@
 
 mod index;
 
-// `pub use index::ReflectionIndex;` is activated in Task 2.2, which introduces the type
-// test-first — the skeleton must compile before the type exists.
+pub use index::ReflectionIndex;
