@@ -29,6 +29,17 @@ fn main() -> std::io::Result<()> {
     // (2a) leaf's server trait + path/descriptor module from echo.proto -> $OUT_DIR/echo.rs.
     leaf_grpc_build::compile(&["tests/proto/echo.proto"], &["tests/proto"])?;
 
+    // (3) leaf-grpc ships the upstream gRPC reflection protos (grpc.reflection.v1 +
+    // grpc.reflection.v1alpha) -> $OUT_DIR/grpc.reflection.v1.rs / .v1alpha.rs. compile()
+    // also writes each proto's encoded FileDescriptorSet const + the Stage-1
+    // REFLECTED_FILE_DESCRIPTOR_SETS auto-registration row (inert unless reflection reads it).
+    leaf_grpc_build::compile(
+        &["proto/reflection_v1.proto", "proto/reflection_v1alpha.proto"],
+        &["proto"],
+    )?;
+    println!("cargo:rerun-if-changed=proto/reflection_v1.proto");
+    println!("cargo:rerun-if-changed=proto/reflection_v1alpha.proto");
+
     // (2b) tonic's CLIENT stub from the SAME echo.proto -> $OUT_DIR/tonic/echo.rs. protox
     // parses the FileDescriptorSet (pure Rust, NO protoc), fed to tonic-build's `compile_fds`.
     let fds = protox::compile(["tests/proto/echo.proto"], ["tests/proto"])
