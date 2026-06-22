@@ -118,12 +118,20 @@ pub struct ApiKeyFilter;
 impl WebFilter for ApiKeyFilter {
     async fn filter(&self, req: Request, next: Next<'_>) -> Result<Response, LeafError> {
         FILTER_CALLS.fetch_add(1, Ordering::SeqCst);
+        // gRPC metadata ARE H2 headers, so the SAME WebFilter inspects `x-api-key`. The auth
+        // gate applies ONLY to gRPC calls (selected by the runtime content-type value, never
+        // a Rust type name) — a plain HTTP request flows through to the route table (so the
+        // same-port HTTP path keeps its own 404/handler behaviour, unguarded by gRPC auth).
+        let is_grpc = req
+            .header("content-type")
+            .is_some_and(|ct| ct.starts_with("application/grpc"));
         let ok = req.header("x-api-key").is_some_and(|k| k == "secret");
-        if ok {
+        if !is_grpc || ok {
             next.run(req).await
         } else {
             // The sanctioned domain-error channel: the gRPC edge maps it via the
-            // GrpcStatusMapper below; for HTTP the ControlAdvice chain would map it.
+            // GrpcStatusMapper below; the gRPC ProtocolDispatch's `render_error` renders the
+            // Unauthorized Integration error as an Unauthenticated grpc-status trailer.
             Err(LeafError::new(ErrorKind::Integration { kind_id: unauthorized_kind() }))
         }
     }

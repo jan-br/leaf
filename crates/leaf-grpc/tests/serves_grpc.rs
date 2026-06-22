@@ -144,3 +144,108 @@ async fn tonic_drives_all_four_call_shapes_against_the_leaf_grpc_controller() {
     let _ = FILTER_CALLS.load(Ordering::SeqCst);
     let _ = running.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_errors_ride_back_as_grpc_status_trailers() {
+    let port = free_port();
+    let running = boot(port).await;
+    wait_until_up(port).await;
+    let mut c = client(port).await;
+
+    // Explicit Status: the handler returns Err(Status::invalid_argument(..)) → tonic sees
+    // Code::InvalidArgument with the message, NOT a transport error.
+    let err = c
+        .boom(tonic::Request::new(echo_tonic::EchoRequest { text: "x".into() }))
+        .await
+        .expect_err("boom returns a Status, not Ok");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("boom"),
+        "the explicit status message rode the trailer: {}",
+        err.message()
+    );
+
+    // Domain LeafError mapped by the GrpcStatusMapper (Integration{missing_kind} -> NotFound).
+    let err = c
+        .domain(tonic::Request::new(echo_tonic::EchoRequest { text: "x".into() }))
+        .await
+        .expect_err("domain raises a mapped Status");
+    assert_eq!(err.code(), tonic::Code::NotFound, "the domain error channel mapped to NotFound");
+
+    let _ = running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_metadata_auth_webfilter_runs_around_grpc() {
+    let port = free_port();
+    let running = boot(port).await;
+    wait_until_up(port).await;
+    FILTER_CALLS.store(0, Ordering::SeqCst);
+
+    // A NO-KEY client: the ApiKeyFilter short-circuits with the Unauthorized domain error,
+    // which the GrpcStatusMapper renders as a Code::Unauthenticated trailer (NOT a raw HTTP body).
+    let channel = tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{port}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect");
+    let mut bare = EchoClient::new(channel);
+    let err = bare
+        .unary(tonic::Request::new(echo_tonic::EchoRequest { text: "hi".into() }))
+        .await
+        .expect_err("a keyless gRPC call is rejected by the WebFilter");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "the filter rejection is a gRPC Status, not an HTTP body"
+    );
+
+    // The WITH-KEY client succeeds — and the filter ran around BOTH calls (the same chain HTTP uses).
+    let mut c = client(port).await;
+    let ok = c
+        .unary(tonic::Request::new(echo_tonic::EchoRequest { text: "hi".into() }))
+        .await
+        .expect("authed call passes the filter")
+        .into_inner();
+    assert_eq!(ok.text, "hi");
+    assert!(
+        FILTER_CALLS.load(Ordering::SeqCst) >= 2,
+        "the WebFilter wrapped the gRPC calls"
+    );
+
+    let _ = running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_and_grpc_share_one_port() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let port = free_port();
+    let running = boot(port).await;
+    wait_until_up(port).await;
+
+    // gRPC works on the port (content-type application/grpc → the gRPC ProtocolDispatch branch).
+    let mut c = client(port).await;
+    let reply = c
+        .unary(tonic::Request::new(echo_tonic::EchoRequest { text: "same-port".into() }))
+        .await
+        .expect("grpc on the shared port")
+        .into_inner();
+    assert_eq!(reply.text, "same-port");
+
+    // A PLAIN HTTP/1 GET to the SAME socket → the HTTP Route family answers (no grpc content-type),
+    // a clean HTTP 404 (an unmatched HTTP route), NOT a gRPC frame. Proves one port, two protocols.
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("tcp");
+    sock.write_all(b"GET /not-a-route HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write http request");
+    let mut buf = Vec::new();
+    sock.read_to_end(&mut buf).await.expect("read http response");
+    let head = String::from_utf8_lossy(&buf);
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "plain HTTP on the shared port is an HTTP 404, got: {}",
+        &head[..head.len().min(40)]
+    );
+
+    let _ = running.shutdown().await;
+}

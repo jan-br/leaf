@@ -157,6 +157,18 @@ impl ProtocolDispatch for GrpcDispatch {
             }
         })
     }
+
+    /// Render a chain [`LeafError`] (a `WebFilter` short-circuit / an extractor fault that
+    /// wrapped a gRPC call) as a `grpc-status` trailer [`Response`], mapped through the SAME
+    /// ordered mapper chain a handler-surfaced error rides (user mappers first, the FALLBACK
+    /// floor last). So an unauthenticated gRPC call rejected by a generic `WebFilter` reads
+    /// back as a valid `Status` (e.g. `Unauthenticated`), never a raw HTTP error body — the
+    /// gRPC analogue of the HTTP `ControlAdvice` chain. Always `Some` (the floor never
+    /// declines), so the gRPC edge fully owns its rejected-call shape.
+    fn render_error(&self, err: &LeafError) -> Option<Response> {
+        let status = Self::status_for(&self.mappers_as_arcs(), err);
+        Some(status_response(&status))
+    }
 }
 
 /// The `#[component]` holder that PROVIDES [`GrpcDispatch`] as the `dyn ProtocolDispatch`

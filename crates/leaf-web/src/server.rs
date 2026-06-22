@@ -130,6 +130,22 @@ pub trait ProtocolDispatch: Send + Sync {
     /// Returns a [`LeafError`] only for a protocol-level failure the [`ControlAdvice`] chain
     /// should map; a gRPC protocol renders application status as trailers, not `Err`.
     fn dispatch<'a>(&'a self, req: Request) -> BoxFuture<'a, Result<Response, LeafError>>;
+
+    /// Render a chain [`LeafError`] (from a [`WebFilter`] short-circuit, an extractor, or
+    /// this protocol's own `dispatch`) into a PROTOCOL-shaped [`Response`], or decline
+    /// (`None`) and let the HTTP [`ControlAdvice`] chain map it.
+    ///
+    /// This is the protocol analogue of the HTTP advice path: when a `ProtocolDispatch`
+    /// CLAIMED a request (its `content-type` matched) but the wrapping filter chain returns
+    /// `Err` BEFORE/around the terminal, a generic filter cannot know to emit a protocol
+    /// error frame — it just raises a domain `LeafError`. The claiming protocol gets first
+    /// refusal to render that error in its own shape (gRPC maps it through its
+    /// `GrpcStatusMapper` chain to a `grpc-status` trailer response, so a rejected gRPC call
+    /// still reads as a valid `Status`, never a raw HTTP body). The default declines, so a
+    /// protocol that has no error shape keeps the HTTP advice behaviour.
+    fn render_error(&self, _err: &LeafError) -> Option<Response> {
+        None
+    }
 }
 
 // The by-trait-injection seam (emitted once, beside the trait — orphan-rule-OK,
@@ -240,7 +256,15 @@ impl Dispatcher {
         let parts = req.parts_clone();
         match chain.run(req).await {
             Ok(resp) => resp,
-            Err(err) => self.map_error(&err, &parts),
+            // A chain `Err` (filter short-circuit / extractor / protocol dispatch): if a
+            // PROTOCOL claimed this request, it gets first refusal to render the error in
+            // its own shape (gRPC → a `grpc-status` trailer response via its mapper chain),
+            // so a rejected gRPC call reads as a valid `Status`, never a raw HTTP body.
+            // Only when no protocol claimed it (or its `render_error` declines) does the
+            // HTTP `ControlAdvice` chain map it — the unchanged HTTP behaviour.
+            Err(err) => proto
+                .and_then(|p| p.render_error(&err))
+                .unwrap_or_else(|| self.map_error(&err, &parts)),
         }
     }
 
