@@ -12,9 +12,6 @@ use prost_types::{FileDescriptorProto, FileDescriptorSet};
 /// [`from_descriptor_sets`](ReflectionIndex::from_descriptor_sets); keyed on the FDS
 /// WIRE symbol strings (the gRPC fully-qualified identifiers, e.g.
 /// `storefront.catalog.Catalog`), NEVER on a Rust type name.
-// The query maps are populated now and read by the `file_*`/`all_extension_numbers_of_type`
-// queries landing in Tasks 2.3–2.6; the allow is removed once every field has a reader.
-#[allow(dead_code)]
 pub struct ReflectionIndex {
     /// `file name` (e.g. `storefront/catalog.proto`) → the decoded file.
     by_filename: HashMap<String, FileDescriptorProto>,
@@ -126,6 +123,18 @@ impl ReflectionIndex {
         let key = normalize_symbol(symbol);
         let file_name = self.by_symbol.get(&key)?;
         Some(self.closure_for(file_name))
+    }
+
+    /// Every extension `number` declared against `type_name` (a fully-qualified WIRE type,
+    /// leading `.` tolerated), sorted ascending and deduped, or `None` if the type has no
+    /// indexed extensions.
+    #[must_use]
+    pub fn all_extension_numbers_of_type(&self, type_name: &str) -> Option<Vec<i32>> {
+        let key = normalize_symbol(type_name);
+        let mut numbers = self.extension_numbers.get(&key)?.clone();
+        numbers.sort_unstable();
+        numbers.dedup();
+        Some(numbers)
     }
 
     /// The file declaring the extension `number` on `extendee` (a fully-qualified WIRE
@@ -398,6 +407,32 @@ mod tests {
         let bytes = encode_set(vec![extensions_file()]);
         let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
         assert!(index.file_containing_extension("pkg.Base", 999).is_none());
+    }
+
+    #[test]
+    fn all_extension_numbers_of_type_returns_sorted_deduped_numbers() {
+        let bytes = encode_set(vec![extensions_file()]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+
+        let numbers = index
+            .all_extension_numbers_of_type("pkg.Base")
+            .expect("Base has extensions");
+        assert_eq!(numbers, vec![100, 101]);
+
+        // Leading-dot variant resolves the same set.
+        assert_eq!(
+            index.all_extension_numbers_of_type(".pkg.Base"),
+            Some(vec![100, 101])
+        );
+    }
+
+    #[test]
+    fn all_extension_numbers_of_type_returns_none_for_a_type_without_extensions() {
+        let bytes = encode_set(vec![extensions_file()]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+        assert!(index
+            .all_extension_numbers_of_type("pkg.NotExtended")
+            .is_none());
     }
 
     #[test]
