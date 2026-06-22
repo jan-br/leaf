@@ -27,13 +27,18 @@ redis = ["leaf/redis"]
 web = ["leaf/web"]
 # The gRPC capability (passthrough to `leaf/grpc`): the storefront serves its catalog
 # domain over gRPC on the SAME embedded server, alongside the `web` HTTP surface. Pulls
-# `futures` for the server-stream's `Streaming<Product>` constructor.
-grpc = ["leaf/grpc", "dep:futures"]
+# `futures` for the server-stream's `Streaming<Product>` constructor + the BUILD-only
+# tonic client-stub generator (tonic-build/protox) for the integration test's polyglot client.
+grpc = ["leaf/grpc", "dep:futures", "dep:tonic-build", "dep:protox"]
 
-# The proto compiler, present so build.rs can compile catalog.proto (the leaf server trait
-# + path/descriptor module). protox is pure-Rust — NO protoc system binary. BUILD-only.
+# The proto compilers, present so build.rs can compile catalog.proto into BOTH the leaf
+# server trait (leaf-grpc-build) AND tonic's client stub (tonic-build, over protox-parsed
+# descriptors) for the integration test. All pure-Rust — NO protoc system binary. BUILD-only:
+# tonic-build/protox never enter the storefront's normal (runtime) dep graph.
 [build-dependencies]
 leaf-grpc-build = { path = "../../crates/leaf-grpc-build", version = "0.1.0" }
+tonic-build = { version = "0.13", default-features = false, features = ["prost"], optional = true }
+protox = { version = "0.7", optional = true }
 
 # The `web`-feature REST proof (`tests/http.rs`) boots the storefront on a dedicated
 # thread and drives real HTTP through it with a `reqwest` client, asserting JSON bodies
@@ -43,3 +48,10 @@ leaf-grpc-build = { path = "../../crates/leaf-grpc-build", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde_json = "1"
+# The gRPC dogfood proof (`tests/grpc.rs`) drives the storefront's #[grpc_controller] over
+# REAL H2 with a tonic CLIENT (the polyglot interop point: leaf's server + tonic's client,
+# one wire) — the gRPC analogue of the reqwest HTTP proof. DEV-only: tonic/prost never enter
+# the storefront's normal dep graph. Pinned to the workspace's tonic 0.13 / prost 0.13 line.
+tonic = { version = "0.13", default-features = false, features = ["transport", "codegen", "prost"] }
+prost = "0.13"
+futures = "0.3"

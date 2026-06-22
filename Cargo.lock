@@ -1825,10 +1825,14 @@ dependencies = [
  "futures",
  "leaf",
  "leaf-grpc-build",
+ "prost",
+ "protox",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
