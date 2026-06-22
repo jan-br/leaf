@@ -187,7 +187,12 @@ fn grpc_controller_route_beans_collect_and_dispatch_all_four_call_shapes() {
     //     by-trait injection — exactly how GrpcDispatch finds every #[grpc_controller] route.
     let routes: Vec<Ref<dyn GrpcRoute>> =
         block_on(<Vec<Ref<dyn GrpcRoute>> as Injectable>::inject(&cx)).expect("routes resolve");
-    assert_eq!(routes.len(), 4, "the four RPC methods lowered to four GrpcRoute beans");
+    // The EchoController's four RPC methods each lowered to one GrpcRoute bean. (leaf-grpc
+    // also ships the two reflection controllers' route beans, which the LAZY `from_slices`
+    // path — no condition pruning — admits unconditionally; count only the echo routes this
+    // test owns.)
+    let echo_routes = routes.iter().filter(|r| r.path().starts_with("/echo.v1.Echo/")).count();
+    assert_eq!(echo_routes, 4, "the four RPC methods lowered to four GrpcRoute beans");
 
     // (3) `path()` reads the Stage-3 descriptor seam by method name (never a spelled literal).
     let by_path: std::collections::HashMap<&str, &Ref<dyn GrpcRoute>> =

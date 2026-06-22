@@ -154,11 +154,15 @@ fn grpc_dispatch_routes_and_mapper_resolve_by_injection() {
     let engine = leaf_core::Engine::new(registry);
     let cx = ResolveCtx::for_engine(&engine);
 
-    // The route collection resolves (one provider — the hand-written PingRoute bean).
+    // The route collection resolves (the hand-written PingRoute bean — plus leaf-grpc's own
+    // reflection route beans, which the LAZY `from_slices` path admits unconditionally since
+    // it runs no condition pruning; assert the PingRoute this test owns is present).
     let routes: Vec<Ref<dyn GrpcRoute>> =
         block_on(<Vec<Ref<dyn GrpcRoute>> as Injectable>::inject(&cx)).expect("routes resolve");
-    assert_eq!(routes.len(), 1);
-    assert_eq!(routes[0].path(), "/test.Ping/Ping");
+    assert!(
+        routes.iter().any(|r| r.path() == "/test.Ping/Ping"),
+        "the hand-written PingRoute bean resolves into the collection"
+    );
 
     // The FALLBACK default mapper resolves by trait with NO hand-written mapper bean.
     let mapper: Ref<dyn GrpcStatusMapper> =

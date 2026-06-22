@@ -4,7 +4,12 @@
 //!      (the condition-propagation wiring proof) via leaf-boot's lazy assembly,
 //!  (3) flipping `leaf.grpc.reflection.enabled` registers the route.
 
+use std::sync::Arc;
+
+use leaf_boot::{Application, RunOverlay, SealInputs};
+use leaf_core::{Injectable, Ref, ResolveCtx};
 use leaf_grpc::reflection::{Answer, ReflectionIndex};
+use leaf_grpc::GrpcRoute;
 
 /// Build the index from the v1 reflection FDS (it self-describes
 /// `grpc.reflection.v1.ServerReflection`) — a real, non-trivial descriptor set.
@@ -48,4 +53,71 @@ fn an_unknown_symbol_is_a_not_found_answer() {
         }
         other => panic!("expected NotFound, got {other:?}"),
     }
+}
+
+// ── the condition-propagation wiring proof (struct + routes gate as one unit) ──
+
+/// Pin the link rows the boot needs: the hyper FALLBACK `dyn WebServer`, the JSON converter,
+/// the leaf-grpc `GrpcDispatch` (the `dyn ProtocolDispatch` the Dispatcher collection-injects),
+/// the `DefaultGrpcStatusMapper` FALLBACK, and the reflection controllers themselves (so their
+/// COMPONENTS rows are present in the link-collected slice).
+fn force_link() {
+    let _ = std::any::TypeId::of::<leaf_web_hyper::HyperServerAutoConfig>();
+    let _ = std::any::TypeId::of::<leaf_serde::JsonConverterConfig>();
+    let _ = std::any::TypeId::of::<leaf_grpc::GrpcDispatch>();
+    let _ = std::any::TypeId::of::<leaf_grpc::DefaultGrpcStatusMapper>();
+    let _ = std::any::TypeId::of::<leaf_grpc::reflection::ReflectionV1>();
+    let _ = std::any::TypeId::of::<leaf_grpc::reflection::ReflectionV1alpha>();
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Boot the whole `Application::run` pipeline (which runs the condition-routing + prune
+/// pass) under the given args, then collection-inject the `Vec<Ref<dyn GrpcRoute>>` the
+/// gated assembly admits, returning the registered route `path()`s.
+async fn resolved_route_paths(args: &[String]) -> Vec<String> {
+    force_link();
+    leaf_tokio::install_ambient_store().ok();
+    let spawner: Arc<dyn leaf_core::Spawner> = Arc::new(leaf_tokio::TokioExecutionFacility::new());
+    let port = free_port();
+    let mut all_args = vec![format!("--leaf.web.server.port={port}")];
+    all_args.extend(args.iter().cloned());
+    let running = Application::new()
+        .with_name("reflection-gating")
+        .with_spawner(spawner)
+        .with_drain_sleeper(|d| Box::pin(tokio::time::sleep(d)))
+        .run(SealInputs::new().with_args(all_args), RunOverlay::none())
+        .await
+        .expect("the reflection app boots to Ready");
+
+    let engine = running.context().engine();
+    let cx = ResolveCtx::for_engine(engine);
+    let routes: Vec<Ref<dyn GrpcRoute>> =
+        <Vec<Ref<dyn GrpcRoute>> as Injectable>::inject(&cx)
+            .await
+            .expect("collection-injects the GrpcRoute beans");
+    let paths = routes.iter().map(|r| r.path().to_string()).collect();
+    running.shutdown().await;
+    paths
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reflection_routes_are_gated_by_the_enabled_property_as_a_unit() {
+    // OFF by default: the ReflectionV1 controller struct bean de-registers (its
+    // #[conditional]) AND — via condition propagation — so do its GrpcRoute beans, so the
+    // reflection path is absent from the collected routes.
+    let off = resolved_route_paths(&[]).await;
+    assert!(
+        !off.iter().any(|p| p.contains("grpc.reflection.v1.ServerReflection")),
+        "reflection is OFF by default — no reflection route registers: {off:?}"
+    );
+
+    // ON: flipping leaf.grpc.reflection.enabled=true registers the struct AND the routes.
+    let on = resolved_route_paths(&["--leaf.grpc.reflection.enabled=true".to_string()]).await;
+    assert!(
+        on.iter().any(|p| p.contains("grpc.reflection.v1.ServerReflection")),
+        "reflection ON registers the v1 ServerReflectionInfo route: {on:?}"
+    );
 }

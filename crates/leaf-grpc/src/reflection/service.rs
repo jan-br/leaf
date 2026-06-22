@@ -3,9 +3,19 @@
 //! semantics but distinct generated Rust types; the adapter is written ONCE and each
 //! controller assembles its own `ServerReflectionResponse` from it.
 
+use futures::StreamExt as _;
 use prost::Message as _;
 
+use leaf_core::{BoxStream, Ref};
+
 use super::index::ReflectionIndex;
+use super::{v1, v1alpha};
+// Bring BOTH generated `ServerReflection` traits into scope (aliased — they share a name)
+// so the generated `GrpcRoute` handler's `self.controller.server_reflection_info(..)` call
+// resolves the trait method on `Ref<ReflectionV1>` / `Ref<ReflectionV1alpha>`.
+use super::v1::ServerReflection as _;
+use super::v1alpha::ServerReflection as _;
+use crate::{Status, Streaming};
 
 /// One resolved reflection answer — the version-agnostic payload the controllers render into
 /// their version's `ServerReflectionResponse`. The `FileDescriptors` variant carries the
@@ -97,3 +107,234 @@ impl Answer {
         }
     }
 }
+
+// ─────────────────── the shared ReflectionIndex bean (built once) ───────────────────
+
+/// Provide the shared [`ReflectionIndex`] as a singleton bean, built ONCE from the Stage-1
+/// `REFLECTED_FILE_DESCRIPTOR_SETS` discovery slice. A corrupt FDS that fails to decode is a
+/// hard boot error (the descriptors are app-compiled, so a decode failure is internal). The
+/// bean is UNCONDITIONAL — only the controllers that READ it are gated; the slice itself is
+/// collected regardless of whether reflection is enabled. The dogfooded `#[component]` holder
+/// + `#[configuration]`/`#[bean]` factory idiom (no hand-rolled `Provider`), the same shape
+/// [`crate::dispatch::GrpcDispatchConfig`] uses.
+#[leaf_macros::component]
+pub struct ReflectionIndexConfig;
+
+impl ReflectionIndexConfig {
+    /// The no-collaborator constructor the `#[component]` provider calls.
+    #[must_use]
+    pub fn new() -> Self {
+        ReflectionIndexConfig
+    }
+}
+
+impl Default for ReflectionIndexConfig {
+    fn default() -> Self {
+        ReflectionIndexConfig::new()
+    }
+}
+
+#[leaf_macros::configuration]
+impl ReflectionIndexConfig {
+    /// Build the shared [`ReflectionIndex`] from the link-collected discovery slice once.
+    #[bean(name = "reflectionIndex")]
+    fn reflection_index(&self) -> ReflectionIndex {
+        let sets: &[&[u8]] = &crate::REFLECTED_FILE_DESCRIPTOR_SETS;
+        ReflectionIndex::from_descriptor_sets(sets)
+            .expect("the app's compiled FileDescriptorSets decode")
+    }
+}
+
+// ─────────────────────────── the two thin controllers ───────────────────────────
+
+/// The grpc.reflection.v1 controller — gated OFF by default; field-injects the shared index.
+#[leaf_macros::grpc_controller]
+#[leaf_macros::conditional(on_property("leaf.grpc.reflection.enabled", having_value = "true"))]
+pub struct ReflectionV1 {
+    index: Ref<ReflectionIndex>,
+}
+
+#[leaf_macros::grpc_controller]
+#[leaf_macros::conditional(on_property("leaf.grpc.reflection.enabled", having_value = "true"))]
+impl v1::ServerReflection for ReflectionV1 {
+    async fn server_reflection_info(
+        &self,
+        requests: Streaming<v1::ServerReflectionRequest>,
+    ) -> Result<Streaming<v1::ServerReflectionResponse>, Status> {
+        let index = self.index.clone();
+        let out: BoxStream<'static, Result<v1::ServerReflectionResponse, Status>> =
+            Box::pin(async_stream_v1(requests, index));
+        Ok(Streaming::new(out))
+    }
+}
+
+/// The grpc.reflection.v1alpha controller — identical semantics, the v1alpha types.
+#[leaf_macros::grpc_controller]
+#[leaf_macros::conditional(on_property("leaf.grpc.reflection.enabled", having_value = "true"))]
+pub struct ReflectionV1alpha {
+    index: Ref<ReflectionIndex>,
+}
+
+#[leaf_macros::grpc_controller]
+#[leaf_macros::conditional(on_property("leaf.grpc.reflection.enabled", having_value = "true"))]
+impl v1alpha::ServerReflection for ReflectionV1alpha {
+    async fn server_reflection_info(
+        &self,
+        requests: Streaming<v1alpha::ServerReflectionRequest>,
+    ) -> Result<Streaming<v1alpha::ServerReflectionResponse>, Status> {
+        let index = self.index.clone();
+        let out: BoxStream<'static, Result<v1alpha::ServerReflectionResponse, Status>> =
+            Box::pin(async_stream_v1alpha(requests, index));
+        Ok(Streaming::new(out))
+    }
+}
+
+// ─────────────────── the per-version request->response mappers ───────────────────
+
+/// Render one v1 request -> one v1 response via the shared `Answer` adapter.
+fn respond_v1(
+    request: &v1::ServerReflectionRequest,
+    index: &ReflectionIndex,
+) -> v1::ServerReflectionResponse {
+    use v1::server_reflection_request::MessageRequest;
+    use v1::server_reflection_response::MessageResponse;
+
+    let answer = match &request.message_request {
+        Some(MessageRequest::ListServices(_)) => Answer::list_services(index),
+        Some(MessageRequest::FileByFilename(name)) => Answer::for_filename(index, name),
+        Some(MessageRequest::FileContainingSymbol(sym)) => Answer::for_symbol(index, sym),
+        Some(MessageRequest::FileContainingExtension(ext)) => {
+            Answer::for_extension(index, &ext.containing_type, ext.extension_number)
+        }
+        Some(MessageRequest::AllExtensionNumbersOfType(ty)) => {
+            Answer::for_all_extension_numbers(index, ty)
+        }
+        None => Answer::NotFound {
+            error_code: 3, // INVALID_ARGUMENT: a request with no message_request set.
+            error_message: "empty reflection request".into(),
+        },
+    };
+
+    let message_response = match answer {
+        Answer::FileDescriptors(files) => {
+            MessageResponse::FileDescriptorResponse(v1::FileDescriptorResponse {
+                file_descriptor_proto: files,
+            })
+        }
+        Answer::Services(names) => {
+            MessageResponse::ListServicesResponse(v1::ListServiceResponse {
+                service: names
+                    .into_iter()
+                    .map(|name| v1::ServiceResponse { name })
+                    .collect(),
+            })
+        }
+        Answer::ExtensionNumbers { base_type_name, numbers } => {
+            MessageResponse::AllExtensionNumbersResponse(v1::ExtensionNumberResponse {
+                base_type_name,
+                extension_number: numbers,
+            })
+        }
+        Answer::NotFound { error_code, error_message } => {
+            MessageResponse::ErrorResponse(v1::ErrorResponse { error_code, error_message })
+        }
+    };
+    v1::ServerReflectionResponse {
+        valid_host: request.host.clone(),
+        original_request: Some(request.clone()),
+        message_response: Some(message_response),
+    }
+}
+
+/// The v1 bidi body: map each inbound request to one response. A malformed inbound frame
+/// (a `Status` from the de-framer) propagates as the stream's `Err` (a transport error).
+fn async_stream_v1(
+    requests: Streaming<v1::ServerReflectionRequest>,
+    index: Ref<ReflectionIndex>,
+) -> impl futures::Stream<Item = Result<v1::ServerReflectionResponse, Status>> {
+    async_stream_helper! { requests, index, respond_v1 }
+}
+
+/// Render one v1alpha request -> one v1alpha response (identical logic, v1alpha types).
+fn respond_v1alpha(
+    request: &v1alpha::ServerReflectionRequest,
+    index: &ReflectionIndex,
+) -> v1alpha::ServerReflectionResponse {
+    use v1alpha::server_reflection_request::MessageRequest;
+    use v1alpha::server_reflection_response::MessageResponse;
+
+    let answer = match &request.message_request {
+        Some(MessageRequest::ListServices(_)) => Answer::list_services(index),
+        Some(MessageRequest::FileByFilename(name)) => Answer::for_filename(index, name),
+        Some(MessageRequest::FileContainingSymbol(sym)) => Answer::for_symbol(index, sym),
+        Some(MessageRequest::FileContainingExtension(ext)) => {
+            Answer::for_extension(index, &ext.containing_type, ext.extension_number)
+        }
+        Some(MessageRequest::AllExtensionNumbersOfType(ty)) => {
+            Answer::for_all_extension_numbers(index, ty)
+        }
+        None => Answer::NotFound {
+            error_code: 3,
+            error_message: "empty reflection request".into(),
+        },
+    };
+    let message_response = match answer {
+        Answer::FileDescriptors(files) => {
+            MessageResponse::FileDescriptorResponse(v1alpha::FileDescriptorResponse {
+                file_descriptor_proto: files,
+            })
+        }
+        Answer::Services(names) => {
+            MessageResponse::ListServicesResponse(v1alpha::ListServiceResponse {
+                service: names
+                    .into_iter()
+                    .map(|name| v1alpha::ServiceResponse { name })
+                    .collect(),
+            })
+        }
+        Answer::ExtensionNumbers { base_type_name, numbers } => {
+            MessageResponse::AllExtensionNumbersResponse(v1alpha::ExtensionNumberResponse {
+                base_type_name,
+                extension_number: numbers,
+            })
+        }
+        Answer::NotFound { error_code, error_message } => {
+            MessageResponse::ErrorResponse(v1alpha::ErrorResponse { error_code, error_message })
+        }
+    };
+    v1alpha::ServerReflectionResponse {
+        valid_host: request.host.clone(),
+        original_request: Some(request.clone()),
+        message_response: Some(message_response),
+    }
+}
+
+fn async_stream_v1alpha(
+    requests: Streaming<v1alpha::ServerReflectionRequest>,
+    index: Ref<ReflectionIndex>,
+) -> impl futures::Stream<Item = Result<v1alpha::ServerReflectionResponse, Status>> {
+    async_stream_helper! { requests, index, respond_v1alpha }
+}
+
+/// Map each inbound reflection request to one response over the bidi stream: a small
+/// `unfold` that threads the inbound `Streaming<Req>` + the shared index, applying `$render`
+/// per request. A malformed inbound frame (`Err(Status)` from de-framing) ends the stream by
+/// yielding that transport `Status`.
+macro_rules! async_stream_helper {
+    ($requests:expr, $index:expr, $render:path) => {
+        futures::stream::unfold(
+            ($requests, $index),
+            |(mut requests, index)| async move {
+                match requests.next().await {
+                    Some(Ok(req)) => {
+                        let resp = $render(&req, &index);
+                        Some((Ok(resp), (requests, index)))
+                    }
+                    Some(Err(status)) => Some((Err(status), (requests, index))),
+                    None => None,
+                }
+            },
+        )
+    };
+}
+use async_stream_helper;

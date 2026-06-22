@@ -42,5 +42,4 @@ pub mod v1alpha {
 mod service;
 
 pub use index::ReflectionIndex;
-// `ReflectionV1`/`ReflectionV1alpha` are added in Task 3.4 — re-exported then.
-pub use service::Answer;
+pub use service::{Answer, ReflectionV1, ReflectionV1alpha};
