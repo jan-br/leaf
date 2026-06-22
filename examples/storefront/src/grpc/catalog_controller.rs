@@ -17,7 +17,7 @@ use crate::catalog::service::{unknown_sku_kind, CatalogService};
 // storefront `build.rs` wrote into `$OUT_DIR/storefront.catalog.rs`.
 leaf::grpc::leaf_grpc::include_proto!("storefront.catalog");
 
-/// A #[grpc_controller] over the catalog domain — the SAME CatalogService (cacheable price)
+/// A `#[grpc_controller]` over the catalog domain — the SAME CatalogService (cacheable price)
 /// + ProductRepository (the name) the HTTP CatalogController serves, now over gRPC. An
 /// ordinary #[component]-family bean; its RPC methods lower to GrpcRoute beans (no
 /// hand-written GrpcRoute/GrpcHandler). Field injection, exactly like the HTTP controller.
@@ -79,7 +79,7 @@ impl Catalog for CatalogGrpcController {
 }
 
 /// A GrpcStatusMapper mapping the storefront's unknown-SKU domain error to Code::NotFound
-/// (the gRPC analogue of the StorefrontErrors #[control_advice]). Published as the `dyn
+/// (the gRPC analogue of the StorefrontErrors `#[control_advice]`). Published as the `dyn
 /// GrpcStatusMapper` view via the dogfooded #[configuration] + #[bean(provides = "dyn …")]
 /// holder idiom (a struct `#[component]` takes no `provides`) — the SAME collection-injection
 /// DI the default FALLBACK mapper rides; first-Some wins, so this mapper supersedes the

@@ -109,7 +109,7 @@ leaf_core::impl_resolve_view!(dyn WebServer);
 
 /// The ABSTRACT protocol-dispatch seam (the design's §1): a second `Handler` family that
 /// runs on the SHARED [`WebServer`]/[`Dispatcher`], selected by `content-type`. A request
-/// whose `content-type` no HTTP [`Route`](crate::Route) claims is delegated to the first
+/// whose `content-type` no HTTP [`Route`] claims is delegated to the first
 /// `ProtocolDispatch` whose [`handles`](ProtocolDispatch::handles) returns `true`.
 ///
 /// This is how leaf-web routes to gRPC WITHOUT naming `leaf-grpc`: the gRPC family is ONE

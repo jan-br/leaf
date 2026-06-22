@@ -383,7 +383,7 @@ fn parse_type(s: &str) -> Result<Type, EmitError> {
 /// Emit the controller STRUCT's `::leaf_grpc::GrpcControllerKind` marker — the gRPC twin of
 /// `::leaf_web::ControllerKind`. Emitted ALONGSIDE the stereotype rows on the controller
 /// struct so the matching RPC impl can assert the struct really is a `#[grpc_controller]`
-/// (see [`grpc_controller_kind_guard`]).
+/// (see `grpc_controller_kind_guard`).
 pub fn emit_grpc_controller_kind(item: &ItemStruct) -> TokenStream {
     let ident = &item.ident;
     let (impl_g, ty_g, where_c) = item.generics.split_for_impl();

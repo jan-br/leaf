@@ -3,7 +3,7 @@
 //! gRPC is a SECOND Handler family on the shared hyper WebServer (one server, one port),
 //! so this bundle is the web stack (the http2-enabled hyper backend + the JSON converter
 //! for same-port HTTP) PLUS the leaf-grpc engine: Status/Code, the length-prefix framing,
-//! Streaming<T>, the GrpcDispatch (the dyn ProtocolDispatch the Dispatcher routes
+//! `Streaming<T>`, the GrpcDispatch (the dyn ProtocolDispatch the Dispatcher routes
 //! `application/grpc` to), and the DefaultGrpcStatusMapper FALLBACK. Each crate's
 //! auto-config participates + backs off independently.
 //!
