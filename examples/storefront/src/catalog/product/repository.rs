@@ -19,4 +19,11 @@ impl ProductRepository {
     pub fn find(&self, sku: &str) -> Option<Product> {
         CATALOG.iter().find(|p| p.sku == sku).cloned()
     }
+
+    /// Every product in the inventory (the full seeded catalog) — the listing the gRPC
+    /// `ListProducts` server-stream serves, one `Product` per frame.
+    #[must_use]
+    pub fn all(&self) -> Vec<Product> {
+        CATALOG.to_vec()
+    }
 }

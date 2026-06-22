@@ -43,6 +43,15 @@ pub use descriptor::{CallShape, MethodDescriptor};
 pub use status::{Code, Status};
 pub use streaming::Streaming;
 
+// The prost message codec, re-exported so a proto-first downstream resolves the absolute
+// `::prost::` paths the `leaf-grpc-build`-generated message structs emit
+// (`#[derive(::prost::Message)]`, `::prost::alloc::*`, `::prost::bytes::*`) WITHOUT naming
+// `prost` as a direct dependency: an umbrella-only app aliases `extern crate leaf as prost;`
+// (the same facade trick as `leaf_grpc`/`leaf_web`), reaching prost through the one `leaf`
+// dep. prost is leaf-grpc's normal (runtime) codec dependency — the re-export only exposes it.
+#[doc(no_inline)]
+pub use prost;
+
 /// Splice a `leaf-grpc-build`-generated module into the current scope.
 ///
 /// `leaf_grpc::include_proto!("pkg")` expands to

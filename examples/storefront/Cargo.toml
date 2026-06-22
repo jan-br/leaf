@@ -14,6 +14,10 @@ publish = false
 [dependencies]
 leaf = { path = "../../crates/leaf", features = ["redis"] }
 serde = { version = "1", features = ["derive"] }
+# The gRPC server-stream builds a `futures::stream::iter` for the `Streaming<Product>`
+# carrier; the umbrella surface exposes `leaf_core::BoxStream` (the type) but not a stream
+# constructor, so the dogfood names `futures` directly. Gated behind the `grpc` capability.
+futures = { version = "0.3", optional = true }
 
 # Mirror the umbrella's capability features so the binary-crate `leaf::force_link!()`
 # shim's `#[cfg(feature = "redis")]` gate (checked in THIS crate's namespace) matches.
@@ -22,8 +26,9 @@ default = ["redis", "web", "grpc"]
 redis = ["leaf/redis"]
 web = ["leaf/web"]
 # The gRPC capability (passthrough to `leaf/grpc`): the storefront serves its catalog
-# domain over gRPC on the SAME embedded server, alongside the `web` HTTP surface.
-grpc = ["leaf/grpc"]
+# domain over gRPC on the SAME embedded server, alongside the `web` HTTP surface. Pulls
+# `futures` for the server-stream's `Streaming<Product>` constructor.
+grpc = ["leaf/grpc", "dep:futures"]
 
 # The proto compiler, present so build.rs can compile catalog.proto (the leaf server trait
 # + path/descriptor module). protox is pure-Rust — NO protoc system binary. BUILD-only.

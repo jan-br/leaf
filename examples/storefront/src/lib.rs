@@ -28,6 +28,13 @@ extern crate leaf as leaf_web;
 #[cfg(feature = "grpc")]
 #[allow(unused_extern_crates)]
 extern crate leaf as leaf_grpc;
+// The proto-first message structs `leaf-grpc-build` generates emit absolute `::prost::`
+// paths (`#[derive(::prost::Message)]`, `::prost::alloc::*`); this SOURCE alias of the one
+// `leaf` dep resolves them to `leaf::prost` — the same facade trick as `leaf_grpc`/`leaf_web`,
+// NOT a new Cargo dependency. The storefront names no `prost` crate directly.
+#[cfg(feature = "grpc")]
+#[allow(unused_extern_crates)]
+extern crate leaf as prost;
 
 pub mod catalog;
 pub mod order;

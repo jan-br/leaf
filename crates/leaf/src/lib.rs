@@ -117,14 +117,47 @@ pub use leaf_starter_web::leaf_web::http;
 // The leaf-grpc macro surface the #[grpc_controller] codegen emits `::leaf_grpc::` paths
 // into — re-exported AT THE UMBRELLA ROOT so the facade alias `extern crate leaf as
 // leaf_grpc;` resolves `::leaf_grpc::GrpcRoute` to `leaf::GrpcRoute`, exactly like the
-// `leaf_web` re-exports. Only the EXACT symbols the macro references are listed. Present
-// iff the `grpc` capability feature pulled the bundle in.
+// `leaf_web` re-exports. Only the EXACT symbols the macro references are listed: the
+// `GrpcRoute`/`GrpcHandler`/`GrpcControllerKind` registration traits, the disjoint
+// `GrpcRecv`/`GrpcSend` framing seams trait resolution picks the call shape from, the
+// concrete `ProstCodec` the route field-injects, the `MethodDescriptor` the `path()` const
+// reads, plus the user-facing `Code`/`Status`/`Streaming`/`GrpcStatusMapper`/`GrpcCodec`/
+// `decode_frames`/`encode_frame`. Present iff the `grpc` capability feature pulled the
+// bundle in.
 #[cfg(feature = "grpc")]
 #[doc(hidden)]
 pub use leaf_starter_grpc::leaf_grpc::{
-    decode_frames, encode_frame, Code, GrpcCodec, GrpcDispatch, GrpcHandler, GrpcRoute,
-    GrpcStatusMapper, ProstCodec, Status, Streaming,
+    decode_frames, encode_frame, CallShape, Code, GrpcCodec, GrpcControllerKind, GrpcDispatch,
+    GrpcHandler, GrpcRecv, GrpcRoute, GrpcSend, GrpcStatusMapper, MethodDescriptor, ProstCodec,
+    Status, Streaming,
 };
+// The prost message-codec surface the `leaf-grpc-build`-generated message structs emit
+// absolute `::prost::` paths against — re-exported AT THE UMBRELLA ROOT so an umbrella-only
+// app's `extern crate leaf as prost;` facade alias resolves `::prost::Message` to
+// `leaf::Message` (and `::prost::alloc::*` to `leaf::alloc::*`), exactly like the
+// `leaf_web`/`http` root re-exports. `Message` is BOTH the codec trait and its `#[derive]`
+// macro (they share the name across namespaces); `alloc` is prost's re-export of the `alloc`
+// crate the generated `String`/`Vec` types live in. Only the EXACT symbols the generated
+// message code references. Present iff the `grpc` capability feature pulled the bundle in.
+#[cfg(feature = "grpc")]
+#[doc(hidden)]
+pub use leaf_starter_grpc::leaf_grpc::prost::{
+    alloc, bytes, encoding, DecodeError, EncodeError, Enumeration, Message, Name, Oneof,
+    UnknownEnumValue,
+};
+// The `dispatch` module the route codegen names (`::leaf_grpc::dispatch::status_response` —
+// the early-return when an inbound frame is a malformed `Status`). Re-exported AT THE ROOT
+// so the facade alias resolves `::leaf_grpc::dispatch` to `leaf::dispatch`, like `leaf::http`.
+#[cfg(feature = "grpc")]
+#[doc(hidden)]
+pub use leaf_starter_grpc::leaf_grpc::dispatch;
+// The `map_first` mapper-chain fold + `LeafError`-mapping helper the dogfood controller calls
+// to render a raised domain error through the collection-injected GrpcStatusMapper chain
+// (the gRPC ControlAdvice analogue). Reached as `leaf::grpc::leaf_grpc::map_first` too, but
+// re-exported here so the facade `::leaf_grpc::map_first` resolves.
+#[cfg(feature = "grpc")]
+#[doc(hidden)]
+pub use leaf_starter_grpc::leaf_grpc::map_first;
 
 // ── flat re-exports of the three foundation crates (so `leaf::core`, `leaf::boot`,
 // `leaf::macros` reach the full surface without naming the hyphenated crates) ──

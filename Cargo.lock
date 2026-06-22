@@ -834,6 +834,7 @@ dependencies = [
  "leaf-cache",
  "leaf-core",
  "leaf-macros",
+ "leaf-starter-grpc",
  "leaf-starter-redis",
  "leaf-starter-web",
  "leaf-tokio",
@@ -1035,6 +1036,14 @@ dependencies = [
  "leaf-macros",
  "once_cell",
  "smol",
+]
+
+[[package]]
+name = "leaf-starter-grpc"
+version = "0.1.0"
+dependencies = [
+ "leaf-grpc",
+ "leaf-starter-web",
 ]
 
 [[package]]
@@ -1813,7 +1822,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "storefront"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "leaf",
+ "leaf-grpc-build",
  "reqwest",
  "serde",
  "serde_json",
