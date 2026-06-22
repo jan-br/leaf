@@ -946,6 +946,7 @@ dependencies = [
  "leaf-web",
  "leaf-web-hyper",
  "prost",
+ "prost-types",
  "protox",
  "tokio",
  "tonic",

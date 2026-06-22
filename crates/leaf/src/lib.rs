@@ -129,7 +129,7 @@ pub use leaf_starter_web::leaf_web::http;
 pub use leaf_starter_grpc::leaf_grpc::{
     decode_frames, encode_frame, CallShape, Code, GrpcCodec, GrpcControllerKind, GrpcDispatch,
     GrpcHandler, GrpcRecv, GrpcRoute, GrpcSend, GrpcStatusMapper, MethodDescriptor, ProstCodec,
-    Status, Streaming,
+    Status, Streaming, REFLECTED_FILE_DESCRIPTOR_SETS,
 };
 // The prost message-codec surface the `leaf-grpc-build`-generated message structs emit
 // absolute `::prost::` paths against — re-exported AT THE UMBRELLA ROOT so an umbrella-only

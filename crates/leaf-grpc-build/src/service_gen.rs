@@ -301,6 +301,12 @@ pub fn render_fds_block(package: &str) -> String {
     out.push_str(&render_fds_slice_row(package));
     out.push('\n');
     out.push_str("}\n");
+    // The re-export is a public-API convenience (reflection + downstreams read it, or
+    // not); when `echo.rs` is `include!`d into a crate that never names it, the `pub use`
+    // trips `unused_imports`. The allow keeps the generated artifact warning-free
+    // regardless of which consts the downstream references (same rationale as the service
+    // module's `#![allow(dead_code)]` on the path constants).
+    out.push_str("#[allow(unused_imports)]\n");
     out.push_str(&format!("pub use {module}::FILE_DESCRIPTOR_SET;\n"));
     out
 }

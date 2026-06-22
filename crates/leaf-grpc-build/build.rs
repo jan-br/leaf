@@ -29,11 +29,35 @@ fn main() -> std::io::Result<()> {
         println!("cargo:rerun-if-changed={proto}");
     }
 
-    let out_dir = std::env::var_os("OUT_DIR")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "OUT_DIR not set"))?;
+    let out_dir = std::path::PathBuf::from(
+        std::env::var_os("OUT_DIR")
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "OUT_DIR not set"))?,
+    );
+
+    // Group by package BEFORE moving `fds` into compile_fds (compile_fds does not write
+    // the .fds itself) — mirrors the library's `compile`.
+    use ::prost::Message;
+    let mut by_pkg: std::collections::BTreeMap<String, ::prost_types::FileDescriptorSet> =
+        std::collections::BTreeMap::new();
+    for f in &fds.file {
+        let pkg = f.package.clone().unwrap_or_default();
+        by_pkg.entry(pkg).or_default().file.push(f.clone());
+    }
 
     let mut config = prost_build::Config::new();
-    config.out_dir(out_dir);
+    config.out_dir(&out_dir);
     config.service_generator(Box::new(LeafServiceGenerator));
-    config.compile_fds(fds)
+    config.compile_fds(fds)?;
+
+    // Per package: write <pkg>.fds + append the FDS discovery block to <pkg>.rs.
+    for (package, set) in &by_pkg {
+        std::fs::write(out_dir.join(format!("{package}.fds")), set.encode_to_vec())?;
+        let rs_path = out_dir.join(format!("{package}.rs"));
+        let mut existing = std::fs::read_to_string(&rs_path).unwrap_or_default();
+        existing.push('\n');
+        existing.push_str(&service_gen::render_fds_block(package));
+        std::fs::write(&rs_path, existing)?;
+    }
+
+    Ok(())
 }

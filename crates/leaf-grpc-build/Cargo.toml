@@ -43,3 +43,6 @@ syn = { workspace = true }
 # structs at TEST compile time.
 leaf-grpc = { workspace = true }
 prost = { workspace = true }
+# The build-output proof decodes the FDS const + the sibling echo.v1.fds as a
+# prost_types::FileDescriptorSet (it names `::prost_types` directly).
+prost-types = { workspace = true }

@@ -60,3 +60,41 @@ fn the_generated_trait_is_implementable_in_all_four_shapes() {
     // contract shapes — the trait method types would reject a mismatched body.
     let _e = EchoImpl;
 }
+
+#[test]
+fn the_generated_module_exposes_the_encoded_file_descriptor_set() {
+    // The FDS const is the package's encoded FileDescriptorSet, embedded from echo.v1.fds.
+    assert!(
+        !FILE_DESCRIPTOR_SET.is_empty(),
+        "the FDS const carries the encoded bytes"
+    );
+}
+
+#[test]
+fn the_fds_const_equals_the_sibling_fds_file_and_decodes_to_the_echo_package() {
+    use ::prost::Message;
+    // Equals the bytes compile() wrote to OUT_DIR/echo.v1.fds.
+    let on_disk = include_bytes!(concat!(env!("OUT_DIR"), "/echo.v1.fds"));
+    assert_eq!(
+        FILE_DESCRIPTOR_SET, on_disk,
+        "the const embeds the .fds verbatim"
+    );
+
+    let decoded = ::prost_types::FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
+        .expect("the FDS const decodes as a prost FileDescriptorSet");
+    let packages: Vec<_> = decoded.file.iter().filter_map(|f| f.package.clone()).collect();
+    assert!(
+        packages.iter().any(|p| p == "echo.v1"),
+        "the decoded FDS names the echo.v1 package, got {packages:?}"
+    );
+    // The service the leaf trait was generated from is present in the descriptor.
+    let services: Vec<_> = decoded
+        .file
+        .iter()
+        .flat_map(|f| f.service.iter().filter_map(|s| s.name.clone()))
+        .collect();
+    assert!(
+        services.iter().any(|s| s == "Echo"),
+        "the Echo service is in the FDS, got {services:?}"
+    );
+}
