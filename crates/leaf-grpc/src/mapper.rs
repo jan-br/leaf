@@ -20,6 +20,17 @@ pub trait GrpcStatusMapper: Send + Sync {
 // provider as `Vec<Ref<dyn GrpcStatusMapper>>` for its ordered first-match chain.
 leaf_core::impl_resolve_view!(dyn GrpcStatusMapper);
 
+/// Run a slice of mappers in order, returning the first non-`None` [`Status`].
+/// The first mapper that claims `err` wins (lower collection order = earlier),
+/// matching leaf-web's `Dispatcher::map_error` first-match-wins semantics over the
+/// `ControlAdvice` chain. With the [`DefaultGrpcStatusMapper`] FALLBACK floor last,
+/// this always yields `Some` for the production chain; on a bare user-only slice an
+/// unclaimed error returns `None` (the caller supplies the floor).
+#[must_use]
+pub fn map_first(mappers: &[&dyn GrpcStatusMapper], err: &LeafError) -> Option<Status> {
+    mappers.iter().find_map(|m| m.map(err))
+}
+
 /// The default gRPC status mapping — the FALLBACK floor (Spring's
 /// `DefaultHandlerExceptionResolver`): `NoSuchBean`→[`Code::Unimplemented`],
 /// `ConvertError`→[`Code::Internal`], everything else→[`Code::Unknown`]. A user
@@ -93,6 +104,35 @@ mod tests {
     use super::*;
     use crate::status::Code;
     use leaf_core::{ErrorKind, LeafError};
+
+    #[test]
+    fn grpc_status_mapper_first_some_in_order_wins() {
+        use crate::status::Status;
+        use leaf_core::{ErrorKind, LeafError};
+
+        // Two mappers both targeting ConstructionFailed; the earlier-consulted one wins.
+        struct Map {
+            kind: ErrorKind,
+            status: Status,
+        }
+        impl GrpcStatusMapper for Map {
+            fn map(&self, err: &LeafError) -> Option<Status> {
+                (err.kind == self.kind).then(|| self.status.clone())
+            }
+        }
+        let early = Map { kind: ErrorKind::ConstructionFailed, status: Status::not_found("a") };
+        let late = Map { kind: ErrorKind::ConstructionFailed, status: Status::internal("b") };
+        let mappers: Vec<&dyn GrpcStatusMapper> = vec![&early, &late];
+
+        let err = LeafError::new(ErrorKind::ConstructionFailed);
+        let chosen = map_first(&mappers, &err).expect("a mapper claims it");
+        assert_eq!(chosen.code, Code::NotFound);
+        assert_eq!(chosen.message, "a");
+
+        // An unclaimed kind => None (the caller falls back to the default mapper).
+        let other = LeafError::new(ErrorKind::ValidationError);
+        assert!(map_first(&mappers, &other).is_none());
+    }
 
     #[test]
     fn default_mapper_maps_the_framework_kinds() {
