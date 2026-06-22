@@ -36,6 +36,7 @@ leaf-figlet = { path = "crates/leaf-figlet", version = "0.1.0" }
 leaf-redis = { path = "crates/leaf-redis", version = "0.1.0" }
 leaf-starter-redis = { path = "crates/leaf-starter-redis", version = "0.1.0" }
 leaf-starter-web = { path = "crates/leaf-starter-web", version = "0.1.0" }
+leaf-starter-grpc = { path = "crates/leaf-starter-grpc", version = "0.1.0" }
 leaf-web = { path = "crates/leaf-web", version = "0.1.0" }
 leaf-web-hyper = { path = "crates/leaf-web-hyper", version = "0.1.0" }
 leaf-grpc = { path = "crates/leaf-grpc", version = "0.1.0" }

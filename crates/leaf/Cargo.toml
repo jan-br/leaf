@@ -26,10 +26,9 @@ default = []
 redis = ["dep:leaf-starter-redis"]
 # `web` — the STACK starter (the curated additive web bundle).
 web = ["dep:leaf-starter-web"]
-# The gRPC capability (sub-project B). Stage 6 wires `dep:leaf-starter-grpc` (which pulls
-# leaf-grpc + enables `http2` on the backend); this bare feature lets the `#[grpc_controller]`
-# macro export gate behind it from Stage 4 onward.
-grpc = []
+# `grpc` — the STACK starter (the gRPC bundle: leaf-grpc + the shared http2 web stack).
+# gRPC rides the same WebServer/port, so enabling `grpc` implies the web stack.
+grpc = ["dep:leaf-starter-grpc", "web"]
 
 [dependencies]
 # THE BASE (always pulled): the kernel ABI, the thin macros, the bootstrap/run
@@ -61,6 +60,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 # The optional starters, dep-hidden behind the capability features above.
 leaf-starter-redis = { workspace = true, optional = true }
 leaf-starter-web = { workspace = true, optional = true }
+leaf-starter-grpc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The end-to-end umbrella proof drives a real run pipeline under a tokio runtime.

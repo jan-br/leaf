@@ -59,6 +59,8 @@ mod __leaf_force_link {
     pub(crate) use leaf_starter_redis as _;
     #[cfg(feature = "web")]
     pub(crate) use leaf_starter_web as _;
+    #[cfg(feature = "grpc")]
+    pub(crate) use leaf_starter_grpc as _;
 }
 
 /// The Cargo PACKAGE names of the integration crates pulled into the participating
@@ -98,8 +100,16 @@ pub fn participating_crates() -> Vec<&'static str> {
     #[cfg(not(feature = "web"))]
     const WEB: &[&str] = &[];
 
+    // The gRPC capability adds the leaf-grpc engine ON TOP of the web stack. The `grpc`
+    // feature implies `web`, so the web-bundle rows already arrive via WEB; the only NET-NEW
+    // SourceTag (leaf-grpc `declare_source!`s it) is added here under the `grpc` gate.
+    #[cfg(feature = "grpc")]
+    const GRPC: &[&str] = &["leaf-grpc"];
+    #[cfg(not(feature = "grpc"))]
+    const GRPC: &[&str] = &[];
+
     let set: std::collections::BTreeSet<&'static str> =
-        REDIS.iter().chain(WEB).copied().collect();
+        REDIS.iter().chain(WEB).chain(GRPC).copied().collect();
     set.into_iter().collect()
 }
 
@@ -148,6 +158,8 @@ macro_rules! force_link {
         use $crate::redis as _;
         #[cfg(feature = "web")]
         use $crate::web as _;
+        #[cfg(feature = "grpc")]
+        use $crate::grpc as _;
     };
 }
 
@@ -217,5 +229,16 @@ mod tests {
         assert!(crates.contains(&"leaf-tokio"), "got: {crates:?}");
         assert!(crates.contains(&"leaf-validation"), "got: {crates:?}");
         assert!(crates.contains(&"leaf-cache"), "got: {crates:?}");
+    }
+
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn the_grpc_capability_adds_leaf_grpc_on_top_of_the_web_stack() {
+        let crates = participating_crates();
+        // The NET-NEW gRPC engine SourceTag.
+        assert!(crates.contains(&"leaf-grpc"), "got: {crates:?}");
+        // The `grpc` feature implies `web`, so the shared web-stack rows ride along.
+        assert!(crates.contains(&"leaf-web"), "the implied web stack: {crates:?}");
+        assert!(crates.contains(&"leaf-web-hyper"), "the implied hyper backend: {crates:?}");
     }
 }

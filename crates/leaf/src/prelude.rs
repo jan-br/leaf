@@ -102,11 +102,17 @@ pub use leaf_starter_web::leaf_web::{
     Path, Query, Request, Response, ResponseEntity, WebFilter,
 };
 
-// The gRPC controller-family stereotype (Stage 4), brought into scope flat behind the
-// `grpc` capability feature — the gRPC twin of the `web`-gated `rest_controller`/`web_filter`
-// exports. The macro emits ABSOLUTE `::leaf_grpc::` paths that resolve through the umbrella's
-// `grpc`-gated re-exports + the `extern crate leaf as leaf_grpc;` facade alias. Present iff
-// the `grpc` feature pulled the bundle in.
+// ── the gRPC capability surface (present iff the `grpc` feature pulled the bundle) ──
+//
+// The #[grpc_controller] stereotype (the gRPC twin of the `web`-gated `rest_controller`/
+// `web_filter` exports) + the leaf-grpc types a controller method names in its signatures
+// (`Status`/`Code` for the error model, `Streaming` for the streaming shapes). The macro
+// emits absolute `::leaf_grpc::` paths resolved through the umbrella's `grpc`-gated root
+// re-exports + the `extern crate leaf as leaf_grpc;` facade alias; these prelude names are
+// what the USER writes.
 #[cfg(feature = "grpc")]
 #[doc(no_inline)]
 pub use leaf_macros::grpc_controller;
+#[cfg(feature = "grpc")]
+#[doc(no_inline)]
+pub use leaf_starter_grpc::leaf_grpc::{Code, Status, Streaming};

@@ -114,6 +114,18 @@ pub use leaf_starter_web::leaf_web::{
 #[doc(hidden)]
 pub use leaf_starter_web::leaf_web::http;
 
+// The leaf-grpc macro surface the #[grpc_controller] codegen emits `::leaf_grpc::` paths
+// into — re-exported AT THE UMBRELLA ROOT so the facade alias `extern crate leaf as
+// leaf_grpc;` resolves `::leaf_grpc::GrpcRoute` to `leaf::GrpcRoute`, exactly like the
+// `leaf_web` re-exports. Only the EXACT symbols the macro references are listed. Present
+// iff the `grpc` capability feature pulled the bundle in.
+#[cfg(feature = "grpc")]
+#[doc(hidden)]
+pub use leaf_starter_grpc::leaf_grpc::{
+    decode_frames, encode_frame, Code, GrpcCodec, GrpcDispatch, GrpcHandler, GrpcRoute,
+    GrpcStatusMapper, ProstCodec, Status, Streaming,
+};
+
 // ── flat re-exports of the three foundation crates (so `leaf::core`, `leaf::boot`,
 // `leaf::macros` reach the full surface without naming the hyphenated crates) ──
 
@@ -181,6 +193,12 @@ pub use leaf_starter_redis as redis;
 #[cfg(feature = "web")]
 #[doc(no_inline)]
 pub use leaf_starter_web as web;
+
+/// The gRPC STACK starter (present iff the `grpc` feature is enabled). The `dep:`-hidden
+/// edge pulls the gRPC bundle into the participating set; reached as `leaf::grpc`.
+#[cfg(feature = "grpc")]
+#[doc(no_inline)]
+pub use leaf_starter_grpc as grpc;
 
 // ── the bootstrap bridge (the default-runtime run entry) ──
 
