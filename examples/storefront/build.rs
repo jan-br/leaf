@@ -38,6 +38,23 @@ fn main() -> std::io::Result<()> {
                 .out_dir(&tonic_out)
                 .compile_fds(fds)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+            // The dev-test reflection CLIENT stub: tonic generates grpc.reflection.v1's client
+            // from leaf-grpc's SHIPPED reflection_v1.proto (vendored beside this build.rs as
+            // proto/reflection_v1.proto so the storefront build needs no path into the crate
+            // src). Client-only, into $OUT_DIR/tonic/grpc.reflection.v1.rs — the same
+            // separate-dir pattern the catalog client uses. Reflection itself is SERVED by
+            // leaf-grpc's dogfooded #[grpc_controller]s; the storefront adds zero reflection
+            // server code. tonic-build/protox stay BUILD-only.
+            let refl_fds = protox::compile(["proto/reflection_v1.proto"], ["proto"])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            tonic_build::configure()
+                .build_server(false)
+                .build_client(true)
+                .out_dir(&tonic_out)
+                .compile_fds(refl_fds)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            println!("cargo:rerun-if-changed=proto/reflection_v1.proto");
         }
         println!("cargo:rerun-if-changed=proto/catalog.proto");
         println!("cargo:rerun-if-changed=build.rs");
