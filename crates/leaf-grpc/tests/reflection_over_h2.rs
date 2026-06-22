@@ -131,3 +131,69 @@ async fn reflection_is_unimplemented_when_disabled_by_default() {
 
     let _ = running.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reflection_lists_services_and_returns_descriptors_when_enabled() {
+    let (port, running) =
+        boot(vec!["--leaf.grpc.reflection.enabled=true".to_string()]).await;
+    wait_until_up(port).await;
+    let mut c = refl_client(port).await;
+
+    // 1. list_services -> the app's echo.Echo service appears (the gRPC wire FQN, sourced
+    //    from the FDS the echo.proto's leaf-grpc-build run contributed to the slice).
+    let resp = one_round(
+        &mut c,
+        ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        },
+    )
+    .await
+    .expect("list_services succeeds with reflection enabled");
+    let names: Vec<String> = match resp {
+        MessageResponse::ListServicesResponse(r) => {
+            r.service.into_iter().map(|s| s.name).collect()
+        }
+        other => panic!("expected ListServicesResponse, got {other:?}"),
+    };
+    assert!(
+        names.iter().any(|n| n == "echo.Echo"),
+        "list_services includes the app catalog service echo.Echo, got {names:?}"
+    );
+
+    // 2. file_containing_symbol("echo.EchoRequest") -> the defining echo.proto descriptor
+    //    bytes (plus its dependency closure). The symbol is the FDS wire FQN, NOT a Rust name.
+    let resp = one_round(
+        &mut c,
+        ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "echo.EchoRequest".to_string(),
+            )),
+        },
+    )
+    .await
+    .expect("file_containing_symbol succeeds");
+    let fds_bytes: Vec<Vec<u8>> = match resp {
+        MessageResponse::FileDescriptorResponse(r) => r.file_descriptor_proto,
+        other => panic!("expected FileDescriptorResponse, got {other:?}"),
+    };
+    assert!(
+        !fds_bytes.is_empty(),
+        "the file + its dependency closure came back as descriptor bytes"
+    );
+    // Decode each returned descriptor and assert the defining file is among them: a file
+    // whose message_type contains EchoRequest. (prost_types is reached via leaf_grpc's normal
+    // dep; prost is named directly as a dev-dep for Message::decode.)
+    let defines_echo_request = fds_bytes.iter().any(|bytes| {
+        let file = <prost_types::FileDescriptorProto as prost::Message>::decode(&bytes[..])
+            .expect("a returned descriptor decodes as a FileDescriptorProto");
+        file.message_type.iter().any(|m| m.name() == "EchoRequest")
+    });
+    assert!(
+        defines_echo_request,
+        "the descriptor defining EchoRequest is in the returned closure"
+    );
+
+    let _ = running.shutdown().await;
+}
