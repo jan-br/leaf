@@ -224,6 +224,87 @@ pub fn spec_from_service(svc: &::prost_build::Service) -> ServiceSpec {
     }
 }
 
+/// The SCREAMING_SNAKE static ident for a package's FDS registration row
+/// (`echo.v1` -> `__LEAF_FDS_ECHO_V1`). PURE case mechanics over the package's OWN
+/// dotted text — dots become `_`, letters/digits upper-case — NEVER type-name
+/// detection (no behavior is keyed on the spelling; an empty package yields
+/// `__LEAF_FDS_`). Deterministic + unique per package, so a second proto in the same
+/// package would collide loudly (one FDS per package module, by construction).
+#[must_use]
+fn fds_static_ident(package: &str) -> String {
+    let mut out = String::from("__LEAF_FDS_");
+    for ch in package.chars() {
+        if ch == '.' {
+            out.push('_');
+        } else {
+            out.push(ch.to_ascii_uppercase());
+        }
+    }
+    out
+}
+
+/// The dotted `<pkg>.fds` sibling file name prost-build's module naming implies
+/// (`Module::to_file_name_or` joins package components with `.`, so the module is
+/// `echo.v1.rs` and its FDS sibling is `echo.v1.fds`). The empty-package default-root
+/// case is handled by `compile`, not here (this renders the dotted form).
+#[must_use]
+fn fds_file_name(package: &str) -> String {
+    format!("{package}.fds")
+}
+
+/// `pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"),
+/// "/<pkg>.fds"));` — the package's encoded `FileDescriptorSet`, embedded from the
+/// sibling `.fds` `compile()` writes beside the generated `<pkg>.rs`.
+#[must_use]
+fn render_fds_const(package: &str) -> String {
+    let file = fds_file_name(package);
+    format!(
+        "pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"));"
+    )
+}
+
+/// The `#[distributed_slice]` row contributing this package's `FILE_DESCRIPTOR_SET` to
+/// `leaf_grpc::REFLECTED_FILE_DESCRIPTOR_SETS`. Routes linkme through the leaf-grpc
+/// re-export (`#[linkme(crate = ::leaf_grpc::linkme)]`), exactly as `declare_source!`
+/// routes through `::leaf_core::linkme`.
+#[must_use]
+fn render_fds_slice_row(package: &str) -> String {
+    let ident = fds_static_ident(package);
+    format!(
+        "#[::leaf_grpc::linkme::distributed_slice(::leaf_grpc::REFLECTED_FILE_DESCRIPTOR_SETS)]\n\
+         #[linkme(crate = ::leaf_grpc::linkme)]\n\
+         static {ident}: &[u8] = &FILE_DESCRIPTOR_SET;"
+    )
+}
+
+/// The full FDS discovery block for one compiled package: the `FILE_DESCRIPTOR_SET`
+/// const + its slice-registration row, wrapped in an inner `#[doc(hidden)] mod` whose
+/// `#![allow(dead_code, non_upper_case_globals)]` covers BOTH items (the const is dead
+/// static data unless reflection reads it; rust-analyzer lints the generated SCREAMING
+/// static ident that rustc would skip — MEMORY: emit the allow on generated items). The
+/// const is re-exported with `pub use` so `FILE_DESCRIPTOR_SET` stays reachable at the
+/// package-module path the integration test (and the reflection index) reads. Emitted
+/// ONCE per proto package by `compile()`.
+#[must_use]
+pub fn render_fds_block(package: &str) -> String {
+    let module = format!(
+        "__leaf_fds_{}",
+        fds_static_ident(package)
+            .trim_start_matches("__LEAF_FDS_")
+            .to_ascii_lowercase()
+    );
+    let mut out = String::new();
+    out.push_str(&format!("#[doc(hidden)]\npub mod {module} {{\n"));
+    out.push_str("    #![allow(dead_code, non_upper_case_globals)]\n    ");
+    out.push_str(&render_fds_const(package));
+    out.push_str("\n    ");
+    out.push_str(&render_fds_slice_row(package));
+    out.push('\n');
+    out.push_str("}\n");
+    out.push_str(&format!("pub use {module}::FILE_DESCRIPTOR_SET;\n"));
+    out
+}
+
 /// The leaf `prost_build::ServiceGenerator`: for each gRPC service prost-build
 /// encounters, append the rendered leaf server trait + path/descriptor module to the
 /// output buffer (beside the message structs prost emits).
@@ -402,6 +483,75 @@ mod tests {
             client_streaming: cs,
             server_streaming: ss,
         }
+    }
+
+    #[test]
+    fn renders_the_file_descriptor_set_const_including_the_fds_file() {
+        let c = render_fds_const("echo.v1");
+        let flat = c.split_whitespace().collect::<String>();
+        assert!(
+            flat.contains("pubconstFILE_DESCRIPTOR_SET:&[u8]"),
+            "the const is the public FDS byte slice: {flat}"
+        );
+        assert!(
+            flat.contains(r#"include_bytes!(concat!(env!("OUT_DIR"),"/echo.v1.fds"))"#),
+            "the const embeds the sibling <pkg>.fds via include_bytes!: {flat}"
+        );
+    }
+
+    #[test]
+    fn renders_the_distributed_slice_registration_row_for_the_package() {
+        let r = render_fds_slice_row("echo.v1");
+        let flat = r.split_whitespace().collect::<String>();
+        // The linkme attribute routes through leaf-grpc's re-export, like declare_source!'s
+        // `#[linkme(crate = ::leaf_core::linkme)]` does for leaf-core's slices.
+        assert!(
+            flat.contains("#[::leaf_grpc::linkme::distributed_slice(::leaf_grpc::REFLECTED_FILE_DESCRIPTOR_SETS)]"),
+            "the row joins the leaf-grpc discovery slice: {flat}"
+        );
+        assert!(
+            flat.contains("#[linkme(crate=::leaf_grpc::linkme)]"),
+            "the row pins linkme to the leaf-grpc re-export: {flat}"
+        );
+        // The static ident is the SCREAMING package, deterministic + unique per package.
+        assert!(
+            flat.contains("static__LEAF_FDS_ECHO_V1:&[u8]=&FILE_DESCRIPTOR_SET;"),
+            "the row contributes the package's FILE_DESCRIPTOR_SET: {flat}"
+        );
+    }
+
+    #[test]
+    fn fds_static_ident_is_pure_case_mechanics_over_the_package_dots() {
+        // No type-name detection: the ident is the package text upper-cased with dots->_.
+        assert_eq!(fds_static_ident("echo.v1"), "__LEAF_FDS_ECHO_V1");
+        assert_eq!(
+            fds_static_ident("grpc.reflection.v1alpha"),
+            "__LEAF_FDS_GRPC_REFLECTION_V1ALPHA"
+        );
+        assert_eq!(fds_static_ident(""), "__LEAF_FDS_");
+    }
+
+    #[test]
+    fn the_emitted_fds_block_parses_as_rust_items() {
+        let src = render_fds_block("echo.v1");
+        syn::parse_str::<syn::File>(&src).expect("the FDS const + row parse as valid Rust items");
+    }
+
+    #[test]
+    fn the_fds_block_reexports_the_const_at_the_package_path() {
+        let flat = render_fds_block("echo.v1").split_whitespace().collect::<String>();
+        assert!(
+            flat.contains("pubuse"),
+            "the const is re-exported to the package module path: {flat}"
+        );
+        assert!(
+            flat.contains("::FILE_DESCRIPTOR_SET;"),
+            "re-exports FILE_DESCRIPTOR_SET: {flat}"
+        );
+        assert!(
+            flat.contains("#![allow(dead_code,non_upper_case_globals)]"),
+            "inner allow covers both items: {flat}"
+        );
     }
 
     #[test]
