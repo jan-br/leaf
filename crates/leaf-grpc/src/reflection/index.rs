@@ -506,4 +506,40 @@ mod tests {
         let err = ReflectionIndex::from_descriptor_sets(&[garbage]);
         assert!(err.is_err(), "corrupt FDS bytes must surface a DecodeError");
     }
+
+    #[test]
+    fn from_descriptor_sets_merges_multiple_sets_and_closes_across_them() {
+        // The discovery slice carries ONE row per compiled proto, so the index is fed many
+        // SEPARATE sets — prove they merge into one index and a dependency closure spans rows.
+        // Set A: common.proto (the imported dependency).
+        let common = FileDescriptorProto {
+            name: Some("common.proto".to_string()),
+            package: Some("common".to_string()),
+            message_type: vec![message("Shared")],
+            ..Default::default()
+        };
+        let set_a = encode_set(vec![common]);
+
+        // Set B: app.proto importing common.proto from the OTHER set, with a service.
+        let app = FileDescriptorProto {
+            name: Some("app.proto".to_string()),
+            package: Some("app".to_string()),
+            dependency: vec!["common.proto".to_string()],
+            service: vec![service("App", vec![method("Do", ".common.Shared", ".common.Shared")])],
+            ..Default::default()
+        };
+        let set_b = encode_set(vec![app]);
+
+        let index = ReflectionIndex::from_descriptor_sets(&[&set_a, &set_b]).unwrap();
+
+        // The service from set B is listed; the symbol from set A resolves.
+        assert_eq!(index.list_services(), vec!["app.App".to_string()]);
+        assert!(index.file_containing_symbol("common.Shared").is_some());
+
+        // The closure of app.App (set B) reaches common.proto (set A) — cross-set, deduped.
+        let files = index.file_containing_symbol("app.App").unwrap();
+        let mut names = names_of(&files);
+        names.sort();
+        assert_eq!(names, vec!["app.proto".to_string(), "common.proto".to_string()]);
+    }
 }
