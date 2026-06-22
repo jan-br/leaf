@@ -118,6 +118,16 @@ impl ReflectionIndex {
         Some(self.closure_for(name))
     }
 
+    /// The file DEFINING this fully-qualified WIRE symbol (a service, method, message,
+    /// nested message, or enum — e.g. `storefront.catalog.Catalog`) PLUS its transitive
+    /// dependency closure, or `None` if the symbol is unknown. A leading `.` is tolerated.
+    #[must_use]
+    pub fn file_containing_symbol(&self, symbol: &str) -> Option<Vec<FileDescriptorProto>> {
+        let key = normalize_symbol(symbol);
+        let file_name = self.by_symbol.get(&key)?;
+        Some(self.closure_for(file_name))
+    }
+
     /// The transitive `dependency` closure of `root` — `root`'s file followed by every
     /// file it imports, recursively, each appearing exactly once. A `dependency` naming
     /// an un-indexed file is skipped (a partial set still answers what it can).
@@ -336,6 +346,70 @@ mod tests {
                 "storefront.catalog.Catalog".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn file_containing_symbol_resolves_messages_services_and_methods() {
+        let bytes = encode_set(vec![catalog_file()]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+
+        // A message symbol → the catalog file.
+        let by_msg = index
+            .file_containing_symbol("storefront.catalog.GetRequest")
+            .expect("message symbol resolves");
+        assert_eq!(by_msg[0].name.as_deref(), Some("storefront/catalog.proto"));
+
+        // A service symbol resolves.
+        assert!(index
+            .file_containing_symbol("storefront.catalog.Catalog")
+            .is_some());
+        // A method symbol resolves (service.method FQN).
+        assert!(index
+            .file_containing_symbol("storefront.catalog.Catalog.Get")
+            .is_some());
+
+        // A leading-dot variant resolves the same way.
+        assert!(index
+            .file_containing_symbol(".storefront.catalog.GetResponse")
+            .is_some());
+    }
+
+    #[test]
+    fn file_containing_symbol_returns_the_defining_file_plus_closure() {
+        // Put the catalog message symbols in a file that imports common.proto.
+        let mut catalog = catalog_file();
+        catalog.dependency = vec!["common.proto".to_string()];
+        let common = FileDescriptorProto {
+            name: Some("common.proto".to_string()),
+            package: Some("common".to_string()),
+            message_type: vec![message("Shared")],
+            ..Default::default()
+        };
+        let bytes = encode_set(vec![common, catalog]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+
+        let files = index
+            .file_containing_symbol("storefront.catalog.Catalog")
+            .expect("service symbol resolves");
+        let mut names = names_of(&files);
+        assert_eq!(names[0], "storefront/catalog.proto");
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "common.proto".to_string(),
+                "storefront/catalog.proto".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn file_containing_symbol_returns_none_for_an_unknown_symbol() {
+        let bytes = encode_set(vec![catalog_file()]);
+        let index = ReflectionIndex::from_descriptor_sets(&[&bytes]).unwrap();
+        assert!(index
+            .file_containing_symbol("storefront.catalog.Nope")
+            .is_none());
     }
 
     #[test]
