@@ -37,3 +37,10 @@ futures.workspace = true
 # tests/dispatch_through_mock.rs uses (no eager validate, no transport). Dev-only:
 # production deps stay leaf-core/leaf-web/prost.
 leaf-boot.workspace = true
+# The cross-cutting integration test drives the leaf-web Dispatcher across the
+# WebFilter chain + the GrpcStatusMapper error model with a tokio runtime
+# (#[tokio::test]) — no hyper/tonic (that is Stage 6). macros + the current-thread
+# rt only; tokio is NOT a production dep (leaf-grpc stays backend/runtime-free).
+tokio = { workspace = true, features = ["macros", "rt"] }
+# (leaf-macros/http/bytes are normal deps, available in tests for the filter/proto
+#  fakes that dogfood #[async_impl] on WebFilter + the Request/Response shapes.)

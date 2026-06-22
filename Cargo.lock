@@ -917,6 +917,7 @@ dependencies = [
  "leaf-macros",
  "leaf-web",
  "prost",
+ "tokio",
 ]
 
 [[package]]
