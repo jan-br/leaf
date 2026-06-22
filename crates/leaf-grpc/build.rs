@@ -55,6 +55,19 @@ fn main() -> std::io::Result<()> {
         .out_dir(&tonic_out)
         .compile_fds(fds)?;
 
+    // (2c) tonic's CLIENT stub for the SHIPPED grpc.reflection.v1 proto -> $OUT_DIR/tonic/
+    // grpc.reflection.v1.rs. protox parses its FileDescriptorSet (pure Rust, NO protoc), fed
+    // to tonic-build's `compile_fds`. Client-only: leaf SERVES reflection (the dogfooded
+    // #[grpc_controller]s); tonic provides the dev-test reflection client peer for the H2
+    // proof (tests/reflection_over_h2.rs). tonic/tonic-build stay build/dev-only.
+    let refl_fds = protox::compile(["proto/reflection_v1.proto"], ["proto"])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    tonic_build::configure()
+        .build_server(false)
+        .build_client(true)
+        .out_dir(&tonic_out)
+        .compile_fds(refl_fds)?;
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=tests/proto/echo.proto");
     Ok(())
