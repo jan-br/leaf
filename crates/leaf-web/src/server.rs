@@ -189,27 +189,20 @@ impl Dispatcher {
     /// mapping when no advice claims it. An unmatched route is itself a
     /// [`LeafError`] (mapped to `404` by the default mapping).
     pub async fn dispatch(&self, mut req: Request) -> Response {
-        // 1. PROTOCOL BRANCH: if a ProtocolDispatch claims this request's content-type,
-        //    delegate the WHOLE request (the frame stream INTACT — gRPC reads it directly).
-        //    Selection is by the runtime content-type header value, never a Rust type name.
+        // Choose the chain's terminal up-front by content-type: if a ProtocolDispatch
+        // claims this request (a non-HTTP content-type, e.g. gRPC) the protocol branch
+        // IS the terminal; otherwise the HTTP route table is. EITHER WAY the SAME ordered
+        // WebFilter chain wraps it — auth/log/trace run uniformly across HTTP and gRPC
+        // (§6). leaf-web names no gRPC type: it only sees `dyn ProtocolDispatch`, selected
+        // by the runtime content-type HEADER VALUE, never a Rust type's spelled name.
         let content_type = req.header(http::header::CONTENT_TYPE.as_str()).map(str::to_owned);
-        if let Some(proto) = self
-            .protocols
-            .iter()
-            .find(|p| p.handles(content_type.as_deref()))
-        {
-            // Capture the parts the advice path needs BEFORE the request moves into dispatch
-            // (Request is no longer Clone — its Body may be a one-shot stream).
-            let parts = req.parts_clone();
-            return match proto.dispatch(req).await {
-                Ok(resp) => resp,
-                Err(err) => self.map_error(&err, &parts),
-            };
-        }
+        let proto = self.protocols.iter().find(|p| p.handles(content_type.as_deref()));
 
-        // 2. HTTP PATH: COLLECT a streamed body to Full BEFORE the route family runs, so
-        //    every extractor / body_bytes() call sees buffered bytes (REST stays ergonomic).
-        if req.body_is_stream() {
+        // The PROTOCOL path reads the frame stream INTACT (gRPC de-frames the body
+        // directly); the HTTP path COLLECTS a streamed body to Full BEFORE the route
+        // family runs, so every extractor / body_bytes() call sees buffered bytes (REST
+        // stays ergonomic). Collection happens ONLY when no protocol claims the request.
+        if proto.is_none() && req.body_is_stream() {
             let body = req.take_body();
             match body.collect(usize::MAX).await {
                 Ok(collected) => req.set_body(crate::body::Body::Full(collected)),
@@ -220,16 +213,27 @@ impl Dispatcher {
             }
         }
 
-        // 3. Build the routing table over the owned routes (borrow for this call) and
-        //    the terminal that matches + invokes. Both are locals living across the
-        //    single `.await` below — no borrow escapes `dispatch`.
+        // Build BOTH possible terminals' backing locals (they must live across the single
+        // `.await` below — no borrow escapes `dispatch`). The HTTP route table is built
+        // regardless; the protocol terminal borrows the claiming `dyn ProtocolDispatch`.
         let route_refs: Vec<&dyn Route> = self.routes.iter().map(AsRef::as_ref).collect();
         let table = RouteTable::build(&route_refs);
-        let terminal = RouteTerminal { table: &table };
+        let route_terminal = RouteTerminal { table: &table };
 
-        // The filter chain ends in the route-dispatch terminal.
+        // Select the terminal: a claiming ProtocolDispatch wins for its content-type;
+        // else the HTTP route table. The protocol-terminal local lives only when used.
+        let proto_terminal;
+        let terminal: &dyn Terminal = match proto {
+            Some(p) => {
+                proto_terminal = ProtocolTerminal { proto: p.as_ref() };
+                &proto_terminal
+            }
+            None => &route_terminal,
+        };
+
+        // ONE ordered filter chain wraps whichever terminal was chosen.
         let filter_refs: Vec<&dyn WebFilter> = self.filters.iter().map(AsRef::as_ref).collect();
-        let chain = FilterChain::new(&filter_refs, &terminal);
+        let chain = FilterChain::new(&filter_refs, terminal);
 
         // The advice path needs the request PARTS (Request is not Clone); snapshot them
         // before the chain consumes `req`.
@@ -279,6 +283,21 @@ impl Terminal for RouteTerminal<'_> {
                 RouteOutcome::NotFound => Err(route_not_found(&req)),
             }
         })
+    }
+}
+
+/// The bottom of the filter chain when a non-HTTP protocol (e.g. gRPC) claims the
+/// request's content-type: delegate to the claiming [`ProtocolDispatch`]. The SAME
+/// ordered [`WebFilter`] chain wraps it, so a filter can authenticate / short-circuit
+/// a gRPC call exactly as it does an HTTP one (§6). leaf-web names no gRPC type — only
+/// the abstract `dyn ProtocolDispatch` seam.
+struct ProtocolTerminal<'p> {
+    proto: &'p dyn ProtocolDispatch,
+}
+
+impl Terminal for ProtocolTerminal<'_> {
+    fn dispatch<'a>(&'a self, req: Request) -> BoxFuture<'a, Result<Response, LeafError>> {
+        self.proto.dispatch(req)
     }
 }
 
@@ -659,6 +678,70 @@ mod tests {
 
         // 202 ACCEPTED comes from the protocol family, NOT the route's 200 "http".
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    /// A fake protocol dispatch that claims `application/grpc*` and echoes a fixed
+    /// body so a test can prove the dispatcher reached the protocol branch.
+    struct FakeProto {
+        claim: &'static str,
+        body: &'static str,
+    }
+
+    impl crate::server::ProtocolDispatch for FakeProto {
+        fn handles(&self, content_type: Option<&str>) -> bool {
+            content_type.is_some_and(|ct| ct.starts_with(self.claim))
+        }
+        fn dispatch<'a>(&'a self, _req: Request) -> BoxFuture<'a, Result<Response, LeafError>> {
+            Box::pin(async move {
+                Ok(Response::ok().with_body(Bytes::from_static(self.body.as_bytes())))
+            })
+        }
+    }
+
+    #[test]
+    fn filter_chain_wraps_the_protocol_dispatch_terminal() {
+        // A grpc-content-type request: NO HTTP route claims it, so the dispatcher
+        // must run the SAME ordered filter chain around the ProtocolDispatch branch
+        // (the auth/log/trace filters are uniform across HTTP and gRPC, §6).
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let filter: Arc<dyn WebFilter> = Arc::new(LogFilter { tag: "log", log: log.clone() });
+        let proto: Arc<dyn crate::server::ProtocolDispatch> =
+            Arc::new(FakeProto { claim: "application/grpc", body: "grpc-ok" });
+
+        let dispatcher = Dispatcher::new(vec![], vec![filter], vec![], vec![proto]);
+        let resp = futures::executor::block_on(dispatcher.dispatch(grpc_req("/pkg.Svc/M")));
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body_bytes(), b"grpc-ok".as_slice());
+        // The filter ran AROUND the protocol terminal — gRPC is filtered too.
+        assert_eq!(*log.lock().expect("log"), vec!["log"]);
+    }
+
+    #[test]
+    fn a_filter_can_short_circuit_a_grpc_request_before_the_protocol_terminal() {
+        // The auth analogue: a filter short-circuits a grpc request (returns its own
+        // Response without calling next), so the ProtocolDispatch terminal NEVER runs.
+        let proto: Arc<dyn crate::server::ProtocolDispatch> =
+            Arc::new(FakeProto { claim: "application/grpc", body: "grpc-ok" });
+        struct Block;
+        #[leaf_macros::async_impl]
+        impl WebFilter for Block {
+            async fn filter(
+                &self,
+                _req: Request,
+                _next: crate::filter::Next<'_>,
+            ) -> Result<Response, LeafError> {
+                Ok(Response::new(StatusCode::FORBIDDEN))
+            }
+        }
+        let blocker: Arc<dyn WebFilter> = Arc::new(Block);
+
+        let dispatcher = Dispatcher::new(vec![], vec![blocker], vec![], vec![proto]);
+        let resp = futures::executor::block_on(dispatcher.dispatch(grpc_req("/pkg.Svc/M")));
+
+        // The filter short-circuited: 403, and the protocol body never appeared.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.body_bytes().is_empty());
     }
 
     #[test]
