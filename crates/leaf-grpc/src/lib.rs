@@ -12,6 +12,15 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+// A self-alias so the `REFLECTED_FILE_DESCRIPTOR_SETS` slice DECLARATION below — and the
+// `leaf-grpc-build`-generated FDS registration rows when they land in THIS crate's own
+// test targets — can resolve the linkme attribute macro through leaf-grpc's
+// `pub use leaf_core::linkme;` re-export (`::leaf_grpc::linkme::distributed_slice`) rather
+// than naming a bare `linkme` dependency. Attribute-macro paths resolve against extern
+// crates / the crate root, and edition 2024 provides no implicit `extern crate self`, so
+// the alias is explicit (the same trick `leaf-validation` uses for its derive paths).
+extern crate self as leaf_grpc;
+
 pub mod caller;
 pub mod codec;
 pub mod descriptor;
@@ -51,6 +60,23 @@ pub use streaming::Streaming;
 // dep. prost is leaf-grpc's normal (runtime) codec dependency — the re-export only exposes it.
 #[doc(no_inline)]
 pub use prost;
+
+// `linkme` re-exported THROUGH leaf-core (which does `pub use linkme;`), so the
+// `leaf-grpc-build`-generated FDS registration rows resolve `::leaf_grpc::linkme`
+// without leaf-grpc naming a bare `linkme` dependency — the same indirection the
+// COMPONENTS/AUTO_CONFIGS rows use for `::leaf_core::linkme`.
+#[doc(no_inline)]
+pub use leaf_core::linkme;
+
+/// The gRPC reflection discovery channel: every proto compiled by
+/// `leaf_grpc_build::compile` contributes its encoded `prost_types::FileDescriptorSet`
+/// bytes here via a generated `#[distributed_slice]` row — no app wiring. Mirrors
+/// leaf-core's `COMPONENTS`/`AUTO_CONFIGS` channels (collected at link time). The bytes
+/// are inert static data whether or not reflection is enabled; the reflection index
+/// (a later stage) is the only reader.
+#[::leaf_grpc::linkme::distributed_slice]
+#[linkme(crate = ::leaf_grpc::linkme)]
+pub static REFLECTED_FILE_DESCRIPTOR_SETS: [&'static [u8]] = [..];
 
 /// Splice a `leaf-grpc-build`-generated module into the current scope.
 ///

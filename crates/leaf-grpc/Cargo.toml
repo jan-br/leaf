@@ -59,6 +59,10 @@ leaf-tokio.workspace = true
 leaf-web-hyper.workspace = true
 leaf-serde.workspace = true
 prost.workspace = true
+# prost-types — the well-known FileDescriptorSet/FileDescriptorProto value types the
+# reflected-FDS slice test decodes the collected discovery-slice bytes into (it is a
+# transitive dep through prost, but named explicitly so the test resolves `::prost_types`).
+prost-types.workspace = true
 tonic.workspace = true
 http.workspace = true
 # The cross-cutting integration test drives the leaf-web Dispatcher across the
