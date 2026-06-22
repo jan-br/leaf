@@ -180,8 +180,14 @@ pub fn render_service(svc: &ServiceSpec) -> String {
     out.push_str("}\n\n");
 
     // ── the per-service module of path constants + method descriptors ──
+    // `#![allow(dead_code)]`: the `<METHOD>_PATH` constants are a public-API convenience
+    // (a caller may key on them, or not — the `#[grpc_controller]` macro reads only the
+    // `<METHOD>_DESCRIPTOR`s). The module is `include!`d into the app crate, so rustc DOES
+    // lint its unused consts; the allow keeps a generated artifact warning-free regardless
+    // of which constants the downstream actually references.
     let module = module_ident(&svc.name);
     out.push_str(&format!("pub mod {module} {{\n"));
+    out.push_str("    #![allow(dead_code)]\n");
     for m in &svc.methods {
         out.push_str("    ");
         out.push_str(&path_const(&svc.name, &svc.package, &m.name, &svc.name));
