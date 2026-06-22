@@ -57,6 +57,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Type};
 
+use crate::conditional::{self, CondExpr};
 use crate::descriptor::{self, BeanInput, Dependency, EmitError, FieldShape, Scope, ServiceView, Slice};
 use crate::stereotype::Stereotype;
 
@@ -84,10 +85,21 @@ pub fn expand_grpc_controller_impl(item: &ItemImpl) -> Result<TokenStream, EmitE
         });
     }
 
+    let guard = propagated_guard(item)?;
     let mut rows = TokenStream::new();
     for inner in &item.items {
         let ImplItem::Fn(func) = inner else { continue };
-        rows.extend(emit_grpc_route_bean(&self_ty, &service_trait, &controller_ident, func)?);
+        let (bean, route_ident) =
+            emit_grpc_route_bean(&self_ty, &service_trait, &controller_ident, func)?;
+        rows.extend(bean);
+        // Condition propagation: copy the controller's guard onto THIS route bean, keyed by
+        // the route struct ident — `emit_guard` mints the GUARD_PAIRINGS row on
+        // `ContractId::of(module_path!() ++ "::" ++ route_ident)`, which is exactly the route
+        // bean's contract (it is emitted `module_qualified` with `contract_path = route_ident`),
+        // so the route registers/de-registers in lockstep with the conditioned struct.
+        if let Some(expr) = &guard {
+            rows.extend(conditional::emit_guard(&route_ident, expr));
+        }
     }
     // The dual-form consistency guard: assert the controller STRUCT carries the
     // `GrpcControllerKind` marker the struct stereotype emits (so a `#[grpc_controller] impl`
@@ -106,7 +118,7 @@ fn emit_grpc_route_bean(
     service_trait: &syn::Path,
     controller_ident: &str,
     method: &ImplItemFn,
-) -> Result<TokenStream, EmitError> {
+) -> Result<(TokenStream, String), EmitError> {
     let method_ident = &method.sig.ident;
     let method_name = method_ident.to_string();
 
@@ -204,7 +216,7 @@ fn emit_grpc_route_bean(
     input.provides = vec![ServiceView { dyn_ty: parse_type("dyn ::leaf_grpc::GrpcRoute")? }];
     let registration = descriptor::emit(&input)?;
 
-    Ok(quote! { #items #registration })
+    Ok((quote! { #items #registration }, route_struct_ident.to_string()))
 }
 
 /// The SHAPE-AGNOSTIC dispatch expression: ONE uniform wrapper that resolves the gRPC call
@@ -356,6 +368,52 @@ fn service_trait_of(item: &ItemImpl) -> Result<syn::Path, EmitError> {
                 .into(),
         }),
     }
+}
+
+/// Read the controller's PROPAGATED guard from the `#[grpc_controller] impl` block's OWN
+/// outer attributes: a `#[conditional(...)]` or `#[profile("...")]` the user stacked on the
+/// impl (mirroring the struct's gate). Returns the combined [`CondExpr`] to copy onto every
+/// generated `GrpcRoute` bean, or `None` when the impl carries no guard.
+///
+/// Multiple guard attrs AND together (Spring's multiple-@Conditional stacking) — a
+/// `#[conditional(..)]` plus a `#[profile(..)]` on one impl gate on BOTH. The attrs are
+/// matched on the path's LAST segment (so `::leaf_macros::conditional` matches too) and
+/// STRIPPED from the re-emitted impl by the macro layer (a standalone `#[conditional]` only
+/// accepts a struct, so on an impl it is inert until this reader consumes it). Never inspects
+/// a type name — the guard is the user's explicit condition DSL.
+///
+/// # Errors
+/// [`EmitError`] on a malformed `#[conditional]`/`#[profile]` body (propagated from the
+/// condition codegen).
+fn propagated_guard(item: &ItemImpl) -> Result<Option<CondExpr>, EmitError> {
+    let mut nodes = Vec::new();
+    for attr in &item.attrs {
+        let name = attr
+            .path()
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .unwrap_or_default();
+        match name.as_str() {
+            "conditional" => {
+                let tokens = attr.parse_args::<TokenStream>().unwrap_or_default();
+                nodes.push(conditional::parse_conditional(tokens)?);
+            }
+            "profile" => {
+                let tokens = attr.parse_args::<TokenStream>().map_err(|e| EmitError {
+                    message: format!("malformed #[profile] on a #[grpc_controller] impl: {e}"),
+                })?;
+                let profile = conditional::parse_profile_attr(tokens)?;
+                nodes.push(conditional::profile_to_cond(&profile));
+            }
+            _ => {}
+        }
+    }
+    Ok(match nodes.len() {
+        0 => None,
+        1 => Some(nodes.into_iter().next().unwrap()),
+        _ => Some(CondExpr::All(nodes)),
+    })
 }
 
 /// The leading-ident name of the `Self` type (`CatalogController` / `Repo<u32>` →
@@ -658,5 +716,83 @@ mod tests {
         let err = expand_grpc_controller_impl(&item)
             .expect_err("an RPC method needs a self receiver");
         assert!(err.message.contains("self"), "got: {}", err.message);
+    }
+
+    // ── condition propagation: the impl's guard attrs ride each route bean ──────
+
+    #[test]
+    fn a_conditioned_grpc_impl_propagates_the_guard_onto_every_route_bean() {
+        // The condition-propagation addition: a `#[conditional(...)]` attr stacked on the
+        // `#[grpc_controller] impl` block is read off the impl's OWN attrs and a guard is
+        // emitted per generated route bean, KEYED on the route struct ident (the route
+        // bean's contract) — so a conditioned controller gates struct + routes as one unit.
+        let item: ItemImpl = syn::parse_str(
+            r#"#[conditional(on_property("leaf.grpc.reflection.enabled"))]
+               impl reflection_v1::ServerReflection for ReflectionV1 {
+                   async fn server_reflection_info(&self, reqs: Streaming<Req>)
+                       -> Result<Streaming<Resp>, Status> { todo!() }
+               }"#,
+        )
+        .expect("a valid conditioned impl");
+        let ts = expand_grpc_controller_impl(&item).expect("emits");
+        syn::parse2::<syn::File>(ts.clone()).expect("the emitted artifact is valid Rust items");
+        let s = flat(&ts);
+        // The route bean for `server_reflection_info` carries a guard pairing row, keyed by
+        // the route struct ident (NOT the controller name) — so it pairs with the route
+        // bean's own contract.
+        assert!(
+            s.contains("#[::leaf_core::linkme::distributed_slice(::leaf_core::GUARD_PAIRINGS)]"),
+            "a conditioned grpc impl emits a GUARD_PAIRINGS row per route: {s}"
+        );
+        assert!(
+            s.contains("pubconst__leaf_guard___LeafGrpcRoute_ReflectionV1_server_reflection_info:::leaf_core::CondExpr"),
+            "the guard const is named off the ROUTE STRUCT ident (the route bean's contract): {s}"
+        );
+        // The guard tree is the controller's on_property condition (the OnProperty leaf id).
+        assert!(
+            s.contains(r#"::leaf_core::contract_hash("leaf::condition::OnProperty")"#),
+            "the propagated guard carries the controller's on_property condition: {s}"
+        );
+        assert!(
+            s.contains(r#"::leaf_core::Attr::Str("name","leaf.grpc.reflection.enabled")"#),
+            "the propagated guard carries the property name: {s}"
+        );
+    }
+
+    #[test]
+    fn an_unconditioned_grpc_impl_emits_no_guard_rows() {
+        // No `#[conditional]`/`#[profile]` on the impl => no guard propagation (the existing
+        // route beans register unconditionally, exactly as before this addition).
+        let item = impl_item(
+            r#"impl catalog::Catalog for CatalogController {
+                async fn get(&self, req: ProductReq) -> Result<Product, Status> { todo!() }
+            }"#,
+        );
+        let s = flat(&expand_grpc_controller_impl(&item).expect("emits"));
+        assert!(
+            !s.contains("::leaf_core::GUARD_PAIRINGS"),
+            "an unconditioned controller emits no propagated guard rows: {s}"
+        );
+    }
+
+    #[test]
+    fn a_profile_gated_grpc_impl_propagates_the_profile_guard() {
+        // `#[profile("prod")]` on the impl propagates the ON_PROFILE leaf onto each route.
+        let item: ItemImpl = syn::parse_str(
+            r#"#[profile("prod")]
+               impl catalog::Catalog for CatalogController {
+                   async fn get(&self, req: ProductReq) -> Result<Product, Status> { todo!() }
+               }"#,
+        )
+        .expect("a valid profile-gated impl");
+        let s = flat(&expand_grpc_controller_impl(&item).expect("emits"));
+        assert!(
+            s.contains(r#"::leaf_core::contract_hash("leaf::condition::OnProfile")"#),
+            "the propagated guard carries the profile condition: {s}"
+        );
+        assert!(
+            s.contains(r#"::leaf_core::Attr::Str("expr","prod")"#),
+            "the rendered profile expr rides the guard: {s}"
+        );
     }
 }

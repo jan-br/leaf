@@ -224,10 +224,13 @@ pub fn grpc_controller(attr: TokenStream, item: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(item as Item);
     match parsed {
         Item::Impl(item_impl) => {
-            // Re-emit the trait impl with async desugared (native async, in-macro — the SAME
-            // BoxFuture desugar `#[async_impl]` performs), then append the lowered GrpcRoute
-            // rows. The RPC methods are plain `async fn`s, so there is nothing to STRIP.
-            let desugared = leaf_codegen::async_impl::expand(&item_impl);
+            // The propagated condition attrs (`#[conditional]`/`#[profile]`) ride the impl as
+            // inert markers the codegen reads (condition propagation); STRIP them from the
+            // re-emitted impl so the standalone `#[conditional]`/`#[profile]` macros never see
+            // an impl (they only accept a struct). The codegen still reads them off the
+            // ORIGINAL `item_impl` below.
+            let cleaned = strip_outer_attrs(item_impl.clone(), &["conditional", "profile"]);
+            let desugared = leaf_codegen::async_impl::expand(&cleaned);
             match leaf_codegen::grpc_controller::expand_grpc_controller_impl(&item_impl) {
                 Ok(rows) => quote! { #desugared #rows }.into(),
                 Err(err) => {
@@ -608,6 +611,23 @@ fn strip_inner_attrs(mut item: ItemImpl, names: &[&str]) -> ItemImpl {
             });
         }
     }
+    item
+}
+
+/// Strip the named OUTER attributes (`#[conditional]`/`#[profile]`) off an `impl` block.
+///
+/// The counterpart to [`strip_inner_attrs`] (which strips METHOD-position attrs): this
+/// removes IMPL-position attrs the codegen has already consumed (the propagated condition
+/// guards). Matching is on the attribute path's LAST segment so a fully-qualified
+/// `#[::leaf_macros::conditional]` is stripped too.
+fn strip_outer_attrs(mut item: ItemImpl, names: &[&str]) -> ItemImpl {
+    item.attrs.retain(|a| {
+        !a.path()
+            .segments
+            .last()
+            .map(|s| names.contains(&s.ident.to_string().as_str()))
+            .unwrap_or(false)
+    });
     item
 }
 
