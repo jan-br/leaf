@@ -109,10 +109,18 @@ impl GrpcDispatch {
     }
 
     /// Map a handler/filter [`LeafError`] to a [`Status`] via the ordered mapper chain
-    /// (user mappers consulted first, the `DefaultGrpcStatusMapper` FALLBACK last). The
-    /// floor never declines, so the production chain always yields a `Status`; if NO
-    /// mapper is wired at all (degenerate), it defaults to [`Code::Unknown`] so a
-    /// well-formed trailer is still produced. Pure + backend-free.
+    /// (user mappers consulted first), falling through to the
+    /// [`DefaultGrpcStatusMapper`](crate::mapper::DefaultGrpcStatusMapper) PROTOCOL floor.
+    ///
+    /// The default mapper is the blessed gRPC-spec floor (`NoSuchBean -> Unimplemented`,
+    /// `ConvertError -> Internal`, else `Unknown`) and it lives HERE — at the protocol
+    /// layer — not solely as an `OnMissingBean`-gated DI bean. So even when a user
+    /// `GrpcStatusMapper` is registered (which removes the FALLBACK DI bean via
+    /// `OnMissingBean(dyn GrpcStatusMapper)`), the unknown-method / decode-fault floor is
+    /// still applied: a user mapper consulted first can RESHAPE an error, but it cannot
+    /// strip the protocol-mandated default. This honours the spec's "unknown method ->
+    /// `Code::Unimplemented`" guarantee regardless of which domain mappers are wired.
+    /// Pure + backend-free.
     #[must_use]
     pub fn status_for(mappers: &[Arc<dyn GrpcStatusMapper>], err: &LeafError) -> Status {
         for m in mappers {
@@ -120,7 +128,10 @@ impl GrpcDispatch {
                 return s;
             }
         }
-        Status::new(Code::Unknown, err.to_string())
+        // The protocol floor: the default mapper claims EVERY error, so this is always Some.
+        crate::mapper::DefaultGrpcStatusMapper::new()
+            .map(err)
+            .unwrap_or_else(|| Status::new(Code::Unknown, err.to_string()))
     }
 }
 
