@@ -17,17 +17,68 @@ use std::collections::BTreeMap;
 /// module's `FILE_DESCRIPTOR_SET`. Keyed on the package STRING the descriptor carries
 /// (the gRPC wire identifier), never on a Rust type name. Returns a sorted map so the
 /// emitted `.fds` set is deterministic across builds.
+///
+/// "Self-contained" means each package's set carries not only the files declaring that
+/// package but the TRANSITIVE IMPORT CLOSURE of those files (everything reachable through
+/// `FileDescriptorProto::dependency`, e.g. the `google/api/*` AIP annotations a service
+/// imports, or cross-package message files). gRPC reflection resolves a service by walking
+/// its descriptors' imports by filename; if an imported file is absent from the reflected
+/// set, the client fails with `File not found: google/api/annotations.proto` and the service
+/// never resolves. The closure is emitted dependencies-first (post-order) so consumers that
+/// assume topological order are satisfied; clients that resolve by filename don't care.
 #[must_use]
 fn group_fds_by_package(fds: &::prost_types::FileDescriptorSet) -> BTreeMap<String, Vec<u8>> {
     use ::prost::Message;
-    let mut by_pkg: BTreeMap<String, ::prost_types::FileDescriptorSet> = BTreeMap::new();
-    for file in &fds.file {
-        let pkg = file.package.clone().unwrap_or_default();
-        by_pkg.entry(pkg).or_default().file.push(file.clone());
+    use std::collections::HashMap;
+
+    // Index every file by its proto filename so imports (which name files, not packages)
+    // can be resolved across the whole input set.
+    let by_filename: HashMap<&str, &::prost_types::FileDescriptorProto> = fds
+        .file
+        .iter()
+        .map(|f| (f.name(), f))
+        .collect();
+
+    // Post-order DFS from `start`, appending each file AFTER its dependencies. `visited`
+    // dedups across the whole closure; `out` preserves dependencies-first order.
+    fn collect_closure<'a>(
+        start: &'a ::prost_types::FileDescriptorProto,
+        by_filename: &HashMap<&str, &'a ::prost_types::FileDescriptorProto>,
+        visited: &mut std::collections::HashSet<&'a str>,
+        out: &mut Vec<&'a ::prost_types::FileDescriptorProto>,
+    ) {
+        if !visited.insert(start.name()) {
+            return;
+        }
+        for dep in &start.dependency {
+            if let Some(dep_file) = by_filename.get(dep.as_str()) {
+                collect_closure(dep_file, by_filename, visited, out);
+            }
+        }
+        out.push(start);
     }
-    by_pkg
+
+    // Which packages exist (each gets its own self-contained set).
+    let packages: std::collections::BTreeSet<String> = fds
+        .file
+        .iter()
+        .map(|f| f.package().to_string())
+        .collect();
+
+    packages
         .into_iter()
-        .map(|(pkg, set)| (pkg, set.encode_to_vec()))
+        .map(|pkg| {
+            let mut visited = std::collections::HashSet::new();
+            let mut files = Vec::new();
+            // Seed from every file declaring this package, then pull in its import closure.
+            for file in fds.file.iter().filter(|f| f.package() == pkg) {
+                collect_closure(file, &by_filename, &mut visited, &mut files);
+            }
+            let set = ::prost_types::FileDescriptorSet {
+                file: files.into_iter().cloned().collect(),
+            };
+            (pkg, set.encode_to_vec())
+        })
         .collect()
 }
 
@@ -107,6 +158,15 @@ mod tests {
         }
     }
 
+    fn file_importing(pkg: &str, name: &str, deps: &[&str]) -> FileDescriptorProto {
+        FileDescriptorProto {
+            name: Some(name.to_string()),
+            package: Some(pkg.to_string()),
+            dependency: deps.iter().map(|d| (*d).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn groups_descriptor_files_by_package_each_a_self_contained_set() {
         let fds = FileDescriptorSet {
@@ -124,6 +184,41 @@ mod tests {
         let decoded = FileDescriptorSet::decode(echo.as_slice()).expect("re-encoded set decodes");
         assert_eq!(decoded.file.len(), 2, "echo.v1's group holds both of its files");
         assert!(groups.contains_key("other"));
+    }
+
+    #[test]
+    fn a_packages_set_carries_its_transitive_import_closure() {
+        use ::prost::Message;
+        // A service in `example.v1` imports `google/api/annotations.proto`, which in turn
+        // imports `google/protobuf/descriptor.proto`. The reflected set for `example.v1` must
+        // carry ALL THREE files (its own + the full closure), else a reflection client fails
+        // with "File not found: google/api/annotations.proto".
+        let fds = FileDescriptorSet {
+            file: vec![
+                file_importing("example.v1", "service.proto", &["google/api/annotations.proto"]),
+                file_importing(
+                    "google.api",
+                    "google/api/annotations.proto",
+                    &["google/protobuf/descriptor.proto"],
+                ),
+                file("google.protobuf", "google/protobuf/descriptor.proto"),
+            ],
+        };
+        let groups = group_fds_by_package(&fds);
+        let example = groups.get("example.v1").expect("example.v1 group present");
+        let decoded =
+            FileDescriptorSet::decode(example.as_slice()).expect("re-encoded set decodes");
+        let names: Vec<&str> = decoded.file.iter().map(|f| f.name()).collect();
+        assert!(
+            names.contains(&"service.proto")
+                && names.contains(&"google/api/annotations.proto")
+                && names.contains(&"google/protobuf/descriptor.proto"),
+            "example.v1's set must carry its full import closure, got: {names:?}",
+        );
+        // Dependencies-first order: a file appears only after everything it imports.
+        let pos = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(pos("google/protobuf/descriptor.proto") < pos("google/api/annotations.proto"));
+        assert!(pos("google/api/annotations.proto") < pos("service.proto"));
     }
 
     #[test]
